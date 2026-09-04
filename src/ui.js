@@ -1,0 +1,1663 @@
+// Страница терминала.
+//
+// Устройство подчинено одному: между нажатием «ВОЙТИ» и открытием кошелька
+// не должно быть ни одного ожидания сети. Поэтому:
+//
+//   ключ пула читается при загрузке — он не меняется;
+//   разрешения проверяются при ARM, а не при входе;
+//   цена держится свежей опросом раз в 250 мс;
+//   симуляция запускается ПАРАЛЛЕЛЬНО с открытием кошелька и успевает
+//   ответить, пока автор читает окно Rabby.
+//
+// Замеры на публичном узле: чтение цены 119 мс, симуляция 119 мс. Оба
+// вынесены из горячего пути, остаётся около 1 мс на расчёт и сборку.
+
+'use strict';
+
+(() => {
+  const C = window.RHCore, W = window.RHWallet;
+  const $ = (id) => document.getElementById(id);
+  const KEY = 'lp-evm-rh';
+  // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
+  // автор дважды присылал скрин со старой, думая, что она новая.
+  const VERSION = '2.7';
+  const LEDGER = 'lp-evm-rh-ledger';   // память о входах: без неё PnL не посчитать
+
+  const state = {
+    rpc: null, rpcUrl: '', account: null,
+    pool: null, slot0: null, slot0At: 0,
+    amount: 2, side: 'down', intent: 'buy', width: 30, gap: 5,
+    decimals: {}, pools: [], busy: false, profile: null, profileAt: 0,
+  };
+
+  // ── журнал ──────────────────────────────────────────────────────────────
+  function log(msg, kind) {
+    const d = document.createElement('div');
+    const t = new Date().toTimeString().slice(0, 8);
+    d.textContent = `${t}  ${msg}`;
+    if (kind) d.className = kind;
+    $('log').prepend(d);
+    while ($('log').children.length > 200) $('log').lastChild.remove();
+  }
+
+  // ── память о входах ─────────────────────────────────────────────────────
+  //
+  // Сеть не хранит, сколько ты вложил. Она знает только состояние сейчас.
+  // Поэтому момент входа записываем сами: сумму, цену и время. Без этого
+  // после закрытия можно показать только «сколько вернулось», а не итог.
+  const ledger = {
+    all() { try { return JSON.parse(localStorage.getItem(LEDGER) || '{}'); }
+            catch (e) { return {}; } },
+    put(k, v) { const a = this.all(); a[k] = { ...(a[k] || {}), ...v };
+                localStorage.setItem(LEDGER, JSON.stringify(a)); },
+    get(k) { return this.all()[k] || null; },
+  };
+
+  const save = () => localStorage.setItem(KEY, JSON.stringify({
+    rpcUrl: state.rpcUrl, amount: state.amount, side: state.side,
+    width: state.width, gap: state.gap, intent: state.intent, pool: $('pool').value,
+    pools: state.pools,
+  }));
+
+  function load() {
+    try {
+      const s = JSON.parse(localStorage.getItem(KEY) || '{}');
+      if (s.rpcUrl) { state.rpcUrl = s.rpcUrl; $('rpc').value = s.rpcUrl; }
+      if (s.pool) $('pool').value = s.pool;
+      if (s.amount) state.amount = s.amount;
+      if (s.intent) state.intent = s.intent;
+      if (s.width) state.width = s.width;
+      if (s.gap) state.gap = s.gap;
+      if (Array.isArray(s.pools)) state.pools = s.pools;
+    } catch (e) { /* первая загрузка */ }
+  }
+
+  // ── ряды кнопок со своим значением ──────────────────────────────────────
+  function chips(host, values, suffix, get, set) {
+    host.innerHTML = '';
+    for (const v of values) {
+      const b = document.createElement('button');
+      b.textContent = v + suffix;
+      if (get() === v) b.classList.add('on');
+      b.onclick = () => { set(v); chips(host, values, suffix, get, set); recalc(); save(); };
+      host.appendChild(b);
+    }
+    const own = document.createElement('input');
+    own.type = 'text'; own.className = 'own'; own.placeholder = 'своё';
+    if (!values.includes(get())) own.value = String(get());
+    const apply = () => {
+      const v = parseFloat(String(own.value).replace(',', '.'));
+      if (!isFinite(v) || v <= 0) { own.style.borderColor = 'var(--bad)'; return; }
+      own.style.borderColor = '';
+      set(v); chips(host, values, suffix, get, set); recalc(); save();
+    };
+    own.onchange = apply;
+    own.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); apply(); } };
+    host.appendChild(own);
+  }
+
+  function sideRow() {
+    const host = $('r-side');
+    host.innerHTML = '';
+    for (const [k, t] of [['buy', 'КУПИТЬ монету за стейбл'],
+                          ['sell', 'ПРОДАТЬ монету за стейбл']]) {
+      const b = document.createElement('button');
+      b.textContent = t;
+      if (state.intent === k) b.classList.add('on');
+      b.onclick = () => { state.intent = k; sideRow(); recalc(); save(); };
+      host.appendChild(b);
+    }
+  }
+
+  // ── узел ────────────────────────────────────────────────────────────────
+  async function checkRpc() {
+    const url = $('rpc').value.trim() || C.RH.publicRpc;
+    $('s-rpc').textContent = 'проверяю…';
+    const r = await C.testRpc(url);
+    if (!r.ok) {
+      $('d-rpc').className = 'dot bad';
+      $('s-rpc').textContent = 'узел не годится';
+      log('узел отвергнут: ' + r.why, 'bad');
+      return false;
+    }
+    state.rpcUrl = url; state.rpc = C.makeRpc(url);
+    $('d-rpc').className = 'dot on';
+    $('s-rpc').textContent = `узел ${r.latencyMs} мс`;
+    $('s-block').textContent = 'блок ' + r.block;
+    log(`узел годен: сеть ${r.chainId}, задержка ${r.latencyMs} мс` +
+        (url === C.RH.publicRpc ? ' (публичный — медленный, поставь свой)' : ''),
+        url === C.RH.publicRpc ? 'warn' : 'ok');
+    save();
+    return true;
+  }
+
+  // ── пул ─────────────────────────────────────────────────────────────────
+  async function loadPool() {
+    if (!state.rpc && !(await checkRpc())) return;
+    const raw = $('pool').value.trim();
+    const m = raw.match(/0x[0-9a-fA-F]{64}/);
+    let poolId = m ? m[0] : null;
+    if (!poolId) {
+      const t = raw.match(/0x[0-9a-fA-F]{40}/);
+      if (!t) { log('не вижу ни PoolId, ни адреса монеты', 'bad'); return; }
+      const list = await poolsByToken(t[0]);
+      if (!list.length) { log('пулов этой монеты не нашёл', 'bad'); return; }
+      // Выбор за автором: молча взять «самый глубокий» значит иногда
+      // войти в пул, который отстаёт от рынка.
+      log(`нашёл ${list.length} пул(ов) — выбери в списке справа от поля`, 'ok');
+      await showPoolChoice(list, t[0]);
+      return;
+    }
+    try {
+      const key = await C.loadPool(state.rpc, poolId, window.keccak256);
+      if (!key.poolIdOk) { log('PoolId не сошёлся с ключом — это НЕ тот пул', 'bad'); return; }
+      // Хук разрешаем, только если у него НЕТ прав на ликвидность.
+      // Такой хук может брать своё с обменов, но не может ни задержать
+      // твой вывод, ни удержать часть позиции.
+      if (!key.hook.allowed) {
+        log('ПУЛ ЗАПРЕЩЁН: хук имеет права на ликвидность — ' +
+            key.hook.danger.join(', ') + '. Он способен не выпустить деньги.', 'bad');
+        return;
+      }
+      if (key.native) { log('одна сторона — нативный ETH, не поддерживаем', 'bad'); return; }
+
+      // ПЛАТИТ ЛИ ПУЛ. Проверка стоит здесь, до всего остального, потому что
+      // пул, который не платит комиссий, бесполезен независимо от цены,
+      // глубины и ширины диапазона: остаётся только риск цены. Автор уже
+      // потерял на таком сто долларов.
+      const real = await C.poolFeeReality(logsRpc(), poolId,
+        Number(BigInt(await logsRpc()('eth_blockNumber', []))));
+      key.real = real;
+      if (real.pays === false) {
+        log(`ПУЛ ЗАПРЕЩЁН: не платит поставщику ликвидности. ${real.swaps} ` +
+            `недавних обмена(ов), комиссия в каждом 0.000%` +
+            (key.hook.takesSwapCut ? '; хук имеет право забирать часть обмена' : '') +
+            '. Стоять в нём — риск цены без дохода.', 'bad');
+        $('poolinfo').innerHTML =
+          `<div class="kv"><span>пара</span><b>${await tokenSymbol(key.currency0)} / ` +
+          `${await tokenSymbol(key.currency1)}</b></div>` +
+          `<div class="kv"><span>реальная комиссия</span><b class="bad">0.000%</b></div>` +
+          `<div class="hint">Замерено по ${real.swaps} обменам из журнала сети. ` +
+          `Вход в такой пул закрыт: комиссий не будет, останется только риск цены. ` +
+          `Ищи другой пул этой монеты — у той же пары бывает соседний, ` +
+          `который платит.</div>`;
+        return;
+      }
+      state.pool = key;
+      state.decimals[key.currency0] = await tokenDecimals(key.currency0);
+      state.decimals[key.currency1] = await tokenDecimals(key.currency1);
+      const s0 = await tokenSymbol(key.currency0), s1 = await tokenSymbol(key.currency1);
+      key.sym0 = s0; key.sym1 = s1;
+      const step = (Math.pow(1.0001, key.tickSpacing) - 1) * 100;
+      $('poolinfo').innerHTML =
+        `<div class="kv"><span>пара</span><b>${s0} / ${s1}</b></div>` +
+        `<div class="kv"><span>комиссия в ключе</span><b class="num">${
+          feeText(key.fee)}</b></div>` +
+        // Главная строка. В ключе может стоять флаг плавающей комиссии, и
+        // тогда число из ключа не говорит вообще ничего — платят или нет,
+        // видно только по совершённым обменам.
+        `<div class="kv"><span>платит на деле</span><b class="num ${
+          real.pays ? 'ok' : 'warn'}">${
+          real.pays ? (real.median / 10000).toFixed(3) + '%'
+                    : 'неизвестно'}</b></div>` +
+        `<div class="hint">${real.pays
+          ? `замерено по ${real.swaps} обменам за последние ${real.blocks} блоков`
+          : (real.why || 'проверить нечем') + ' — входить вслепую не стоит'}</div>` +
+        `<div class="kv"><span>шаг цены</span><b class="num">${step.toFixed(2)}%</b></div>` +
+        `<div class="kv"><span>минимальный отступ</span><b class="num warn">${
+          ((1 - Math.pow(1.0001, -key.tickSpacing)) * 100).toFixed(2)}%</b></div>` +
+        `<div class="kv"><span>хук</span><b class="${key.hooksEmpty ? 'ok' : 'warn'}">${
+          key.hooksEmpty ? 'нет' : 'есть, но без прав на ликвидность'}</b></div>` +
+        (key.hooksEmpty ? '' :
+          `<div class="hint">умеет: ${key.hook.rights.join(', ')}. ` +
+          `К твоей ликвидности доступа нет — вывести сможешь всегда.</div>`);
+      log(`пул ${s0}/${s1}: в ключе ${feeText(key.fee)}, на деле ${
+            real.pays ? (real.median / 10000).toFixed(3) + '% по ' + real.swaps + ' обменам'
+                      : 'проверить нечем'}, ` +
+          `шаг ${key.tickSpacing} тиков = ${step.toFixed(2)}%`,
+          real.pays ? 'ok' : 'warn');
+      rememberPool(poolId, `${s0}/${s1}`);
+      startPricePump();
+      save();
+      loadProfile();
+    } catch (e) { log('пул не загрузился: ' + e.message, 'bad'); }
+  }
+
+  // ── ВЫБОР ПУЛА ПО МОНЕТЕ ────────────────────────────────────────────────
+  //
+  // Раньше здесь молча брался самый глубокий пул. Это опасно, и автор
+  // ткнул в самую суть: цена в мелком пуле ОТСТАЁТ от рынка. У GRASS на этой
+  // сети 30 пулов, и крайние показывают 0.001959 против 0.002780 — разница
+  // в четверть. Войти не в тот пул значит войти по вчерашней цене.
+  //
+  // Цену ведёт тот пул, где идёт ОБЪЁМ, а не тот, где больше лежит.
+  // Поэтому сортируем по объёму и показываем всё, что нужно для выбора,
+  // включая отклонение цены от ведущего пула.
+  async function poolsByToken(addr) {
+    try {
+      const r = await fetch('https://api.dexscreener.com/latest/dex/search?q=' + addr);
+      const d = await r.json();
+      return (d.pairs || [])
+        .filter(p => p.chainId === 'robinhood' &&
+                     /^0x[0-9a-fA-F]{64}$/.test(p.pairAddress || ''))
+        .map(p => ({
+          poolId: p.pairAddress.toLowerCase(),
+          pair: `${p.baseToken?.symbol || '?'}/${p.quoteToken?.symbol || '?'}`,
+          liq: p.liquidity?.usd || 0,
+          vol: p.volume?.h24 || 0,
+          price: Number(p.priceUsd) || 0,
+        }))
+        .sort((a, b) => b.vol - a.vol);
+    } catch (e) { return []; }
+  }
+
+  async function showPoolChoice(list, coinAddr) {
+    const host = $('poolinfo');
+    const top = list.slice(0, 8);
+    host.innerHTML = `<div class="hint">нашёл ${list.length} пул(ов). ` +
+      `Цену ведёт тот, где идёт объём — он первый.</div>` +
+      `<div class="hint">читаю пулы…</div>`;
+
+
+    // Подробности берём с цепочки: комиссию, шаг диапазона и права хука
+    // подделать нельзя, а вот сводке из интернета доверять на деньгах нельзя.
+    // Номер последнего блока нужен всем замерам комиссии — берём один раз.
+    let latest = 0;
+    try { latest = Number(BigInt(await logsRpc()('eth_blockNumber', []))); } catch (e) { }
+
+    const rows = await Promise.all(top.map(async (p) => {
+      try {
+        const k = await C.loadPool(state.rpc, p.poolId, window.keccak256);
+        // Названия ядро не отдаёт — берём сами, иначе не понять, есть ли в
+        // паре стейбл, а без него заходить нечем.
+        k.sym0 = await tokenSymbol(k.currency0);
+        k.sym1 = await tokenSymbol(k.currency1);
+        // ЦЕНУ БЕРЁМ ИЗ ЦЕПОЧКИ, а не из сводки в интернете.
+        // Сводка сама отстаёт: по GRASS она давала 0.00278, тогда как пул
+        // в тот же момент стоял на 0.0036. Мерить отставание отстающей
+        // линейкой бессмысленно.
+        let onchain = null, quote = null;
+        try {
+          const s0v = await C.readSlot0(state.rpc, p.poolId);
+          const dd0 = await tokenDecimals(k.currency0);
+          const dd1 = await tokenDecimals(k.currency1);
+          const raw = C.priceFromSqrt(s0v.sqrtPriceX96, dd0, dd1);
+          const coinIs0 = k.currency0.toLowerCase() === (coinAddr || '').toLowerCase();
+          onchain = coinIs0 ? raw : (raw ? 1 / raw : 0);
+          quote = coinIs0 ? k.sym1 : k.sym0;
+        } catch (e) { /* цена не прочиталась */ }
+        return { ...p, key: k, ok: k.poolIdOk, onchain, quote,
+                 real: { pays: null, why: 'не замерено' } };
+      } catch (e) { return { ...p, key: null, ok: false }; }
+    }));
+
+    // ПЛАТИТ ЛИ ПУЛ — замер по журналу, а не поле в ключе. Без этой строки
+    // список ставил первым тот пул, который не платит вовсе: он же и самый
+    // крупный по обороту.
+    //
+    // ПО ОЧЕРЕДИ, а не Promise.all. Журнал читается только через общий
+    // публичный узел, и восемь одновременных запросов он встречает ответом
+    // «Too Many Requests» — проверено. Окно короткое (4000 блоков, порядка
+    // сотни событий), так что очередь стоит десятые доли секунды на пул.
+    if (latest) {
+      for (const r of rows) {
+        if (!r.key || !r.ok) continue;
+        try { r.real = await C.poolFeeReality(logsRpc(), r.poolId, latest); }
+        catch (e) { r.real = { pays: null, why: 'узел не ответил' }; }
+      }
+    }
+
+    // Сравнивать цены можно только внутри одной котировки: пул к ETH и пул
+    // к стейблу меряют разными линейками. Ведущим в каждой котировке считаем
+    // пул с наибольшим объёмом — цену ведёт торговля, а не глубина.
+    //
+    // Ведущего ищем ДО перестановки списка и именно по обороту: цену ведёт
+    // тот, где торгуют, даже если он не платит поставщику ликвидности. Это
+    // разные вопросы — «где настоящая цена» и «где мне платят».
+    const lead = new Map();
+    for (const r of [...rows].sort((a, b) => b.vol - a.vol)) {
+      if (!r.onchain || !r.quote) continue;
+      if (!lead.has(r.quote)) lead.set(r.quote, r.onchain);
+    }
+
+    // Порядок показа: сначала те, что ПЛАТЯТ, внутри — по обороту. Оборот сам
+    // по себе больше не решает: у PIXELCAT первый по обороту пул платит
+    // 0.000%, а соседний, втрое меньший по обороту, — 4.096%.
+    rows.sort((a, b) => (Number(b.real?.pays === true) - Number(a.real?.pays === true)) ||
+                        (b.vol - a.vol));
+
+    host.innerHTML = `<div class="hint">нашёл ${list.length} пул(ов), ` +
+      `показываю ${rows.length}. Сначала те, что реально платят комиссию, ` +
+      `внутри — по обороту за сутки. Цена — из цепочки, ` +
+      `сравнение внутри одной котировки.</div>`;
+    for (const r of rows) {
+      const b = document.createElement('button');
+      b.style.cssText = 'width:100%;text-align:left;margin-top:6px;padding:8px 10px';
+      const money = (v) => v >= 1e6 ? '$' + (v / 1e6).toFixed(2) + 'M'
+                         : v >= 1e3 ? '$' + (v / 1e3).toFixed(0) + 'k'
+                         : '$' + v.toFixed(0);
+      const base = r.quote ? lead.get(r.quote) : null;
+      const dev = base && r.onchain ? (r.onchain / base - 1) * 100 : 0;
+      let verdict = '', cls = 'ok';
+      if (!r.ok || !r.key) { verdict = 'ключ не сошёлся — не трогать'; cls = 'bad'; }
+      else if (!r.key.hook.allowed) {
+        verdict = 'ХУК ДЕРЖИТ ЛИКВИДНОСТЬ — вход запрещён'; cls = 'bad';
+      } else if (r.key.native) { verdict = 'сторона — нативный ETH, не поддерживаем'; cls = 'warn'; }
+      // Пул, который не платит, отсекаем ЖЁСТКО и до всех остальных придирок.
+      // Именно такой пул стоил автору ста долларов, и выглядел он при этом
+      // лучше всех: первый по обороту, стейбл в паре, хук без прав на
+      // ликвидность — по старым правилам «годен».
+      else if (r.real && r.real.pays === false) {
+        verdict = `НЕ ПЛАТИТ: ${r.real.swaps} обмен(ов) подряд с нулевой комиссией` +
+                  (r.key.hook.takesSwapCut ? ', хук забирает часть обмена' : '');
+        cls = 'bad';
+      } else if (!STABLE.test(r.key.sym0 || '') && !STABLE.test(r.key.sym1 || '')) {
+        verdict = 'стейбла в паре нет — заходить нечем'; cls = 'warn';
+      } else if (r.real && r.real.pays === null) {
+        verdict = 'платит ли — неизвестно: ' + (r.real.why || 'замер не вышел'); cls = 'warn';
+      } else verdict = 'годен';
+      const step = r.key ? (Math.pow(1.0001, r.key.tickSpacing) - 1) * 100 : 0;
+      b.innerHTML =
+        `<b>${r.pair}</b> <span class="dim num">объём ${money(r.vol)} · ` +
+        `ликв ${money(r.liq)}</span>` +
+        (r.key ? `<br><span class="dim num">в ключе ${feeText(r.key.fee)} · ` +
+                 // Главное число строки: сколько пул ВЗЯЛ с последних обменов.
+                 // В ключе может стоять флаг плавающей комиссии, и тогда поле
+                 // не говорит ничего.
+                 `<span class="${r.real?.pays ? 'ok' : 'warn'}">на деле ${
+                    r.real?.pays ? (r.real.median / 10000).toFixed(3) + '%'
+                                 : r.real?.pays === false ? '0.000%' : '?'}</span> · ` +
+                 `шаг ${step.toFixed(2)}% · минимальный отступ ` +
+                 `${((1 - Math.pow(1.0001, -r.key.tickSpacing)) * 100).toFixed(2)}%</span>` : '') +
+        (r.onchain ? `<br><span class="dim num">цена в цепочке ${fmtPrice(r.onchain)} ` +
+                     `${r.quote}</span>` : '') +
+        `<br><span class="${cls}">${verdict}</span>` +
+        (Math.abs(dev) > 1
+          ? `<span class="warn"> · на ${dev > 0 ? '+' : ''}${dev.toFixed(1)}% ` +
+            `от ведущего пула в ${r.quote} — расходится</span>` : '');
+      if (cls === 'bad') b.disabled = true;
+      else b.onclick = () => { $('pool').value = r.poolId; loadPool(); };
+      host.appendChild(b);
+    }
+  }
+
+  async function tokenDecimals(a) {
+    try { return Number(BigInt(await C.ethCall(state.rpc, a, C.SEL.decimals))); }
+    catch (e) { return 18; }
+  }
+
+  async function tokenSymbol(a) {
+    // Нулевой адрес — это нативная монета сети, у неё нет контракта и
+    // спрашивать symbol() не у кого. Без этого в списке пулов стоял «?».
+    if (/^0x0{40}$/i.test(a || '')) return 'ETH';
+    try {
+      const r = await C.ethCall(state.rpc, a, C.SEL.symbol);
+      const b = r.slice(2);
+      const len = parseInt(b.slice(64, 128), 16);
+      let s = '';
+      for (let i = 0; i < len; i++) s += String.fromCharCode(parseInt(b.substr(128 + i * 2, 2), 16));
+      return s || '?';
+    } catch (e) { return '?'; }
+  }
+
+  // ── цена держится свежей ────────────────────────────────────────────────
+  let pump = null;
+  function startPricePump() {
+    if (pump) clearInterval(pump);
+    const tick = async () => {
+      if (!state.pool || !state.rpc) return;
+      try {
+        const s = await C.readSlot0(state.rpc, state.pool.poolId);
+        state.slot0 = s; state.slot0At = Date.now();
+        $('d-price').className = 'dot on';
+        $('s-price').textContent = 'цена живая';
+        showPrice();
+        recalc();
+      } catch (e) {
+        $('d-price').className = 'dot bad';
+        $('s-price').textContent = 'цена не читается';
+      }
+    };
+    tick();
+    pump = setInterval(tick, 250);
+  }
+
+  // Сырая цена пула: сколько currency1 за один currency0.
+  function rawPrice(tick) {
+    const d0 = state.decimals[state.pool.currency0] ?? 18;
+    const d1 = state.decimals[state.pool.currency1] ?? 18;
+    return Math.pow(1.0001, tick) * Math.pow(10, d0 - d1);
+  }
+
+  // Цена ДЛЯ ЧЕЛОВЕКА: всегда «сколько стейбла за одну монету».
+  //
+  // Сырая цена зависит от того, каким по счёту стоит стейбл. В паре
+  // USDG/TAOBAO она читалась как «1667 TAOBAO за 1 USDG» — так никто не
+  // думает и на графике так не смотрят. Переворачиваем, когда стейбл
+  // оказался первым.
+  function priceOf(tick) {
+    const raw = rawPrice(tick);
+    return stableSide() === 0 ? (raw ? 1 / raw : 0) : raw;
+  }
+
+  // Названия для подписи: монета и стейбл, а не currency0/currency1.
+  function names() {
+    const st = stableSide();
+    if (st === 0) return { coin: state.pool.sym1, stable: state.pool.sym0 };
+    return { coin: state.pool.sym0, stable: state.pool.sym1 };
+  }
+
+  function showPrice() {
+    if (!state.slot0) return;
+    const p = priceOf(state.slot0.tick);
+    $('price').textContent = p < 0.01 ? p.toPrecision(6) : p.toFixed(6);
+    const n = names();
+    $('pricesub').textContent =
+      `${n.stable} за 1 ${n.coin} · тик ${state.slot0.tick}`;
+  }
+
+  // Распределение ликвидности: где именно стоят чужие позиции.
+  // Читается из контракта при загрузке пула — это десятки запросов,
+  // в горячий путь входа они не попадают.
+  async function loadProfile() {
+    if (!state.pool || !state.slot0) return;
+    try {
+      const t0 = performance.now();
+      const pr = await C.readLiquidityProfile(
+        state.rpc, state.pool.poolId, state.slot0.tick, state.pool.tickSpacing, 2);
+      state.profile = pr; state.profileAt = Date.now();
+      log(`ликвидность прочитана: ${pr.ticks.length} занятых тиков ` +
+          `за ${(performance.now() - t0).toFixed(0)} мс`);
+      recalc();
+    } catch (e) { log('распределение не прочиталось: ' + e.message, 'warn'); }
+  }
+
+  // ── полоса диапазона ────────────────────────────────────────────────────
+  //
+  // То же, что показывает Krystal: где сейчас цена и куда встанет позиция.
+  // Рисуем по цене, а не по тикам, в тех же единицах, что подписи.
+  function drawChart(p) {
+    const cv = $('chart');
+    if (!cv || !state.slot0 || !state.pool) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth, h = 150;
+    if (cv.width !== w * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+    const g = cv.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+
+    const now = priceOf(state.slot0.tick);
+    let lo = p ? Math.min(priceOf(p.tickLower), priceOf(p.tickUpper)) : now * 0.8;
+    let hi = p ? Math.max(priceOf(p.tickLower), priceOf(p.tickUpper)) : now * 1.2;
+    // Поле зрения: диапазон плюс запас, и цена обязательно внутри.
+    // Поле зрения ЗАМЕТНО шире диапазона: автор просил видеть, что
+    // творится вокруг, а не только внутри своей полосы.
+    const span = Math.max(hi, now) - Math.min(lo, now);
+    const left = Math.max(1e-18, Math.min(lo, now) - span * 0.55);
+    const right = Math.max(hi, now) + span * 0.55;
+    const X = (v) => (v - left) / (right - left) * w;
+
+    // РАСПРЕДЕЛЕНИЕ ЛИКВИДНОСТИ — где стоят чужие позиции.
+    const pr = state.profile;
+    if (pr && pr.bars && pr.bars.length) {
+      let mx = 0n;
+      for (const b of pr.bars) if (b.liq > mx) mx = b.liq;
+      if (mx > 0n) {
+        for (const b of pr.bars) {
+          const pa = priceOf(b.from), pb = priceOf(b.to);
+          const xa = X(Math.min(pa, pb)), xb = X(Math.max(pa, pb));
+          if (xb < 0 || xa > w) continue;
+          const k = Number(b.liq * 1000n / mx) / 1000;      // доля от максимума
+          const hh = Math.max(2, k * (h - 34));
+          // Чем плотнее ликвидность, тем ярче и насыщеннее столбик —
+          // «где сколько стоит» видно по цвету, а не только по высоте.
+          const a = 0.16 + k * 0.5;
+          const gr = g.createLinearGradient(0, h - 14 - hh, 0, h - 14);
+          gr.addColorStop(0, `rgba(${70 + k * 60},${150 + k * 60},${210},${a})`);
+          gr.addColorStop(1, `rgba(${40 + k * 40},${90 + k * 50},${150},${a * 0.5})`);
+          g.fillStyle = gr;
+          const x0 = Math.max(0, xa), x1 = Math.min(w, xb);
+          g.fillRect(x0, h - 14 - hh, Math.max(1, x1 - x0 - 1), hh);
+          g.strokeStyle = `rgba(120,190,240,${0.3 + k * 0.5})`;
+          g.lineWidth = 1.5;
+          g.beginPath(); g.moveTo(x0, h - 14 - hh);
+          g.lineTo(x1 - 1, h - 14 - hh); g.stroke();
+        }
+      }
+    }
+
+    // ПОДПИСИ ЦЕН по всей ширине, чтобы можно было прикинуть уровень.
+    g.font = '10px ui-monospace,Menlo,monospace';
+    g.textAlign = 'center';
+    for (let i = 0; i <= 6; i++) {
+      const x = w * i / 6;
+      const v = left + (right - left) * i / 6;
+      g.strokeStyle = '#141d27'; g.lineWidth = 1;
+      g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h - 12); g.stroke();
+      g.fillStyle = '#55677a';
+      const rel = (v / now - 1) * 100;
+      g.fillText((rel >= 0 ? '+' : '') + rel.toFixed(0) + '%',
+                 Math.min(w - 14, Math.max(14, x)), h - 2);
+    }
+
+    // полоса позиции
+    if (p) {
+      const x0 = X(lo), x1 = X(hi);
+      const grad = g.createLinearGradient(x0, 0, x1, 0);
+      grad.addColorStop(0, 'rgba(38,208,124,.06)');
+      grad.addColorStop(.5, 'rgba(38,208,124,.20)');
+      grad.addColorStop(1, 'rgba(38,208,124,.06)');
+      g.fillStyle = grad;
+      g.fillRect(x0, 8, Math.max(2, x1 - x0), h - 22);
+      g.strokeStyle = '#26d07c'; g.lineWidth = 2;
+      for (const x of [x0, x1]) {
+        g.beginPath(); g.moveTo(x, 6); g.lineTo(x, h - 14); g.stroke();
+      }
+      g.fillStyle = 'rgba(38,208,124,.9)';
+      g.font = '10px ui-monospace,Menlo,monospace';
+      g.textAlign = 'left';
+      g.fillText('моя позиция', Math.max(2, x0 + 4), 16);
+    }
+
+    // текущая цена
+    const xn = X(now);
+    g.strokeStyle = '#f0a742'; g.lineWidth = 2;
+    g.setLineDash([4, 3]);
+    g.beginPath(); g.moveTo(xn, 4); g.lineTo(xn, h - 10); g.stroke();
+    g.setLineDash([]);
+    g.fillStyle = '#f0a742';
+    g.beginPath(); g.moveTo(xn, 4); g.lineTo(xn - 5, -3); g.lineTo(xn + 5, -3);
+    g.closePath(); g.fill();
+
+    $('c-lo').textContent = fmtPrice(left);
+    $('c-hi').textContent = fmtPrice(right);
+    $('c-now').textContent = 'цена ' + fmtPrice(now);
+
+    // ГЛАВНОЕ ЧИСЛО, а не картинка: сколько цене ещё идти до диапазона.
+    // Пока она снаружи, позиция не работает и комиссий не приносит.
+    if (p) {
+      const inside = now >= lo && now <= hi;
+      const near = now < lo ? lo : hi;             // ближняя граница
+      const away = (near / now - 1) * 100;
+      $('c-gap').innerHTML = inside
+        ? '<span class="ok">цена ВНУТРИ — позиция работает</span>'
+        : `до диапазона <b class="num warn">${Math.abs(away).toFixed(2)}%</b> ` +
+          `<span class="dim">${away > 0 ? 'вверх' : 'вниз'}</span>`;
+    } else {
+      $('c-gap').textContent = '';
+    }
+  }
+
+  // ── расчёт диапазона ────────────────────────────────────────────────────
+  // Цена как на графике: без экспоненты, с достаточным числом знаков,
+  // чтобы уровень можно было отложить у себя в терминале.
+  function fmtPrice(v) {
+    if (!isFinite(v) || v <= 0) return '—';
+    if (v >= 1) return v.toFixed(6);
+    const mag = Math.floor(Math.log10(v));
+    return v.toFixed(Math.min(18, Math.max(6, -mag + 4)));
+  }
+
+  function recalc() {
+    if (!state.pool || !state.slot0) return null;
+    try {
+      const r = resolveSide();
+      state.side = r.side;
+      const below = goesBelow(r.side);
+      const p = C.planRange({
+        tick: state.slot0.tick, tickSpacing: state.pool.tickSpacing,
+        widthPct: askedToRaw(state.width, below),
+        gapPct: askedToRaw(state.gap, below),
+        side: r.side,
+      });
+      // Показываем ЯВНО, какой токен уйдёт с кошелька. Именно эту строку
+      // надо сверять с окном Rabby.
+      const depSym = r.token.toLowerCase() === (state.pool.currency0 || '').toLowerCase()
+        ? state.pool.sym0 : state.pool.sym1;
+      $('v-dep').textContent = `${state.amount} ${depSym}`;
+      // При перевороте цены нижняя граница становится верхней.
+      const a = priceOf(p.tickLower), b = priceOf(p.tickUpper);
+      $('v-lo').textContent = fmtPrice(Math.min(a, b));
+      $('v-hi').textContent = fmtPrice(Math.max(a, b));
+      // Проценты показываем В ТОЙ ЖЕ ЦЕНЕ, что и Min/Max выше и график ниже.
+      const gapShown = rawToShown(p.gapReal);
+      const widthShown = rawToShown(p.widthReal);
+      $('v-gap').textContent = gapShown.toFixed(2) + '%';
+      $('v-width').textContent = widthShown.toFixed(2) + '%';
+      $('v-side').innerHTML = p.oneSided
+        ? '<span class="ok">да</span>' : '<span class="bad">НЕТ</span>';
+      const asked = below ? -state.gap : state.gap;
+      drawChart(p);
+      $('rangeinfo').innerHTML = Math.abs(gapShown - asked) > 1
+        ? `<div class="hint warn">просил ${asked}%, шаг пула позволяет только ` +
+          `${gapShown.toFixed(2)}% — это ограничение пула, не ошибка</div>` : '';
+      return p;
+    } catch (e) {
+      drawChart(null);
+      $('rangeinfo').innerHTML = `<div class="hint bad">${e.message}</div>`;
+      return null;
+    }
+  }
+
+  // ── деньги ──────────────────────────────────────────────────────────────
+  // КАКОЙ ТОКЕН ВНОСИТСЯ.
+  //
+  // Здесь была моя ошибка, из-за которой терминал чуть не внёс мемкоин
+  // вместо стейбла. Порядок токенов в пуле задаётся их адресами, а не
+  // смыслом: в паре UNICORN/USDG стейбл оказался вторым, а в USDG/TAOBAO —
+  // ПЕРВЫМ. Я же считал, что «вниз» всегда значит «вторым токеном».
+  //
+  // Правило без исключений:
+  //   диапазон НИЖЕ цены держит currency1;
+  //   диапазон ВЫШЕ цены держит currency0.
+  //
+  // Поэтому сторону выбирает не человек, а расположение стейбла в паре.
+  // Комиссия из ключа пула. Значение от 0x800000 — это НЕ проценты, а флаг
+  // плавающей комиссии; делить его на 10000 давало «838.86%». И три знака
+  // после запятой обязательны: 0.003% и 0.000% на глаз различаются только так.
+  function feeText(fee) {
+    if (fee >= 0x800000) return 'плавающая';
+    return (fee / 10000).toFixed(3) + '%';
+  }
+
+  const STABLE = /^(usdg|usdc|usdt|dai|usde|usdc\.e|frax|tusd)$/i;
+
+  function stableSide() {
+    if (!state.pool) return null;
+    if (STABLE.test(state.pool.sym1 || '')) return 1;
+    if (STABLE.test(state.pool.sym0 || '')) return 0;
+    return null;                                  // стейбла в паре нет
+  }
+
+  // ── ПРОЦЕНТЫ ТОЖЕ НАДО ПЕРЕВОРАЧИВАТЬ ───────────────────────────────────
+  //
+  // Границы диапазона я когда-то уже чинил: цену переворачивал, а границы
+  // оставлял сырыми, и в таблице выходило «Min 2610» при цене 0.0004.
+  // Проценты остались непочиненными, и это всплыло на USDG/ROBINCAT.
+  //
+  // Тик считает currency1 за currency0. Когда стейбл стоит ПЕРВЫМ, показанная
+  // цена — перевёрнутая, и «вниз» в ней означает «вверх» в тиках. Автор
+  // просил ширину 50%, планировщик честно отложил +50% в сырой цене, а на
+  // графике это оказалось всего −34.7%: 1/1.5314 = 0.653. Он померил по
+  // свечам −32% и справедливо спросил, где обещанные пятьдесят.
+  //
+  // Поэтому: ввод переводим из показанной цены в сырую, а результат — обратно.
+  const priceInverted = () => stableSide() === 0;
+
+  // Процент, который ввёл автор (в ТОЙ цене, что он видит) → процент для
+  // планировщика (в сырой цене тиков). below — диапазон ниже показанной цены.
+  // Сама арифметика живёт в ядре — там до неё дотягиваются проверки.
+  const askedToRaw = (pct, below) => C.askedToRawPct(pct, below, priceInverted());
+  const rawToShown = (rawPct) => C.rawToShownPct(rawPct, priceInverted());
+
+  // Диапазон уходит ВНИЗ по показанной цене? В сырых тиках сторона может быть
+  // противоположной — именно из-за этого расхождения и вышла ошибка.
+  const goesBelow = (rawSide) =>
+    rawSide === 'down' ? !priceInverted() : priceInverted();
+
+  // Что человек хочет: купить монету за стейбл или продать монету за стейбл.
+  // Из этого однозначно следует сторона диапазона.
+  function resolveSide() {
+    const st = stableSide();
+    if (st === null) {
+      // Пара без стейбла — работаем по прямому выбору стороны.
+      return { side: state.side, token: state.side === 'down'
+        ? state.pool.currency1 : state.pool.currency0, known: false };
+    }
+    if (state.intent === 'buy') {
+      // Вносим стейбл.
+      return { side: st === 1 ? 'down' : 'up',
+               token: st === 1 ? state.pool.currency1 : state.pool.currency0,
+               known: true };
+    }
+    // Вносим монету, чтобы продать её выше.
+    return { side: st === 1 ? 'up' : 'down',
+             token: st === 1 ? state.pool.currency0 : state.pool.currency1,
+             known: true };
+  }
+
+  function quoteToken() {
+    return resolveSide().token;
+  }
+
+  function amountRaw() {
+    const t = quoteToken();
+    const d = state.decimals[t] ?? 18;
+    return BigInt(Math.round(state.amount * Math.pow(10, Math.min(d, 15)))) *
+           (10n ** BigInt(Math.max(0, d - 15)));
+  }
+
+  async function arm() {
+    if (!state.pool || !state.account) { log('нужны пул и кошелёк', 'bad'); return; }
+    const token = quoteToken();
+    const need = amountRaw();
+    const now = Math.floor(Date.now() / 1000);
+    const plan = await C.planApprovals(state.rpc, token, state.account, need, 1800, now);
+    if (!plan.steps.length) { log('разрешений уже хватает, можно входить', 'ok'); return; }
+    for (const s of plan.steps) {
+      log('прошу подпись: ' + s.what + ' на ' + state.amount);
+      try {
+        const h = await W.send({ from: state.account, to: s.tx.to, data: s.tx.data });
+        log('отправлено: ' + h, 'ok');
+      } catch (e) { log('отказ: ' + e.message, 'bad'); return; }
+    }
+  }
+
+  async function open() {
+    if (state.busy) return;
+    const p = recalc();
+    if (!p) { log('диапазон не посчитан', 'bad'); return; }
+    if (!state.account) { log('кошелёк не подключён', 'bad'); return; }
+    if (!p.oneSided) { log('позиция не односторонняя — не отправляю', 'bad'); return; }
+    const age = Date.now() - state.slot0At;
+    if (age > 3000) { log(`цене ${age} мс — жду свежую`, 'warn'); return; }
+
+    // ПРОВЕРКА БАЛАНСА ДО КОШЕЛЬКА.
+    //
+    // Симуляция ловит нехватку токена, но она идёт параллельно и её ответ
+    // приходит уже при открытом окне подписи. Дешевле проверить заранее:
+    // один запрос, зато не откроется окно с заведомо провальной сделкой.
+    const dep = resolveSide();
+    try {
+      const bal = BigInt(await C.ethCall(state.rpc, dep.token,
+        C.SEL.balanceOf + C.addrWord(state.account)));
+      const need = amountRaw();
+      if (bal < need) {
+        const d = state.decimals[dep.token] ?? 18;
+        const symd = dep.token.toLowerCase() === state.pool.currency0.toLowerCase()
+          ? state.pool.sym0 : state.pool.sym1;
+        log(`на кошельке ${(Number(bal) / Math.pow(10, d)).toFixed(4)} ${symd}, ` +
+            `а нужно ${state.amount} — вношу НЕ ТОТ токен или не хватает`, 'bad');
+        return;
+      }
+    } catch (e) { log('баланс не проверился: ' + e.message, 'warn'); }
+
+    const t0 = performance.now();
+    const key = state.pool;
+    const sqrtL = C.getSqrtRatioAtTick(p.tickLower);
+    const sqrtU = C.getSqrtRatioAtTick(p.tickUpper);
+    const amt = amountRaw();
+    // Односторонняя позиция: ниже цены она состоит только из currency1,
+    // выше — только из currency0.
+    const liquidity = p.oneSided && dep.side === 'down'
+      ? C.liquidityForAmount1(sqrtL, sqrtU, amt)
+      : C.liquidityForAmount0(sqrtL, sqrtU, amt);
+    // Неиспользуемой стороне ставим 0: если цена войдёт в диапазон, пока
+    // автор подписывает, транзакция откажет, а не потратит второй токен.
+    const data = C.buildMintCalldata({
+      key, tickLower: p.tickLower, tickUpper: p.tickUpper, liquidity,
+      amount0Max: dep.side === 'down' ? 0n : amt,
+      amount1Max: dep.side === 'down' ? amt : 0n,
+      owner: state.account,
+      deadline: Math.floor(Date.now() / 1000) + 90,
+    });
+    log(`собрал за ${(performance.now() - t0).toFixed(1)} мс, открываю кошелёк`);
+    state.busy = true;
+    setTimeout(() => { state.busy = false; }, 4000);
+
+    // Симуляция ПАРАЛЛЕЛЬНО: ответ придёт, пока читаешь окно Rabby.
+    C.simulate(state.rpc, state.account, C.RH.positionManager, data)
+      .then(r => log(r.ok ? 'симуляция: пройдёт' : 'СИМУЛЯЦИЯ НЕ ПРОШЛА: ' + r.why,
+                     r.ok ? 'ok' : 'bad'));
+    try {
+      const h = await W.send({ from: state.account, to: C.RH.positionManager, data });
+      log('вход отправлен: ' + h, 'ok');
+      // Запоминаем вход: сумму, цену и время. Сеть этого не хранит, а без
+      // него честного итога после закрытия не посчитать.
+      pendingEntry = { amountIn: state.amount, tEntry: Date.now(),
+                       priceIn: priceOf(state.slot0.tick), hash: h,
+                       token0: key.currency0, token1: key.currency1,
+                       pair: `${state.pool.sym0}/${state.pool.sym1}`,
+                       fee: state.pool.fee };
+      setTimeout(() => bindEntry(), 6000);
+      setTimeout(loadPositions, 6000);
+    } catch (e) { log('кошелёк отказал: ' + e.message, 'bad'); }
+  }
+
+  // Привязка записи о входе к номеру NFT: номер известен только после того,
+  // как транзакция попала в блок.
+  let pendingEntry = null;
+  async function bindEntry() {
+    if (!pendingEntry) return;
+    try {
+      const r = await fetch(
+        `https://robinhoodchain.blockscout.com/api/v2/transactions/${pendingEntry.hash}`);
+      const tx = await r.json();
+      const nft = (tx.token_transfers || []).find(t =>
+        (t.token?.address_hash || '').toLowerCase() === C.RH.positionManager);
+      const id = nft && (nft.total?.token_id || nft.token_id);
+      if (!id) { setTimeout(bindEntry, 4000); return; }
+      ledger.put(String(id), pendingEntry);
+      log(`вход записан: позиция ${id}, ${pendingEntry.amountIn} по цене ` +
+          `${pendingEntry.priceIn.toPrecision(6)}`, 'ok');
+      pendingEntry = null;
+      loadPositions();
+    } catch (e) { setTimeout(bindEntry, 4000); }
+  }
+
+  // ── позиции ─────────────────────────────────────────────────────────────
+  async function loadPositions() {
+    const run = ++posRun;
+    const stale = () => run !== posRun;
+    const tb = $('pos').querySelector('tbody');
+    if (!state.account) { tb.innerHTML = '<tr><td colspan="7" class="hint">подключи кошелёк</td></tr>'; return; }
+    tb.innerHTML = '<tr><td colspan="7" class="hint">читаю…</td></tr>';
+    let ids = [];
+    try {
+      // ЖУРНАЛ СОБЫТИЙ ЧИТАЕМ ЧЕРЕЗ ПУБЛИЧНЫЙ УЗЕЛ.
+      //
+      // Бесплатный тариф Alchemy разрешает eth_getLogs всего по 10 блоков за
+      // запрос — при блоках по 0.1 секунды это одна секунда истории, искать
+      // так невозможно. Публичный узел Robinhood отдаёт сразу сотни тысяч
+      // блоков. Скорость от этого не страдает: цена и вход по-прежнему идут
+      // через твой быстрый узел, а журнал нужен только для списка позиций.
+      // Раньше здесь шёл перебор окнами на 60 000 блоков — три тяжёлых
+      // запроса, дающих всего 1.7 часа истории, и узел на них отвечал
+      // «internal server error». Один запрос по всей истории и дешевле,
+      // и полнее: фильтр по адресу делает глубину бесплатной.
+      ids = (await C.readAllPositions(logsRpc(), state.account)).map(x => x.id);
+    } catch (e) { log('позиции не прочитались: ' + e.message, 'warn'); }
+    // Свои позиции знаем сами: обозреватель индексирует новую NFT с
+    // задержкой до полуминуты, и всё это время позиция «пропадала».
+    // Номера, которые мы открыли сами, добавляем сразу и читаем прямо
+    // из контракта.
+    for (const k of Object.keys(ledger.all())) {
+      if (!ids.includes(k)) ids.unshift(k);
+    }
+    if (stale()) return;
+    if (!ids.length) { tb.innerHTML = '<tr><td colspan="7" class="hint">позиций нет</td></tr>'; return; }
+    tb.innerHTML = '';
+    let shown = 0;
+    for (const id of ids.slice(0, 40)) {
+      let liq = 0n, info = null;
+      try {
+        liq = await C.readPositionLiquidity(state.rpc, id);
+        if (liq === 0n) continue;                 // пустая оболочка
+        info = await C.readPositionPool(state.rpc, id);
+      } catch (e) { continue; }
+      if (stale()) return;
+      shown++;
+      const t = C.unpackTicks(info.info);
+      const poolId = poolIdOf(info.key);
+      let s0 = null, fees = null;
+      try { s0 = await C.readSlot0(state.rpc, poolId); } catch (e) { /* нет цены */ }
+      try {
+        fees = await C.readFees(state.rpc, poolId, id, t.tickLower, t.tickUpper,
+                                window.keccak256);
+      } catch (e) { /* комиссии не критичны */ }
+      const d0 = await tokenDecimals(info.key.currency0);
+      const d1 = await tokenDecimals(info.key.currency1);
+      const sym0 = await tokenSymbol(info.key.currency0);
+      const sym1 = await tokenSymbol(info.key.currency1);
+
+      // СОСТАВ: сколько чего лежит сейчас и сколько это в стейбле.
+      let comp = '—', valueStr = '—', total = null, stableSym = sym1, feesValue = 0;
+      if (s0) {
+        const a = C.amountsForLiquidity(
+          s0.sqrtPriceX96, C.getSqrtRatioAtTick(t.tickLower),
+          C.getSqrtRatioAtTick(t.tickUpper), liq);
+        const raw = Math.pow(1.0001, s0.tick) * Math.pow(10, d0 - d1);
+        const n0 = Number(a.amount0) / Math.pow(10, d0);
+        const n1 = Number(a.amount1) / Math.pow(10, d1);
+        // СТОИМОСТЬ СЧИТАЕМ В СТЕЙБЛЕ, а не в currency1.
+        // Здесь была ошибка: у пары USDG/TAOBAO стоимость выходила
+        // «3335 TAOBAO», а итог показывал +166690%. Стейбл может стоять
+        // первым, и тогда пересчитывать надо в него, а не в него же наоборот.
+        const st = STABLE.test(sym1 || '') ? 1 : (STABLE.test(sym0 || '') ? 0 : 1);
+        stableSym = st === 1 ? sym1 : sym0;
+        let v0, v1;
+        if (st === 1) { v0 = n0 * raw; v1 = n1; }          // стейбл — второй
+        else { v0 = n0; v1 = raw ? n1 / raw : 0; }         // стейбл — первый
+        total = v0 + v1;
+        const pc = (v) => total > 0 ? (v / total * 100).toFixed(0) + '%' : '—';
+        comp = `${fmtNum(n0)} ${sym0} <span class="dim">${pc(v0)}</span><br>` +
+               `${fmtNum(n1)} ${sym1} <span class="dim">${pc(v1)}</span>`;
+        if (fees) {
+          const g0 = Number(fees.fee0) / Math.pow(10, d0);
+          const g1 = Number(fees.fee1) / Math.pow(10, d1);
+          feesValue = st === 1 ? g0 * raw + g1 : g0 + (raw ? g1 / raw : 0);
+        }
+        valueStr = `${total.toFixed(4)} ${stableSym}` +
+          (fees ? `<br><span class="ok">+${feesValue.toFixed(4)} комиссий</span>` +
+                  `<br><span class="dim">итого ${(total + feesValue).toFixed(4)}</span>` : '');
+      }
+
+      // ВРЕМЯ В ПОЗИЦИИ И ИТОГ — СЧИТАЕМ ПОСЛЕ ОТРИСОВКИ СТРОКИ.
+      //
+      // Поиск входа ходит в журнал сети и занимает секунды. Строка ждала его,
+      // и автор открыл позицию с реальными деньгами, а в таблице её не
+      // было — вместе с кнопкой «Закрыть». Позицию надо показывать сразу,
+      // а вход дописывать, когда посчитается.
+      let timeStr = '—';
+      let pnlStr = '<span class="dim">ищу вход в цепочке…</span>';
+      const timeOf = (rec) => {
+        if (!rec || !rec.tEntry) return '—';
+        const mins = (Date.now() - rec.tEntry) / 60000;
+        return (mins < 60 ? `${mins.toFixed(0)} мин` : `${(mins / 60).toFixed(1)} ч`) +
+               (rec.entryPrice
+                 ? `<br><span class="dim">вход по ${fmtPrice(rec.entryPrice)}</span>` : '');
+      };
+      // ЕСЛИ ЗАКРЫТЬ И ПРОДАТЬ ПРЯМО СЕЙЧАС.
+      //
+      // Наивная оценка «стоимость плюс комиссии» завышена: чтобы получить
+      // чистый стейбл, монету надо продать, а продажа платит комиссию пула.
+      // У пула с комиссией 5% это заметные деньги, и молчать о них нельзя.
+      let cashOut = null;
+      if (total != null && s0) {
+        const feeShare = (info.key.fee || 0) / 1000000;   // 50000 → 0.05
+        const raw2 = Math.pow(1.0001, s0.tick) * Math.pow(10, d0 - d1);
+        const stIdx2 = STABLE.test(sym1 || '') ? 1 : 0;
+        const a2 = C.amountsForLiquidity(
+          s0.sqrtPriceX96, C.getSqrtRatioAtTick(t.tickLower),
+          C.getSqrtRatioAtTick(t.tickUpper), liq);
+        const coinQty = (stIdx2 === 1 ? Number(a2.amount0) / Math.pow(10, d0)
+                                      : Number(a2.amount1) / Math.pow(10, d1))
+          + (fees ? (stIdx2 === 1 ? Number(fees.fee0) / Math.pow(10, d0)
+                                  : Number(fees.fee1) / Math.pow(10, d1)) : 0);
+        const stableQty = (stIdx2 === 1 ? Number(a2.amount1) / Math.pow(10, d1)
+                                        : Number(a2.amount0) / Math.pow(10, d0))
+          + (fees ? (stIdx2 === 1 ? Number(fees.fee1) / Math.pow(10, d1)
+                                  : Number(fees.fee0) / Math.pow(10, d0)) : 0);
+        const coinPrice = stIdx2 === 1 ? raw2 : (raw2 ? 1 / raw2 : 0);
+        cashOut = stableQty + coinQty * coinPrice * (1 - feeShare);
+      }
+
+      const pnlOf = (rec) => {
+        let pnlStr = '—';
+      if (rec && rec.amountIn != null && total != null) {
+        // ИТОГ = стоимость позиции ПЛЮС накопленные комиссии.
+        // Раньше комиссии показывались отдельной зелёной строкой, но в итог
+        // не входили: позиция с +13.29 комиссий показывала минус 6.11.
+        // Автор справедливо спросил, где же плюс.
+        // ПЛЮС ВСЁ, ЧТО УЖЕ ВЫНУТО. После снятия комиссий или закрытия половины
+        // тело уменьшается, а вход остаётся прежним — без этого слагаемого
+        // итог показал бы выдуманный минус ровно на снятую сумму.
+        const out = rec.takenOut || 0;
+        const pnl = (total + feesValue + out) - rec.amountIn;
+        const pct = rec.amountIn > 0 ? (pnl / rec.amountIn * 100) : 0;
+        pnlStr = `<span class="${pnl >= 0 ? 'ok' : 'bad'}">${pnl >= 0 ? '+' : ''}` +
+                 `${pnl.toFixed(2)} (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)</span>` +
+                 (out > 0 ? `<br><span class="dim">уже вынуто ${out.toFixed(2)}, ` +
+                            `учтено в итоге</span>` : '');
+        if (cashOut != null) {
+          const net = cashOut + out - rec.amountIn;
+          const netPct = rec.amountIn ? net / rec.amountIn * 100 : 0;
+          pnlStr += `<br><span class="dim">закрыть и продать сейчас:</span>` +
+                    `<br><b class="${net >= 0 ? 'ok' : 'bad'}">${net >= 0 ? '+' : ''}` +
+                    `${net.toFixed(2)} USDG (${netPct >= 0 ? '+' : ''}${netPct.toFixed(2)}%)</b>` +
+                    `<br><span class="dim">= ${cashOut.toFixed(2)} на руки, ` +
+                    `комиссия продажи учтена</span>`;
+        }
+      } else if (total != null) {
+        pnlStr = '<span class="dim">вход в цепочке не найден</span>';
+      }
+        return pnlStr;
+      };
+
+      const inRange = s0 && s0.tick >= t.tickLower && s0.tick < t.tickUpper;
+      // Границы показываем ЦЕНОЙ, а не тиками: тик ни на одном графике не
+      // отложишь, а цену — сразу. Автор отмечает уровни у себя на графике.
+      // Границы — в ТЕХ ЖЕ единицах, что и цена сверху. Здесь я это забыл
+      // сделать: цену перевернул, а границы оставил сырыми, и в таблице
+      // выходило «Min 2610» при цене 0.0004. Автор справедливо спросил,
+      // почему цена нормальная, а границы нет.
+      const stIdx = STABLE.test(sym1 || '') ? 1 : (STABLE.test(sym0 || '') ? 0 : 1);
+      const pAt = (tk) => {
+        const raw = Math.pow(1.0001, tk) * Math.pow(10, d0 - d1);
+        return stIdx === 0 ? (raw ? 1 / raw : 0) : raw;
+      };
+      // При перевороте нижняя граница становится верхней.
+      const bLo = Math.min(pAt(t.tickLower), pAt(t.tickUpper));
+      const bHi = Math.max(pAt(t.tickLower), pAt(t.tickUpper));
+      let bounds = '—';
+      if (s0) {
+        const nowP = stIdx === 0
+          ? 1 / (Math.pow(1.0001, s0.tick) * Math.pow(10, d0 - d1))
+          : Math.pow(1.0001, s0.tick) * Math.pow(10, d0 - d1);
+        const inside = nowP >= bLo && nowP <= bHi;
+        const near = nowP < bLo ? bLo : bHi;
+        const away = Math.abs(near / nowP - 1) * 100;
+        bounds = `<span class="dim">Min</span> ${fmtPrice(bLo)}<br>` +
+                 `<span class="dim">Max</span> ${fmtPrice(bHi)}<br>` +
+                 (inside ? '<span class="ok">внутри</span>'
+                         : `<span class="warn">до входа ${away.toFixed(1)}%</span>`);
+      }
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        `<td class="num">${id}<br><span class="${inRange ? 'ok' : 'dim'}">${
+          inRange ? 'в работе' : 'ждёт'}</span></td>` +
+        `<td>${sym0}/${sym1}<br><span class="dim num">${timeStr}</span></td>` +
+        `<td class="num">${bounds}</td>` +
+        `<td class="num">${comp}</td>` +
+        `<td class="num">${valueStr}</td>` +
+        `<td class="num">${pnlStr}</td>` +
+        // Три действия вместо одного. Комиссии в Uniswap V4 забираются тем же
+        // действием DECREASE_LIQUIDITY, что и закрытие, только с нулём вместо
+        // ликвидности — форма вызова та самая, что сверена байт в байт с
+        // настоящими транзакциями Krystal. Все три варианта прогнаны
+        // симуляцией на живой позиции: проходят.
+        `<td style="white-space:nowrap">` +
+        // Названия пишем от того, ЧТО ОСТАНЕТСЯ, а не от того, что уйдёт.
+        // «Комиссии» и «½» автор принял за одно и то же — и правильно
+        // усомнился: с виду обе «забирают деньги». Разница в теле позиции.
+        `<button style="padding:4px 6px;font-size:11px" ` +
+        `title="забрать накопленные комиссии; тело позиции остаётся в пуле целиком">` +
+        `Комиссии<br><span class="dim" style="font-size:9px">тело целиком остаётся` +
+        `</span></button> ` +
+        `<button style="padding:4px 6px;font-size:11px" ` +
+        `title="забрать комиссии и половину тела; вторая половина продолжает работать">` +
+        `Половина<br><span class="dim" style="font-size:9px">+ все комиссии` +
+        `</span></button> ` +
+        `<button class="danger" style="padding:4px 6px;font-size:11px">` +
+        `Закрыть<br><span class="dim" style="font-size:9px">всё и выход` +
+        `</span></button></td>`;
+      {
+        const bs = tr.querySelectorAll('button');
+        bs[0].onclick = () => closePosition(id, 0n, info.key, total, stableSym, 'fees');
+        bs[1].onclick = () => closePosition(id, liq / 2n, info.key, total, stableSym, 'half');
+        bs[2].onclick = () => closePosition(id, liq, info.key, total, stableSym, 'all');
+      }
+      // Проверяем ВПЛОТНУЮ к записи: между прошлой проверкой и этим местом
+      // стоят запросы в сеть, и за это время мог начаться новый проход.
+      if (stale()) return;
+      tb.appendChild(tr);
+
+      // Вход дописываем, когда найдётся. Строка с кнопкой «Закрыть» уже
+      // стоит, и автор может выйти из позиции, не дожидаясь расчёта.
+      (async () => {
+        let rec = null;
+        try { rec = await entryFromChain(id, info.key, poolId, d0, d1, sym0, sym1); }
+        catch (e) { /* возьмём запись браузера */ }
+        if (!rec) rec = ledger.get(String(id));
+        if (stale() || !tr.parentNode) return;
+        tr.cells[1].innerHTML =
+          `${sym0}/${sym1}<br><span class="dim num">${timeOf(rec)}</span>`;
+        tr.cells[5].innerHTML = pnlOf(rec);
+      })();
+    }
+    if (!shown) tb.innerHTML = '<tr><td colspan="7" class="hint">открытых позиций нет</td></tr>';
+  }
+
+  // PoolId считается из ключа — тот же приём, что и при загрузке пула.
+  // ВХОД БЕРЁМ С ЦЕПОЧКИ.
+  //
+  // Раньше вход жил только в памяти браузера. Автор открыл терминал и
+  // увидел «вход не записан» на позиции, в которой сидел с реальными
+  // деньгами: память браузера не пережила смену версии. Такой источник
+  // правды о деньгах никуда не годится.
+  //
+  // Теперь спрашиваем цепочку: блок выпуска NFT, внесённые суммы из
+  // расписки, цена того блока из событий обмена. Это факт, а не наша запись.
+  // Найденное держим в памяти страницы, чтобы не искать повторно.
+  // ЗАЩИТА ОТ НАЛОЖЕНИЯ ОБНОВЛЕНИЙ.
+  //
+  // Обновление позиций ходит в цепочку и идёт секунды. За это время можно
+  // нажать кнопку ещё раз или получить событие кошелька — и два прохода
+  // начинают писать в одну таблицу. В проверке позиция показалась ДВАЖДЫ.
+  // Каждый проход берёт номер; писать в таблицу вправе только последний.
+  let posRun = 0, histRun = 0;
+
+  const entryCache = new Map();
+  function entryFromChain(id, key, poolId, d0, d1, sym0, sym1) {
+    const k = String(id);
+    if (entryCache.has(k)) return entryCache.get(k);
+    const p = (async () => {
+      // Журнал — только через публичный узел. Alchemy отдаёт eth_getLogs
+      // по 10 блоков за раз, и поиск входа там просто не работает.
+      const m = await C.findMint(logsRpc(), id);
+      if (!m) return null;
+      const f = await C.txFlows(state.rpc, m.hash, state.account);
+      const inflow = f ? f.flows.filter(x => x.dir < 0) : [];
+      if (!inflow.length) return null;
+      const pe = await C.priceAtBlock(logsRpc(), poolId, m.block);
+      const tEntry = await C.blockTime(state.rpc, m.block);
+      const raw = pe ? C.priceFromSqrt(pe.sqrtPriceX96, d0, d1) : null;
+      // Стейбл может стоять и первым, и вторым — порядок задают адреса.
+      const st = STABLE.test(sym1 || '') ? 1 : (STABLE.test(sym0 || '') ? 0 : 1);
+      let amountIn = 0;
+      for (const x of inflow) {
+        const is0 = x.token === key.currency0.toLowerCase();
+        const n = Number(x.amount) / Math.pow(10, is0 ? d0 : d1);
+        const isStable = (st === 1 && !is0) || (st === 0 && is0);
+        // Внесённое считаем ПО ЦЕНЕ ВХОДА — так это определено у Кристала
+        // и у Метеоры, и только так процент получается честным.
+        if (isStable) amountIn += n;
+        else if (raw) amountIn += st === 1 ? n * raw : n / raw;
+      }
+      return {
+        amountIn, tEntry, block: m.block, hash: m.hash, fromChain: true,
+        entryPrice: raw == null ? null : (st === 1 ? raw : (raw ? 1 / raw : 0)),
+      };
+    })().catch(() => null);
+    entryCache.set(k, p);
+    return p;
+  }
+
+  function poolIdOf(key) {
+    return window.keccak256('0x' +
+      C.addrWord(key.currency0) + C.addrWord(key.currency1) +
+      BigInt(key.fee).toString(16).padStart(64, '0') +
+      (((BigInt(key.tickSpacing) + (1n << 256n)) % (1n << 256n))
+        .toString(16).padStart(64, '0')).slice(-64) +
+      C.addrWord(key.hooks));
+  }
+
+  const fmtNum = (v) => v === 0 ? '0'
+    : Math.abs(v) >= 1000 ? v.toFixed(0)
+    : Math.abs(v) >= 1 ? v.toFixed(3) : v.toPrecision(3);
+
+  // mode: 'all' — закрыть целиком, 'half' — половину, 'fees' — только комиссии.
+  //
+  // Действие в цепочке одно и то же (DECREASE_LIQUIDITY + TAKE_PAIR),
+  // отличается только величина снимаемой ликвидности. Комиссии приходят
+  // ЦЕЛИКОМ при любом из трёх: пул отдаёт накопленное вместе с телом, а при
+  // нуле — накопленное и только его.
+  const MODES = {
+    all:  { verb: 'закрытие', ask: (id) => `Закрыть позицию ${id} ЦЕЛИКОМ?` },
+    half: { verb: 'частичное закрытие',
+            ask: (id) => `Закрыть ПОЛОВИНУ позиции ${id}?\n\n` +
+                         `Комиссии придут целиком, половина тела останется работать.` },
+    fees: { verb: 'снятие комиссий',
+            ask: (id) => `Забрать накопленные комиссии позиции ${id}?\n\n` +
+                         `Тело позиции останется в пуле и продолжит работать.` },
+  };
+
+  async function closePosition(tokenId, liquidity, key, valueNow, symQuote, mode = 'all') {
+    const m = MODES[mode] || MODES.all;
+    if (!confirm(m.ask(tokenId))) return;
+    // Снимать нечего — не гоняем кошелёк зря.
+    if (mode !== 'fees' && (!liquidity || liquidity <= 0n)) {
+      log('в позиции нет ликвидности — снимать нечего', 'warn');
+      return;
+    }
+    const rec = ledger.get(String(tokenId));
+    const data = C.buildCloseCalldata({
+      tokenId, liquidity,
+      currency0: key.currency0, currency1: key.currency1,
+      amount0Min: 0n, amount1Min: 0n,
+      deadline: Math.floor(Date.now() / 1000) + 120,
+    });
+    C.simulate(state.rpc, state.account, C.RH.positionManager, data)
+      .then(r => log(r.ok ? `${m.verb}: симуляция пройдёт`
+                          : `${m.verb.toUpperCase()} НЕ ПРОЙДЁТ: ` + r.why,
+                     r.ok ? 'ok' : 'bad'));
+    try {
+      const h = await W.send({ from: state.account, to: C.RH.positionManager, data });
+      log(`${m.verb} отправлено: ` + h, 'ok');
+      // ЧЕСТНЫЙ ИТОГ. Считаем по тому, что реально вернулось, а не по
+      // ожиданиям: читаем переводы самой транзакции закрытия.
+      if (mode === 'all') settleClose(h, tokenId, rec, symQuote, key);
+      else settleTake(h, tokenId, symQuote, key, m.verb);
+      setTimeout(loadPositions, 5000);
+    } catch (e) { log('кошелёк отказал: ' + e.message, 'bad'); }
+  }
+
+  // ЧАСТИЧНЫЙ ВЫВОД. Считать его как закрытие нельзя: вход остаётся прежним,
+  // а тело уменьшилось, и итог показал бы выдуманный минус в половину суммы.
+  //
+  // Поэтому забранное складывается в ledger, а PnL прибавляет его к тому, что
+  // осталось внутри. Позиция стоит ровно столько, сколько в ней лежит ПЛЮС всё,
+  // что из неё уже вынуто.
+  async function settleTake(hash, tokenId, symQuote, key, verb) {
+    for (let i = 0; i < 12; i++) {
+      await new Promise(r => setTimeout(r, 2500));
+      let tx = null;
+      try {
+        const r = await fetch(
+          `https://robinhoodchain.blockscout.com/api/v2/transactions/${hash}`);
+        tx = await r.json();
+      } catch (e) { continue; }
+      if (!tx || !tx.status) continue;
+      if (tx.status !== 'ok') { log(`${verb} НЕ прошло: ` + (tx.result || ''), 'bad'); return; }
+
+      let back0 = 0, back1 = 0;
+      for (const t of (tx.token_transfers || [])) {
+        if ((t.to?.hash || '').toLowerCase() !== state.account.toLowerCase()) continue;
+        const a = (t.token?.address_hash || '').toLowerCase();
+        const dec = Number(t.token?.decimals || 18);
+        const v = Number(t.total?.value || 0) / Math.pow(10, dec);
+        if (a === key.currency0.toLowerCase()) back0 += v;
+        if (a === key.currency1.toLowerCase()) back1 += v;
+      }
+      let price = 0;
+      try {
+        const s0 = await C.readSlot0(state.rpc, poolIdOf(key));
+        price = Math.pow(1.0001, s0.tick) *
+                Math.pow(10, await tokenDecimals(key.currency0) -
+                             await tokenDecimals(key.currency1));
+      } catch (e) { /* без цены посчитаем только в токенах */ }
+      const stableIsFirst = symQuote && (await tokenSymbol(key.currency0)) === symQuote;
+      const got = stableIsFirst ? back0 + (price ? back1 / price : 0)
+                                : back1 + back0 * price;
+      const prev = ledger.get(String(tokenId)) || {};
+      const takenOut = (prev.takenOut || 0) + got;
+      ledger.put(String(tokenId), { takenOut, lastTake: Date.now() });
+      log(`${verb.toUpperCase()} ПРОШЛО ${tokenId}: получено ${back0.toFixed(4)} + ` +
+          `${back1.toFixed(4)} = ${got.toFixed(4)} ${symQuote}. ` +
+          `Всего вынуто из позиции: ${takenOut.toFixed(4)} ${symQuote} — ` +
+          `итог считаю с учётом этого.`, 'ok');
+      return;
+    }
+    log(`${verb}: подтверждения не дождался, проверь кошелёк`, 'warn');
+  }
+
+  async function settleClose(hash, tokenId, rec, symQuote, key) {
+    for (let i = 0; i < 12; i++) {
+      await new Promise(r => setTimeout(r, 2500));
+      let tx = null;
+      try {
+        const r = await fetch(
+          `https://robinhoodchain.blockscout.com/api/v2/transactions/${hash}`);
+        tx = await r.json();
+      } catch (e) { continue; }
+      if (!tx || !tx.status) continue;
+      if (tx.status !== 'ok') { log('закрытие НЕ прошло: ' + (tx.result || ''), 'bad'); return; }
+      // сколько чего вернулось нам
+      let back0 = 0, back1 = 0;
+      for (const t of (tx.token_transfers || [])) {
+        const to = (t.to?.hash || '').toLowerCase();
+        if (to !== state.account.toLowerCase()) continue;
+        const a = (t.token?.address_hash || '').toLowerCase();
+        const dec = Number(t.token?.decimals || 18);
+        const v = Number(t.total?.value || 0) / Math.pow(10, dec);
+        if (a === key.currency0.toLowerCase()) back0 += v;
+        if (a === key.currency1.toLowerCase()) back1 += v;
+      }
+      let price = 0;                              // сырая: currency1 за currency0
+      try {
+        const s0 = await C.readSlot0(state.rpc, poolIdOf(key));
+        const d0 = await tokenDecimals(key.currency0);
+        const d1 = await tokenDecimals(key.currency1);
+        price = Math.pow(1.0001, s0.tick) * Math.pow(10, d0 - d1);
+      } catch (e) { /* без цены посчитаем только в токенах */ }
+      // Итог тоже в стейбле, с какой бы стороны он ни стоял.
+      const st = STABLE.test(symQuote || '') ? null : null;
+      const stableIsFirst = symQuote &&
+        (await tokenSymbol(key.currency0)) === symQuote;
+      const got = stableIsFirst
+        ? back0 + (price ? back1 / price : 0)
+        : back1 + back0 * price;
+      const mins = rec && rec.tEntry ? (Date.now() - rec.tEntry) / 60000 : null;
+      let line = `ЗАКРЫТО ${tokenId}: вернулось ${back0.toFixed(4)} + ` +
+                 `${back1.toFixed(4)} ${symQuote} = ${got.toFixed(4)} ${symQuote}`;
+      if (rec && rec.amountIn != null) {
+        // То, что вынули раньше (комиссии, половина), входит в итог наравне
+        // с тем, что вернулось сейчас. Иначе закрытие остатка выглядело бы
+        // убытком ровно на снятую сумму.
+        const out = (ledger.get(String(tokenId)) || {}).takenOut || 0;
+        const pnl = got + out - rec.amountIn;
+        const pct = rec.amountIn > 0 ? pnl / rec.amountIn * 100 : 0;
+        if (out > 0) line += ` + вынуто раньше ${out.toFixed(4)}`;
+        line += ` | вносил ${rec.amountIn.toFixed(4)} → ИТОГ ${pnl >= 0 ? '+' : ''}` +
+                `${pnl.toFixed(4)} (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)`;
+        if (mins != null) line += ` за ${mins < 60 ? mins.toFixed(0) + ' мин' : (mins/60).toFixed(1) + ' ч'}`;
+        ledger.put(String(tokenId), { closed: Date.now(), got, pnl });
+        // Одна карточка сразу после закрытия — как просил автор.
+        // Не копятся: старая убирается перед показом новой.
+        showCard(String(tokenId), { ...(ledger.get(String(tokenId)) || {}) });
+      } else {
+        line += ' | вход не записан, итог посчитать не с чем';
+      }
+      log(line, rec && rec.amountIn != null && got >= rec.amountIn ? 'ok' : 'warn');
+      return;
+    }
+    log('закрытие отправлено, но подтверждения не дождался — проверь в обозревателе', 'warn');
+  }
+
+  // Узел для журнала событий: публичный, у него нет ограничения глубины.
+  let _logsRpc = null;
+  function logsRpc() {
+    if (!_logsRpc) _logsRpc = C.makeRpc(C.RH.publicRpc);
+    return _logsRpc;
+  }
+
+  // ── история сделок ──────────────────────────────────────────────────────
+  //
+  // Читается из журнала событий сети: все переводы токенов между кошельком
+  // и PoolManager. Вход — деньги ушли, выход — вернулись. Это надёжнее наших
+  // записей: показывает, что реально двигалось, даже если позиция открыта
+  // не через терминал.
+  // ── история сделок: каждая сторона по цене СВОЕГО момента ──────────────
+  //
+  // Так считают Кристал и Метеора, и только так процент честный: внесённое
+  // оценивается по цене входа, полученное — по цене выхода.
+  //
+  // Комиссии отдельной строкой НЕ прибавляем. При закрытии пул отдаёт тело
+  // позиции вместе с накопленными комиссиями одним движением — в полученных
+  // суммах они уже сидят. Прибавить их ещё раз значит посчитать дважды.
+  //
+  // Раньше здесь была моя выдумка: цену закрытия я вычислял из самих
+  // вернувшихся сумм. Она давала «цену закрытия 1.000000», сделки по
+  // +21107% и итог +165 562 при обороте в тысячи. Теперь цена берётся из
+  // события обмена в пуле — она там лежит готовая.
+  // Блок в этой сети ~0.101 с — этим меряем время в позиции.
+  const BLOCK_SEC = 0.101;
+  const HIST_LIMIT = 25;
+
+  async function loadHistory() {
+    const run = ++histRun;
+    const stale = () => run !== histRun;
+    const tb = $('hist').querySelector('tbody');
+    if (!state.account || !state.rpc) {
+      tb.innerHTML = '<tr><td colspan="4" class="hint">нужны кошелёк и узел</td></tr>';
+      return;
+    }
+    tb.innerHTML = '<tr><td colspan="4" class="hint">читаю цепочку…</td></tr>';
+
+    let all = [];
+    try { all = await C.readAllPositions(logsRpc(), state.account); }
+    catch (e) {
+      tb.innerHTML = '<tr><td colspan="4" class="hint">узел не отдал историю: ' +
+                     (e.message || '') + '</td></tr>';
+      return;
+    }
+    if (!all.length) {
+      tb.innerHTML = '<tr><td colspan="4" class="hint">позиций не было</td></tr>';
+      return;
+    }
+    const take = all.slice(0, HIST_LIMIT);
+
+    // Раскладываем по пулам: события ликвидности читаются пулом целиком,
+    // так на десяток позиций уходит пара запросов вместо десятка.
+    const pools = new Map();
+    for (const it of take) {
+      let info;
+      try { info = await C.readPositionPool(state.rpc, it.id); } catch (e) { continue; }
+      const pid = poolIdOf(info.key);
+      if (!pools.has(pid)) pools.set(pid, { key: info.key, items: [], from: it.block });
+      const g = pools.get(pid);
+      g.items.push({ ...it, info });
+      g.from = Math.min(g.from, it.block);
+    }
+
+    const rows = [];
+    for (const [pid, g] of pools) {
+      const d0 = await tokenDecimals(g.key.currency0);
+      const d1 = await tokenDecimals(g.key.currency1);
+      const s0 = await tokenSymbol(g.key.currency0);
+      const s1 = await tokenSymbol(g.key.currency1);
+      const st = STABLE.test(s1 || '') ? 1 : (STABLE.test(s0 || '') ? 0 : 1);
+      const stableSym = st === 1 ? s1 : s0;
+
+      let events;
+      try { events = await C.readPositionEvents(logsRpc(), pid, g.from, g.items.map(x => x.id)); }
+      catch (e) { continue; }
+
+      // Одна транзакция может закрыть несколько позиций сразу. Тогда её
+      // движения относятся ко всем сразу, и приписать их одной — соврать.
+      // Считаем, сколько наших позиций в каждой транзакции.
+      const share = new Map();
+      for (const it of g.items) {
+        for (const ev of (events.get(it.id) || [])) {
+          const k = ev.hash + (ev.delta > 0n ? ':in' : ':out');
+          share.set(k, (share.get(k) || 0n) + (ev.delta > 0n ? ev.delta : -ev.delta));
+        }
+      }
+
+      // Стоимость движений транзакции по цене её собственного блока.
+      const valueAt = async (ev, dir) => {
+        const f = await C.txFlows(state.rpc, ev.hash, state.account);
+        const pr = await C.priceAtBlock(logsRpc(), pid, ev.block);
+        const raw = pr ? C.priceFromSqrt(pr.sqrtPriceX96, d0, d1) : null;
+        const mine = ev.delta > 0n ? ev.delta : -ev.delta;
+        const whole = share.get(ev.hash + (dir < 0 ? ':in' : ':out')) || mine;
+        const part = whole > 0n ? Number(mine) / Number(whole) : 1;
+        let v = 0; const parts = [];
+        for (const x of (f ? f.flows.filter(y => y.dir === dir) : [])) {
+          const is0 = x.token === g.key.currency0.toLowerCase();
+          const n = (Number(x.amount) / Math.pow(10, is0 ? d0 : d1)) * part;
+          const isStable = (st === 1 && !is0) || (st === 0 && is0);
+          v += isStable ? n : (raw ? (st === 1 ? n * raw : n / raw) : 0);
+          parts.push(`${fmtNum(n)} ${is0 ? s0 : s1}`);
+        }
+        return {
+          v, parts,
+          coinPx: raw == null ? null : (st === 1 ? raw : (raw ? 1 / raw : 0)),
+          split: part < 1,
+          ok: !!f && raw != null,
+        };
+      };
+
+      for (const it of g.items) {
+        const e = events.get(it.id) || [];
+        const open = e.find(x => x.delta > 0n);
+        const close = e.filter(x => x.delta < 0n).pop();
+        if (!open) continue;
+        const IN = await valueAt(open, -1);
+        const OUT = close ? await valueAt(close, 1) : null;
+        rows.push({
+          id: it.id, pair: `${s0}/${s1}`, stableSym,
+          openBlock: open.block, closeBlock: close ? close.block : null,
+          IN, OUT,
+          mins: close ? (close.block - open.block) * BLOCK_SEC / 60 : null,
+        });
+      }
+    }
+
+    rows.sort((a, b) => (b.closeBlock || b.openBlock) - (a.closeBlock || a.openBlock));
+
+    if (stale()) return;
+    if (!rows.length) {
+      tb.innerHTML = '<tr><td colspan="4" class="hint">сделок не нашёл</td></tr>';
+      return;
+    }
+
+    if (stale()) return;
+    tb.innerHTML = '';
+    let total = 0, counted = 0;
+    for (const r of rows) {
+      const tr = document.createElement('tr');
+      let res;
+      if (!r.OUT) {
+        res = '<span class="dim">ещё открыта</span>';
+      } else if (!r.IN.ok || !r.OUT.ok) {
+        res = '<span class="dim">цену момента не достал — итог не показываю</span>';
+      } else {
+        const pnl = r.OUT.v - r.IN.v;
+        const pct = r.IN.v > 0 ? pnl / r.IN.v * 100 : 0;
+        total += pnl; counted++;
+        const approx = r.IN.split || r.OUT.split;
+        res = `<span class="${pnl >= 0 ? 'ok' : 'bad'}">${approx ? '≈' : ''}` +
+              `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} · ${pct >= 0 ? '+' : ''}` +
+              `${pct.toFixed(2)}%</span><br><span class="dim">` +
+              `${r.IN.v.toFixed(2)} → ${r.OUT.v.toFixed(2)} ${r.stableSym}</span>` +
+              (approx ? '<br><span class="hint">закрыто вместе с другими, ' +
+                        'суммы делю по ликвидности</span>' : '');
+      }
+      const px = (x) => x && x.coinPx ? fmtPrice(x.coinPx) : '—';
+      tr.innerHTML =
+        `<td class="num dim">${r.closeBlock || r.openBlock}` +
+        `<br><span class="hint">NFT ${r.id}</span></td>` +
+        `<td>${r.pair}${r.mins != null
+            ? `<br><span class="dim">${r.mins < 60 ? r.mins.toFixed(0) + ' мин'
+                                                   : (r.mins / 60).toFixed(1) + ' ч'}</span>` : ''}</td>` +
+        `<td class="num"><span class="dim">внёс</span> ${r.IN.parts.join(' + ') || '—'}` +
+        `<br><span class="hint">монета по ${px(r.IN)}</span>` +
+        (r.OUT ? `<br><span class="dim">забрал</span> ${r.OUT.parts.join(' + ') || '—'}` +
+                 `<br><span class="hint">монета по ${px(r.OUT)}</span>` : '') +
+        `</td><td>${res}</td>`;
+      // Проверяем ВПЛОТНУЮ к записи: между прошлой проверкой и этим местом
+      // стоят запросы в сеть, и за это время мог начаться новый проход.
+      if (stale()) return;
+      tb.appendChild(tr);
+    }
+
+    const head = document.createElement('tr');
+    head.innerHTML =
+      `<td colspan="3"><b>итог по ${counted} закрытым сделкам</b>` +
+      `<br><span class="hint">внесённое по цене входа, полученное по цене выхода — ` +
+      `как считают Кристал и Метеора. Комиссии уже внутри полученного.</span></td>` +
+      `<td class="num"><b class="${total >= 0 ? 'ok' : 'bad'}">${
+        total >= 0 ? '+' : ''}${total.toFixed(2)}</b></td>`;
+    tb.prepend(head);
+    log(`история: ${rows.length} позиций, из них закрытых ${counted}`, 'ok');
+  }
+
+  // ── карточка сделки ─────────────────────────────────────────────────────
+  //
+  // Показывается после закрытия и по кнопке в истории. Не копится: одна
+  // карточка на экране, закрывается щелчком. Скачивается картинкой.
+  function drawCard(rec) {
+    const W = 900, H = 520;
+    const cv = document.createElement('canvas');
+    cv.width = W; cv.height = H;
+    const g = cv.getContext('2d');
+    g.fillStyle = '#07090c'; g.fillRect(0, 0, W, H);
+    // мягкое свечение в углу, чтобы не выглядело как таблица
+    const glow = g.createRadialGradient(W * 0.78, H * 0.18, 10, W * 0.78, H * 0.18, 420);
+    const win = (rec.pnl ?? 0) >= 0;
+    glow.addColorStop(0, win ? 'rgba(38,208,124,.16)' : 'rgba(239,91,91,.14)');
+    glow.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = glow; g.fillRect(0, 0, W, H);
+
+    g.fillStyle = '#7d8fa3';
+    g.font = '600 22px ui-sans-serif,system-ui,sans-serif';
+    const head = 'Uniswap V4';
+    g.fillText(head, 52, 74);
+    if (rec.fee != null) {
+      // Плашку ставим ПОСЛЕ надписи, отмерив её ширину. На глаз она налезала
+      // на текст: «Uniswap V4» шире, чем я предположил.
+      const x = 52 + g.measureText(head).width + 16;
+      const t = (rec.fee / 10000).toFixed(2) + '%';
+      g.font = '600 17px ui-sans-serif,system-ui,sans-serif';
+      const w = g.measureText(t).width;
+      g.fillStyle = '#1b2632';
+      g.fillRect(x, 52, w + 24, 30);
+      g.fillStyle = '#dbe4ee';
+      g.fillText(t, x + 12, 74);
+    }
+
+    g.fillStyle = '#ffffff';
+    g.font = '700 62px ui-sans-serif,system-ui,sans-serif';
+    g.fillText(rec.pair || 'позиция', 52, 168);
+
+    const pct = rec.amountIn ? (rec.pnl / rec.amountIn) * 100 : 0;
+    g.fillStyle = '#7d8fa3';
+    g.font = '600 30px ui-sans-serif,system-ui,sans-serif';
+    g.fillText(win ? 'Прибыль' : 'Убыток', 52, 300);
+    g.textAlign = 'right';
+    g.fillStyle = win ? '#26d07c' : '#ef5b5b';
+    g.font = '700 40px ui-monospace,Menlo,monospace';
+    g.fillText((pct >= 0 ? '+' : '') + pct.toFixed(2) + '%', W - 52, 300);
+    g.textAlign = 'left';
+    g.font = '700 110px ui-sans-serif,system-ui,sans-serif';
+    g.fillText((win ? '+$' : '−$') + Math.abs(rec.pnl ?? 0).toFixed(2), 52, 400);
+
+    g.fillStyle = '#55677a';
+    g.font = '400 20px ui-sans-serif,system-ui,sans-serif';
+    const mins = rec.tEntry && rec.closed
+      ? Math.max(1, Math.round((rec.closed - rec.tEntry) / 60000)) + ' мин в позиции' : '';
+    g.fillText(`${rec.amountIn} → ${(rec.got ?? 0).toFixed(2)}   ${mins}`, 52, 452);
+    g.textAlign = 'right';
+    g.fillText('LP EVM RH', W - 52, 452);
+    return cv;
+  }
+
+  function showCard(id, rec) {
+    document.querySelectorAll('.cardbox').forEach(x => x.remove());
+    const box = document.createElement('div');
+    box.className = 'cardbox';
+    box.style.cssText = 'position:fixed;inset:0;background:rgba(3,6,10,.82);' +
+      'display:flex;align-items:center;justify-content:center;z-index:9999;' +
+      'flex-direction:column;gap:14px';
+    const cv = drawCard(rec);
+    cv.style.cssText = 'max-width:min(92vw,900px);width:100%;height:auto;' +
+      'border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.6)';
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:10px';
+    const dl = document.createElement('button');
+    dl.textContent = 'Скачать картинку';
+    dl.className = 'go';
+    dl.onclick = () => {
+      const a = document.createElement('a');
+      a.download = `LP_${(rec.pair || id).replace('/', '_')}_${id}.png`;
+      a.href = cv.toDataURL('image/png');
+      a.click();
+    };
+    const cl = document.createElement('button');
+    cl.textContent = 'Закрыть';
+    cl.onclick = () => box.remove();
+    row.append(dl, cl);
+    box.append(cv, row);
+    box.onclick = (e) => { if (e.target === box) box.remove(); };
+    document.body.appendChild(box);
+  }
+
+  // ── запуск ──────────────────────────────────────────────────────────────
+  load();
+  chips($('r-amt'), [1, 2, 5, 10, 50, 100], '', () => state.amount, v => state.amount = v);
+  chips($('r-width'), [15, 30, 50, 70], '%', () => state.width, v => state.width = v);
+  chips($('r-gap'), [1, 3, 5, 10], '%', () => state.gap, v => state.gap = v);
+  sideRow();
+
+  $('b-rpc').onclick = checkRpc;
+  $('b-pool').onclick = loadPool;
+  $('b-arm').onclick = arm;
+  $('b-open').onclick = open;
+  $('b-pos').onclick = loadPositions;
+  // Кнопка была нарисована, но ни к чему не привязана — история
+  // обновлялась только при подключении кошелька.
+  $('b-hist').onclick = () => loadHistory();
+  $('b-wallet').onclick = async () => {
+    try {
+      const w = await W.connect();
+      state.account = w.address;
+      $('d-wallet').className = 'dot on';
+      $('s-wallet').textContent = w.address.slice(0, 6) + '…' + w.address.slice(-4);
+      log('кошелёк подключён: ' + w.address, 'ok');
+      if (w.chainId !== C.RH.chainId) log(`кошелёк в сети ${w.chainId} — переключи на 4663`, 'warn');
+      // Позиции — сразу: ради них и подключаемся, и там кнопка «Закрыть».
+      // История сама не грузится: это десятки запросов к общему публичному
+      // узлу, он от них отвечает «internal server error», и страдают ПОЗИЦИИ.
+      // Нужна история — есть кнопка.
+      loadPositions();
+    } catch (e) { log('кошелёк: ' + e.message, 'bad'); }
+  };
+
+  // ── горячая клавиша ─────────────────────────────────────────────────────
+  //
+  // Вход по Enter, когда курсор НЕ в поле ввода. Автор сказал: важна
+  // каждая секунда, и тянуться мышью к кнопке — потеря времени.
+  //
+  // Предохранитель: двойное срабатывание подряд блокируется, пока идёт
+  // отправка. Кошелёк всё равно спросит подтверждение — деньги не уйдут
+  // от случайного нажатия, но открывать окно дважды незачем.
+  document.addEventListener('keydown', (e) => {
+    const tag = (e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea') return;
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (state.busy) { log('уже отправляю, подожди', 'warn'); return; }
+      log('Enter — вход');
+      open();
+    }
+    if (e.key === 'r' || e.key === 'к') { loadPositions(); }
+  });
+
+  // ── недавние пулы ───────────────────────────────────────────────────────
+  function drawPools() {
+    const host = $('recent');
+    if (!host) return;
+    host.innerHTML = '';
+    for (const p of state.pools.slice(0, 6)) {
+      const b = document.createElement('button');
+      b.textContent = p.name;
+      b.title = p.id;
+      b.onclick = () => { $('pool').value = p.id; loadPool(); };
+      host.appendChild(b);
+    }
+  }
+
+  function rememberPool(id, name) {
+    state.pools = [{ id, name }, ...state.pools.filter(p => p.id !== id)].slice(0, 6);
+    save(); drawPools();
+  }
+
+  drawPools();
+  const verEl = $('ver'); if (verEl) verEl.textContent = 'v' + VERSION;
+  // Наружу отдаём только показ карточки: пригодится и для проверки, и
+  // чтобы можно было открыть карточку по прошлой сделке из консоли.
+  window.RHTerminal = { showCard, drawCard, version: VERSION };
+  log(`терминал ${VERSION} загружен. Enter — вход, R — обновить позиции.`);
+  if (state.rpcUrl) checkRpc().then(ok => { if (ok && $('pool').value) loadPool(); });
+})();
