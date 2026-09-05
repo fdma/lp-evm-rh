@@ -291,8 +291,13 @@ const TRANSFER_TOPIC =
 // закономерно отвечал отказом, и тест это поймал. Поэтому предел частоты
 // исключён явной проверкой и никогда не приводит к делению.
 const RATE_LIMIT_RE = /too many requests|rate limit|429/i;
+// ВНИМАНИЕ НА ОПЕЧАТКУ УЗЛА. Он отвечает буквально «internal server errror»
+// — с тремя «р». Шаблон был написан по правильному написанию и НЕ СОВПАДАЛ,
+// поэтому деление отрезка не запускалось вовсе: запрос просто падал. На
+// экране это выглядело как «узел не отдал события обмена» у пулов с
+// миллионными оборотами, и автор справедливо сказал, что такого быть не может.
 const LOGS_CAP_RE =
-  /exceeds limit|too many (results|logs|events)|more than|response size|too large|internal server error|block range|query returned/i;
+  /exceeds limit|too many (results|logs|events)|more than|response size|too large|internal server err+or|block range|query returned/i;
 
 // Делению нужен потолок по ЧИСЛУ ЗАПРОСОВ, а не только по глубине. Первая
 // версия его не имела: запрос без фильтра развалился на сотни кусков, и узел
@@ -529,15 +534,45 @@ async function blockTime(rpc, block) {
 // есть. Дороже это почти не стоит — у самого бойкого пула около 600 событий,
 // а при перегрузе отрезок делится сам.
 async function poolFeeReality(rpc, poolId, latest, window = 40000) {
-  const from = Math.max(0, latest - window);
-  let logs = null;
-  try {
-    logs = await getLogsSplit(rpc, {
-      address: RH.poolManager,
-      topics: [SWAP_TOPIC, poolId],
-    }, from, latest);
-  } catch (e) {
-    return { swaps: 0, pays: null, why: 'узел не отдал события обмена', blocks: latest - from };
+  // ОТ МАЛОГО ОКНА К БОЛЬШОМУ, А НЕ НАОБОРОТ.
+  //
+  // Раньше сразу запрашивались 40 000 блоков, и при загрузке списка из восьми
+  // пулов это восемь тяжёлых запросов подряд. Общий узел на такое отвечает
+  // отказом, и на экране у всех пулов оказывалось «платит ли — неизвестно»
+  // даже там, где обменов миллионы. Автор справедливо сказал: «этого не может
+  // быть с пулами».
+  //
+  // У живого пула хватает и шести тысяч блоков (около десяти минут). Окно
+  // расширяем, только если в маленьком обменов не нашлось, — то есть платим
+  // за глубину лишь там, где она действительно нужна.
+  const steps = [];
+  for (let w = Math.min(6000, window); w <= window; w *= 5) steps.push(Math.round(w));
+  if (!steps.length || steps[steps.length - 1] !== window) steps.push(window);
+
+  let logs = null, from = latest, lastErr = null;
+  for (const w of steps) {
+    from = Math.max(0, latest - w);
+    try {
+      // БЮДЖЕТ НА ЗАПРОСЫ. Здесь не нужна полнота: достаточно увидеть
+      // несколько недавних обменов и их комиссию. Когда узел болеет, деление
+      // отрезка доходит до сорока запросов и сорока шести секунд — а список
+      // из восьми пулов на это ждать нельзя. Лучше честно сказать
+      // «неизвестно» через секунду, чем показать то же самое через минуту.
+      logs = await getLogsSplit(rpc, {
+        address: RH.poolManager,
+        topics: [SWAP_TOPIC, poolId],
+      }, from, latest, { left: 4 });
+    } catch (e) {
+      // Если узел отказал на МАЛЕНЬКОМ окне, большое ему тем более не по
+      // силам. Расширяемся только после успешного, но пустого ответа.
+      lastErr = e; logs = null; break;
+    }
+    if (logs.length) break;               // нашлись обмены — глубже не лезем
+  }
+  if (logs === null) {
+    return { swaps: 0, pays: null,
+             why: 'узел сейчас не отдаёт события обмена — повтори через минуту',
+             blocks: latest - from };
   }
   const fees = logs.map(l => Number(BigInt('0x' + words(l.data)[5]))).sort((a, b) => a - b);
   if (!fees.length) {
@@ -650,16 +685,19 @@ async function readLiquidityProfile(rpc, poolId, tick, spacing, words = 3) {
   const compressed = Math.floor(tick / spacing);
   const centerWord = compressed >> 8;
   const ticks = [];
-  for (let w = centerWord - words; w <= centerWord + words; w++) {
+  const wordIdx = [];
+  for (let w = centerWord - words; w <= centerWord + words; w++) wordIdx.push(w);
+  const maps = await Promise.all(wordIdx.map(async (w) => {
     const wp = ((BigInt(w) + (1n << 256n)) % (1n << 256n))
       .toString(16).padStart(64, '0');
-    let bm;
     try {
-      bm = await ethCall(rpc, RH.stateView,
-        SEL.getTickBitmap + stripHex(poolId) + wp);
-    } catch (e) { continue; }
-    let bits;
-    try { bits = BigInt(bm); } catch (e) { continue; }
+      return [w, BigInt(await ethCall(rpc, RH.stateView,
+        SEL.getTickBitmap + stripHex(poolId) + wp))];
+    } catch (e) { return null; }
+  }));
+  for (const m of maps) {
+    if (!m) continue;
+    const [w, bits] = m;
     if (bits === 0n) continue;
     for (let i = 0; i < 256; i++) {
       if ((bits >> BigInt(i)) & 1n) ticks.push((w * 256 + i) * spacing);
@@ -668,21 +706,30 @@ async function readLiquidityProfile(rpc, poolId, tick, spacing, words = 3) {
   if (!ticks.length) return { ticks: [], bars: [] };
   ticks.sort((a, b) => a - b);
 
+  // ПАЧКАМИ, А НЕ ПО ОДНОМУ.
+  //
+  // Занятых тиков бывает под сотню, и последовательный обход занимал
+  // 62 секунды — автор увидел это в журнале. Узел спокойно держит восемь
+  // запросов разом, и та же работа укладывается в пару секунд.
   const nets = new Map();
-  for (const t of ticks) {
-    const tw = ((BigInt(t) + (1n << 256n)) % (1n << 256n))
-      .toString(16).padStart(64, '0');
-    try {
-      const r = await ethCall(rpc, RH.stateView,
-        SEL.getTickLiquidity + stripHex(poolId) + tw);
-      const w2 = words_(r);
-      // Возвращает (uint128 liquidityGross, int128 liquidityNet).
-      // ВАЖНО: в ответе int128 расширен знаком до полных 32 байт, поэтому
-      // разбирать надо как 256-битное со знаком. С 128 получались числа
-      // порядка 10^78 — заведомая чушь, на ней и поймал.
-      const net = toSigned(BigInt('0x' + w2[1]), 256);
-      nets.set(t, net);
-    } catch (e) { /* тик пропускаем */ }
+  const BATCH = 8;
+  for (let i = 0; i < ticks.length; i += BATCH) {
+    const part = ticks.slice(i, i + BATCH);
+    const got = await Promise.all(part.map(async (t) => {
+      const tw = ((BigInt(t) + (1n << 256n)) % (1n << 256n))
+        .toString(16).padStart(64, '0');
+      try {
+        const r = await ethCall(rpc, RH.stateView,
+          SEL.getTickLiquidity + stripHex(poolId) + tw);
+        const w2 = words_(r);
+        // Возвращает (uint128 liquidityGross, int128 liquidityNet).
+        // ВАЖНО: в ответе int128 расширен знаком до полных 32 байт, поэтому
+        // разбирать надо как 256-битное со знаком. С 128 получались числа
+        // порядка 10^78 — заведомая чушь, на ней и поймал.
+        return [t, toSigned(BigInt('0x' + w2[1]), 256)];
+      } catch (e) { return null; }
+    }));
+    for (const g of got) if (g) nets.set(g[0], g[1]);
   }
 
   // Активная ликвидность сейчас — точка отсчёта.
@@ -827,9 +874,13 @@ function makeRpc(url, fetchImpl) {
         last = e;
         // «Too Many Requests» лечится только паузой подлиннее: узел общий,
         // и долбить его чаще — делать себе же хуже.
+        // «Слишком часто» лечится только паузой подлиннее: узел общий, и
+        // долбить его чаще — делать себе же хуже. Внутренняя ошибка узла
+        // тоже часто проходит сама, но ей нужна секунда, а не сто миллисекунд.
         const busy = /too many requests|429|rate/i.test(e.message || '');
+        const sick = /internal server err+or/i.test(e.message || '');
         if (i < tries - 1) {
-          await new Promise(r => setTimeout(r, (busy ? 700 : 150) * (i + 1)));
+          await new Promise(r => setTimeout(r, (busy ? 700 : sick ? 900 : 150) * (i + 1)));
         }
       }
     }
