@@ -480,7 +480,13 @@ async function priceAtBlock(rpc, poolId, block, maxBack = 400000, windowSize = 2
       const w = words(l.data);
       return {
         sqrtPriceX96: BigInt('0x' + w[2]),
-        tick: Number(toSigned(BigInt('0x' + w[4]), 24)),
+        // 256, А НЕ 24. Слово в журнале — это int24, РАСШИРЕННЫЙ ЗНАКОМ до
+        // 256 бит: у отрицательного тика оно выглядит как 0xffff…fb0d59.
+        // При ширине 24 такое слово превращалось в 1.16e+77, и цена по нему
+        // не считалась вовсе. Пулы с положительным тиком работали, с
+        // отрицательным — молча нет; из-за этого 30 позиций из 124 выпали
+        // из подсчёта итога. В readSlot0 рядом всегда стояло 256.
+        tick: Number(toSigned(BigInt('0x' + w[4]), 256)),
         block: Number(BigInt(l.blockNumber)),
       };
     }
@@ -851,7 +857,9 @@ async function loadPool(rpc, poolId, keccak256) {
     currency0: '0x' + w[0].slice(24),
     currency1: '0x' + w[1].slice(24),
     fee: Number(BigInt('0x' + w[2])),
-    tickSpacing: Number(toSigned(BigInt('0x' + w[3]), 24)),
+    // Тоже расширен знаком до 256 бит. Сейчас шаг всегда положительный,
+    // поэтому ширина 24 давала верный ответ, но полагаться на это не стоит.
+    tickSpacing: Number(toSigned(BigInt('0x' + w[3]), 256)),
     hooks: '0x' + w[4].slice(24),
   };
   const packed = w.slice(0, 5).join('');
@@ -1100,7 +1108,7 @@ async function readPositionPool(rpc, tokenId) {
     key: {
       currency0: '0x' + x[0].slice(24), currency1: '0x' + x[1].slice(24),
       fee: Number(BigInt('0x' + x[2])),
-      tickSpacing: Number(toSigned(BigInt('0x' + x[3]), 24)),
+      tickSpacing: Number(toSigned(BigInt('0x' + x[3]), 256)),
       hooks: '0x' + x[4].slice(24),
     },
     info: BigInt('0x' + x[5]),
