@@ -20,7 +20,7 @@
   const KEY = 'lp-evm-rh';
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '2.9';
+  const VERSION = '3.0';
   const LEDGER = 'lp-evm-rh-ledger';   // память о входах: без неё PnL не посчитать
 
   const state = {
@@ -189,6 +189,14 @@
       state.decimals[key.currency0] = await tokenDecimals(key.currency0);
       state.decimals[key.currency1] = await tokenDecimals(key.currency1);
       const s0 = await tokenSymbol(key.currency0), s1 = await tokenSymbol(key.currency1);
+      // Название не прочиталось — не грузим пул. По названиям определяется,
+      // какая сторона стейбл, а от этого зависит СТОРОНА диапазона и то,
+      // какой токен уйдёт с кошелька. Молчаливый «?» выключал это определение.
+      if (s0 === '?' || s1 === '?') {
+        log('не прочитались названия токенов — пул не гружу, ' +
+            'по ним выбирается сторона входа', 'bad');
+        return;
+      }
       key.sym0 = s0; key.sym1 = s1;
       const step = (Math.pow(1.0001, key.tickSpacing) - 1) * 100;
       $('poolinfo').innerHTML =
@@ -348,18 +356,18 @@
                      : r.real && r.real.pays === false ? '0.000%'
                      : r.pending ? '…' : '?';
         b.innerHTML =
-          '<b>' + r.pair + '</b> <span class="dim num">объём ' + money(r.vol) +
+          '<b>' + esc(r.pair) + '</b> <span class="dim num">объём ' + money(r.vol) +
           ' · ликв ' + money(r.liq) + '</span>' +
           (r.key ? '<br><span class="dim num">в ключе ' + feeText(r.key.fee) + ' · ' +
                    '<span class="' + (r.real && r.real.pays ? 'ok' : 'warn') + '">на деле ' +
                    onDeal + '</span> · шаг ' + step.toFixed(2) + '% · минимальный отступ ' +
                    ((1 - Math.pow(1.0001, -r.key.tickSpacing)) * 100).toFixed(2) + '%</span>' : '') +
           (r.onchain ? '<br><span class="dim num">цена в цепочке ' + fmtPrice(r.onchain) +
-                       ' ' + r.quote + '</span>' : '') +
+                       ' ' + esc(r.quote) + '</span>' : '') +
           '<br><span class="' + cls + '">' + verdict + '</span>' +
           (Math.abs(dev) > 1
             ? '<span class="warn"> · на ' + (dev > 0 ? '+' : '') + dev.toFixed(1) +
-              '% от ведущего пула в ' + r.quote + ' — расходится</span>' : '');
+              '% от ведущего пула в ' + esc(r.quote) + ' — расходится</span>' : '');
         // Пока не замерено, кнопку не блокируем: войти вслепую всё равно не
         // выйдет, в loadPool стоит своя проверка на оплату.
         if (cls === 'bad') b.disabled = true;
@@ -411,7 +419,7 @@
     };
     mk('новый вход', !watching, () => { watching = null; drawWatchBar(); recalc(); });
     for (const o of openList) {
-      mk(`${o.pair} #${o.id}`, watching && watching.id === o.id, async () => {
+      mk(`${esc(o.pair)} #${o.id}`, watching && watching.id === o.id, async () => {
         watching = o;
         drawWatchBar();
         // Пул позиции может отличаться от загруженного — тогда и цена, и
@@ -427,9 +435,17 @@
     }
   }
 
+  // РАЗРЯДНОСТЬ НЕ УГАДЫВАЕМ. Раньше при отказе узла возвращалось 18, и это
+  // напрямую превращалось в деньги: у USDG разрядность 6, и «2 USDG»
+  // становились 2·10^18, то есть заявкой на два триллиона. Лучше отказать
+  // загрузку пула, чем подписывать цифру, которую никто не проверял.
+  const decCache = new Map();
   async function tokenDecimals(a) {
-    try { return Number(BigInt(await C.ethCall(state.rpc, a, C.SEL.decimals))); }
-    catch (e) { return 18; }
+    if (decCache.has(a)) return decCache.get(a);
+    const d = Number(BigInt(await C.ethCall(state.rpc, a, C.SEL.decimals)));
+    if (!Number.isInteger(d) || d < 0 || d > 36) throw new Error('странная разрядность токена');
+    decCache.set(a, d);
+    return d;
   }
 
   async function tokenSymbol(a) {
@@ -499,7 +515,7 @@
     $('price').textContent = p < 0.01 ? p.toPrecision(6) : p.toFixed(6);
     const n = names();
     $('pricesub').textContent =
-      `${n.stable} за 1 ${n.coin} · тик ${state.slot0.tick}`;
+      `${esc(n.stable)} за 1 ${esc(n.coin)} · тик ${state.slot0.tick}`;
   }
 
   // Распределение ликвидности: где именно стоят чужие позиции.
@@ -706,6 +722,18 @@
   // Комиссия из ключа пула. Значение от 0x800000 — это НЕ проценты, а флаг
   // плавающей комиссии; делить его на 10000 давало «838.86%». И три знака
   // после запятой обязательны: 0.003% и 0.000% на глаз различаются только так.
+  // ЭКРАНИРОВАНИЕ ВСЕГО, ЧТО ПРИШЛО ИЗ СЕТИ.
+  //
+  // symbol() токена возвращает произвольную строку, которую пишет автор
+  // токена, а сводка DexScreener — чужой ответ из интернета. Обе шли прямо
+  // в innerHTML. Токен с именем вида «<img src=x onerror=…>» выполнял бы свой
+  // скрипт на странице, где лежит доступ к кошельку, — и достаточно было
+  // просто посмотреть список пулов, ничего не выбирая. На цепочке, полной
+  // мемкоинов со случайными именами, это не теория.
+  const esc = (s) => String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
   function feeText(fee) {
     if (fee >= 0x800000) return 'плавающая';
     return (fee / 10000).toFixed(3) + '%';
@@ -828,6 +856,10 @@
     // приходит уже при открытом окне подписи. Дешевле проверить заранее:
     // один запрос, зато не откроется окно с заведомо провальной сделкой.
     const dep = resolveSide();
+    // Снимок того, на чём строился план: всё, что после await, обязано
+    // относиться к тому же пулу и той же сумме. Иначе в calldata попадут
+    // тики одного пула и ключ другого.
+    const snapPool = state.pool, snapAmount = state.amount, snapSlot = state.slot0;
     try {
       const bal = BigInt(await C.ethCall(state.rpc, dep.token,
         C.SEL.balanceOf + C.addrWord(state.account)));
@@ -840,7 +872,16 @@
             `а нужно ${state.amount} — вношу НЕ ТОТ токен или не хватает`, 'bad');
         return;
       }
-    } catch (e) { log('баланс не проверился: ' + e.message, 'warn'); }
+    } catch (e) {
+      // ОТКАЗ ПРОВЕРКИ — ЭТО СТОП, А НЕ ПРЕДУПРЕЖДЕНИЕ.
+      //
+      // Раньше здесь стоял warn, и вход шёл дальше. Но эта же проверка
+      // единственная ловит случай, когда разрядность или сторона прочитались
+      // неверно: без неё окно кошелька откроется с суммой, которую никто не
+      // сверял. Отказ узла — повод остановиться, а не пожать плечами.
+      log('баланс не проверился: ' + e.message + ' — вход не отправляю', 'bad');
+      return;
+    }
 
     const t0 = performance.now();
     const key = state.pool;
@@ -861,9 +902,14 @@
       owner: state.account,
       deadline: Math.floor(Date.now() / 1000) + 90,
     });
+    // Пока шли запросы, пул или сумму могли переключить — тогда план уже не
+    // про то, что на экране.
+    if (state.pool !== snapPool || state.amount !== snapAmount || state.slot0 !== snapSlot) {
+      log('пул или сумма сменились, пока я считал — вход отменён, нажми ещё раз', 'warn');
+      return;
+    }
     log(`собрал за ${(performance.now() - t0).toFixed(1)} мс, открываю кошелёк`);
     state.busy = true;
-    setTimeout(() => { state.busy = false; }, 4000);
 
     // Симуляция ПАРАЛЛЕЛЬНО: ответ придёт, пока читаешь окно Rabby.
     C.simulate(state.rpc, state.account, C.RH.positionManager, data)
@@ -881,7 +927,16 @@
                        fee: state.pool.fee };
       setTimeout(() => bindEntry(), 6000);
       setTimeout(loadPositions, 6000);
-    } catch (e) { log('кошелёк отказал: ' + e.message, 'bad'); }
+    } catch (e) {
+      log('кошелёк отказал: ' + e.message, 'bad');
+    } finally {
+      // ФЛАГ СНИМАЕТСЯ ОТВЕТОМ КОШЕЛЬКА, А НЕ ТАЙМЕРОМ.
+      //
+      // Раньше здесь стоял setTimeout на 4 секунды, а окно Rabby ждёт
+      // подтверждения десятки секунд. Второй Enter через пять секунд слал
+      // ВТОРУЮ заявку на те же деньги: две позиции, двойная сумма.
+      state.busy = false;
+    }
   }
 
   // Привязка записи о входе к номеру NFT: номер известен только после того,
@@ -939,11 +994,28 @@
     tb.innerHTML = '';
     let shown = 0;
     const found = [];              // для переключателя верхней шкалы
-    for (const id of ids.slice(0, 40)) {
-      let liq = 0n, info = null;
+    // СНАЧАЛА ОТСЕИВАЕМ ПУСТЫЕ, ПОТОМ РЕЖЕМ СПИСОК.
+    //
+    // Раньше стояло ids.slice(0, 40) ДО проверки ликвидности. Пустых оболочек
+    // остаётся много — у этого кошелька их больше сотни, — и позиция с
+    // деньгами, оказавшаяся старше сорока последних NFT, просто исчезала из
+    // таблицы вместе с кнопкой «Закрыть». Экран при этом честно писал
+    // «открытых позиций нет».
+    //
+    // Проверка ликвидности — это один eth_call на позицию, дешевле, чем
+    // потерять доступ к выходу.
+    const live = [];
+    for (const id of ids) {
       try {
-        liq = await C.readPositionLiquidity(state.rpc, id);
-        if (liq === 0n) continue;                 // пустая оболочка
+        const q = await C.readPositionLiquidity(state.rpc, id);
+        if (q > 0n) live.push({ id, liq: q });
+      } catch (e) { /* не прочиталась — не выдаём за пустую, просто пропуск */ }
+      if (stale()) return;
+      if (live.length >= 40) break;               // столько всё равно не бывает
+    }
+    for (const { id, liq } of live) {
+      let info = null;
+      try {
         info = await C.readPositionPool(state.rpc, id);
       } catch (e) { continue; }
       if (stale()) return;
@@ -981,14 +1053,14 @@
         else { v0 = n0; v1 = raw ? n1 / raw : 0; }         // стейбл — первый
         total = v0 + v1;
         const pc = (v) => total > 0 ? (v / total * 100).toFixed(0) + '%' : '—';
-        comp = `${fmtNum(n0)} ${sym0} <span class="dim">${pc(v0)}</span><br>` +
-               `${fmtNum(n1)} ${sym1} <span class="dim">${pc(v1)}</span>`;
+        comp = `${fmtNum(n0)} ${esc(sym0)} <span class="dim">${pc(v0)}</span><br>` +
+               `${fmtNum(n1)} ${esc(sym1)} <span class="dim">${pc(v1)}</span>`;
         if (fees) {
           const g0 = Number(fees.fee0) / Math.pow(10, d0);
           const g1 = Number(fees.fee1) / Math.pow(10, d1);
           feesValue = st === 1 ? g0 * raw + g1 : g0 + (raw ? g1 / raw : 0);
         }
-        valueStr = `${total.toFixed(4)} ${stableSym}` +
+        valueStr = `${total.toFixed(4)} ${esc(stableSym)}` +
           (fees ? `<br><span class="ok">+${feesValue.toFixed(4)} комиссий</span>` +
                   `<br><span class="dim">итого ${(total + feesValue).toFixed(4)}</span>` : '');
       }
@@ -1101,7 +1173,7 @@
       tr.innerHTML =
         `<td class="num">${id}<br><span class="${inRange ? 'ok' : 'dim'}">${
           inRange ? 'в работе' : 'ждёт'}</span></td>` +
-        `<td>${sym0}/${sym1}<br><span class="dim num">${timeStr}</span></td>` +
+        `<td>${esc(sym0)}/${esc(sym1)}<br><span class="dim num">${timeStr}</span></td>` +
         `<td class="num">${bounds}</td>` +
         `<td class="num">${comp}</td>` +
         `<td class="num">${valueStr}</td>` +
@@ -1144,9 +1216,18 @@
         try { rec = await entryFromChain(id, info.key, poolId, d0, d1, sym0, sym1); }
         catch (e) { /* возьмём запись браузера */ }
         if (!rec) rec = ledger.get(String(id));
+        // ВЫНУТОЕ ДОБАВЛЯЕМ ВСЕГДА, А НЕ ТОЛЬКО КОГДА ЦЕПОЧКА МОЛЧИТ.
+        //
+        // Запись о частичных снятиях живёт только в браузере, а вход берётся
+        // с цепочки — и в обычном случае ledger вообще не читался. Из-за
+        // этого после «Комиссий» строка показывала минус ровно на снятую
+        // сумму, а после «Половины» — минус около 50%. То есть починка,
+        // объявленная в v2.5, в основном пути не работала.
+        const takenOut = (ledger.get(String(id)) || {}).takenOut;
+        if (rec && takenOut) rec = { ...rec, takenOut };
         if (stale() || !tr.parentNode) return;
         tr.cells[1].innerHTML =
-          `${sym0}/${sym1}<br><span class="dim num">${timeOf(rec)}</span>`;
+          `${esc(sym0)}/${esc(sym1)}<br><span class="dim num">${timeOf(rec)}</span>`;
         tr.cells[5].innerHTML = pnlOf(rec);
       })();
     }
@@ -1244,6 +1325,10 @@
 
   async function closePosition(tokenId, liquidity, key, valueNow, symQuote, mode = 'all') {
     const m = MODES[mode] || MODES.all;
+    // Пока висит окно кошелька, второй клик слать нельзя: заявка уйдёт
+    // дважды, и подтвердить обе под рукой слишком легко. У закрытия такой
+    // защиты не было вовсе.
+    if (state.busy) { log('уже жду ответа кошелька', 'warn'); return; }
     if (!confirm(m.ask(tokenId))) return;
     // Снимать нечего — не гоняем кошелёк зря.
     if (mode !== 'fees' && (!liquidity || liquidity <= 0n)) {
@@ -1261,6 +1346,7 @@
       .then(r => log(r.ok ? `${m.verb}: симуляция пройдёт`
                           : `${m.verb.toUpperCase()} НЕ ПРОЙДЁТ: ` + r.why,
                      r.ok ? 'ok' : 'bad'));
+    state.busy = true;
     try {
       const h = await W.send({ from: state.account, to: C.RH.positionManager, data });
       log(`${m.verb} отправлено: ` + h, 'ok');
@@ -1269,7 +1355,9 @@
       if (mode === 'all') settleClose(h, tokenId, rec, symQuote, key);
       else settleTake(h, tokenId, symQuote, key, m.verb);
       setTimeout(loadPositions, 5000);
-    } catch (e) { log('кошелёк отказал: ' + e.message, 'bad'); }
+    } catch (e) {
+      log('кошелёк отказал: ' + e.message, 'bad');
+    } finally { state.busy = false; }
   }
 
   // ЧАСТИЧНЫЙ ВЫВОД. Считать его как закрытие нельзя: вход остаётся прежним,
@@ -1540,7 +1628,7 @@
         res = `<span class="${pnl >= 0 ? 'ok' : 'bad'}">${approx ? '≈' : ''}` +
               `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} · ${pct >= 0 ? '+' : ''}` +
               `${pct.toFixed(2)}%</span><br><span class="dim">` +
-              `${r.IN.v.toFixed(2)} → ${r.OUT.v.toFixed(2)} ${r.stableSym}</span>` +
+              `${r.IN.v.toFixed(2)} → ${r.OUT.v.toFixed(2)} ${esc(r.stableSym)}</span>` +
               (approx ? '<br><span class="hint">закрыто вместе с другими, ' +
                         'суммы делю по ликвидности</span>' : '');
       }
@@ -1548,7 +1636,7 @@
       tr.innerHTML =
         `<td class="num dim">${r.closeBlock || r.openBlock}` +
         `<br><span class="hint">NFT ${r.id}</span></td>` +
-        `<td>${r.pair}${r.mins != null
+        `<td>${esc(r.pair)}${r.mins != null
             ? `<br><span class="dim">${r.mins < 60 ? r.mins.toFixed(0) + ' мин'
                                                    : (r.mins / 60).toFixed(1) + ' ч'}</span>` : ''}</td>` +
         `<td class="num"><span class="dim">внёс</span> ${r.IN.parts.join(' + ') || '—'}` +
