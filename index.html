@@ -137,6 +137,10 @@
         <h2>цена сейчас</h2>
         <div class="big num" id="price">—</div>
         <div class="hint" id="pricesub">пул не загружен</div>
+        <!-- Переключатель того, ЧТО показано на шкале: планируемый вход или
+             одна из открытых позиций. Без него шкала всегда рисовала будущий
+             вход, и при открытых позициях это сбивало с толку. -->
+        <div id="watchbar" class="row" style="gap:6px;flex-wrap:wrap;margin-top:8px"></div>
         <canvas id="chart" height="150" style="width:100%;margin-top:12px;
           border-radius:7px;background:#080c11;display:block"></canvas>
         <div class="row" style="justify-content:space-between;margin-top:6px">

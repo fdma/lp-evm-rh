@@ -20,7 +20,7 @@
   const KEY = 'lp-evm-rh';
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '2.7';
+  const VERSION = '2.8';
   const LEDGER = 'lp-evm-rh-ledger';   // память о входах: без неё PnL не посчитать
 
   const state = {
@@ -165,7 +165,9 @@
       // пул, который не платит комиссий, бесполезен независимо от цены,
       // глубины и ширины диапазона: остаётся только риск цены. Автор уже
       // потерял на таком сто долларов.
-      const real = await C.poolFeeReality(logsRpc(), poolId,
+      // Через кэш: если пул только что выбран из списка, он уже замерен, и
+      // повторный запрос к журналу — это лишние секунды ожидания на ровном месте.
+      const real = await feeRealityCached(poolId,
         Number(BigInt(await logsRpc()('eth_blockNumber', []))));
       key.real = real;
       if (real.pays === false) {
@@ -291,93 +293,137 @@
       } catch (e) { return { ...p, key: null, ok: false }; }
     }));
 
-    // ПЛАТИТ ЛИ ПУЛ — замер по журналу, а не поле в ключе. Без этой строки
-    // список ставил первым тот пул, который не платит вовсе: он же и самый
-    // крупный по обороту.
-    //
-    // ПО ОЧЕРЕДИ, а не Promise.all. Журнал читается только через общий
-    // публичный узел, и восемь одновременных запросов он встречает ответом
-    // «Too Many Requests» — проверено. Окно короткое (4000 блоков, порядка
-    // сотни событий), так что очередь стоит десятые доли секунды на пул.
-    if (latest) {
-      for (const r of rows) {
-        if (!r.key || !r.ok) continue;
-        try { r.real = await C.poolFeeReality(logsRpc(), r.poolId, latest); }
-        catch (e) { r.real = { pays: null, why: 'узел не ответил' }; }
-      }
-    }
-
     // Сравнивать цены можно только внутри одной котировки: пул к ETH и пул
     // к стейблу меряют разными линейками. Ведущим в каждой котировке считаем
     // пул с наибольшим объёмом — цену ведёт торговля, а не глубина.
     //
-    // Ведущего ищем ДО перестановки списка и именно по обороту: цену ведёт
-    // тот, где торгуют, даже если он не платит поставщику ликвидности. Это
-    // разные вопросы — «где настоящая цена» и «где мне платят».
+    // Ведущего ищем именно по обороту: цену ведёт тот, где торгуют, даже если
+    // он не платит поставщику ликвидности. Это разные вопросы — «где
+    // настоящая цена» и «где мне платят».
     const lead = new Map();
     for (const r of [...rows].sort((a, b) => b.vol - a.vol)) {
       if (!r.onchain || !r.quote) continue;
       if (!lead.has(r.quote)) lead.set(r.quote, r.onchain);
     }
 
-    // Порядок показа: сначала те, что ПЛАТЯТ, внутри — по обороту. Оборот сам
-    // по себе больше не решает: у PIXELCAT первый по обороту пул платит
-    // 0.000%, а соседний, втрое меньший по обороту, — 4.096%.
-    rows.sort((a, b) => (Number(b.real?.pays === true) - Number(a.real?.pays === true)) ||
-                        (b.vol - a.vol));
+    const money = (v) => v >= 1e6 ? '$' + (v / 1e6).toFixed(2) + 'M'
+                       : v >= 1e3 ? '$' + (v / 1e3).toFixed(0) + 'k'
+                       : '$' + v.toFixed(0);
 
-    host.innerHTML = `<div class="hint">нашёл ${list.length} пул(ов), ` +
-      `показываю ${rows.length}. Сначала те, что реально платят комиссию, ` +
-      `внутри — по обороту за сутки. Цена — из цепочки, ` +
-      `сравнение внутри одной котировки.</div>`;
-    for (const r of rows) {
+    // Отрисовка вынесена в функцию: она вызывается сразу, ещё без замеров,
+    // и потом заново после каждого замера.
+    const render = (measuring) => {
+      host.innerHTML = '<div class="hint">нашёл ' + list.length + ' пул(ов), показываю ' +
+        rows.length + '. ' +
+        (measuring ? 'Замеряю, платят ли они — строки обновятся сами. '
+                   : 'Сначала те, что реально платят комиссию, внутри — по обороту. ') +
+        'Цена — из цепочки, сравнение внутри одной котировки.</div>';
+      for (const r of rows) {
+        const b = document.createElement('button');
+        b.style.cssText = 'width:100%;text-align:left;margin-top:6px;padding:8px 10px';
+        const base = r.quote ? lead.get(r.quote) : null;
+        const dev = base && r.onchain ? (r.onchain / base - 1) * 100 : 0;
+        let verdict = '', cls = 'ok';
+        if (!r.ok || !r.key) { verdict = 'ключ не сошёлся — не трогать'; cls = 'bad'; }
+        else if (!r.key.hook.allowed) {
+          verdict = 'ХУК ДЕРЖИТ ЛИКВИДНОСТЬ — вход запрещён'; cls = 'bad';
+        } else if (r.key.native) { verdict = 'сторона — нативный ETH, не поддерживаем'; cls = 'warn'; }
+        // Пул, который не платит, отсекаем ЖЁСТКО и до всех остальных придирок.
+        // Именно такой пул стоил автору ста долларов, и выглядел он при этом
+        // лучше всех: первый по обороту, стейбл в паре, хук без прав на
+        // ликвидность — по старым правилам «годен».
+        else if (r.real && r.real.pays === false) {
+          verdict = 'НЕ ПЛАТИТ: ' + r.real.swaps + ' обмен(ов) подряд с нулевой комиссией' +
+                    (r.key.hook.takesSwapCut ? ', хук забирает часть обмена' : '');
+          cls = 'bad';
+        } else if (!STABLE.test(r.key.sym0 || '') && !STABLE.test(r.key.sym1 || '')) {
+          verdict = 'стейбла в паре нет — заходить нечем'; cls = 'warn';
+        } else if (r.pending) {
+          verdict = 'замеряю, платит ли…'; cls = 'dim';
+        } else if (r.real && r.real.pays === null) {
+          verdict = 'платит ли — неизвестно: ' + (r.real.why || 'замер не вышел'); cls = 'warn';
+        } else verdict = 'годен';
+        const step = r.key ? (Math.pow(1.0001, r.key.tickSpacing) - 1) * 100 : 0;
+        const onDeal = r.real && r.real.pays ? (r.real.median / 10000).toFixed(3) + '%'
+                     : r.real && r.real.pays === false ? '0.000%'
+                     : r.pending ? '…' : '?';
+        b.innerHTML =
+          '<b>' + r.pair + '</b> <span class="dim num">объём ' + money(r.vol) +
+          ' · ликв ' + money(r.liq) + '</span>' +
+          (r.key ? '<br><span class="dim num">в ключе ' + feeText(r.key.fee) + ' · ' +
+                   '<span class="' + (r.real && r.real.pays ? 'ok' : 'warn') + '">на деле ' +
+                   onDeal + '</span> · шаг ' + step.toFixed(2) + '% · минимальный отступ ' +
+                   ((1 - Math.pow(1.0001, -r.key.tickSpacing)) * 100).toFixed(2) + '%</span>' : '') +
+          (r.onchain ? '<br><span class="dim num">цена в цепочке ' + fmtPrice(r.onchain) +
+                       ' ' + r.quote + '</span>' : '') +
+          '<br><span class="' + cls + '">' + verdict + '</span>' +
+          (Math.abs(dev) > 1
+            ? '<span class="warn"> · на ' + (dev > 0 ? '+' : '') + dev.toFixed(1) +
+              '% от ведущего пула в ' + r.quote + ' — расходится</span>' : '');
+        // Пока не замерено, кнопку не блокируем: войти вслепую всё равно не
+        // выйдет, в loadPool стоит своя проверка на оплату.
+        if (cls === 'bad') b.disabled = true;
+        else b.onclick = () => { $('pool').value = r.poolId; loadPool(); };
+        host.appendChild(b);
+      }
+    };
+
+    // СПИСОК ПОКАЗЫВАЕМ СРАЗУ, ЗАМЕРЫ ДОПИСЫВАЕМ ПОТОМ.
+    //
+    // Раньше список ждал, пока замерятся все восемь пулов: восемь запросов к
+    // журналу по очереди, и всё это время на экране висело «читаю пулы…».
+    // Автор справедливо сказал, что новый пул грузится очень долго.
+    rows.sort((a, b) => b.vol - a.vol);
+    for (const r of rows) r.pending = !!(latest && r.key && r.ok);
+    render(true);
+
+    if (latest) {
+      // По очереди, а не Promise.all: журнал читается только через общий
+      // публичный узел, и восемь одновременных запросов он встречает отказом.
+      for (const r of rows) {
+        if (!r.pending) continue;
+        try { r.real = await feeRealityCached(r.poolId, latest); }
+        catch (e) { r.real = { pays: null, why: 'узел не ответил' }; }
+        r.pending = false;
+        render(true);
+      }
+      // Всё замерено — расставляем по-честному: сначала платящие.
+      rows.sort((a, b) => (Number(b.real && b.real.pays === true) -
+                           Number(a.real && a.real.pays === true)) || (b.vol - a.vol));
+      render(false);
+    }
+  }
+
+  // Переключатель под ценой: «новый вход» и по кнопке на каждую открытую
+  // позицию. Выбранная позиция рисуется на шкале вместо планируемого входа.
+  function drawWatchBar() {
+    const host = $('watchbar');
+    if (!host) return;
+    host.innerHTML = '';
+    if (!openList.length) return;
+    const mk = (label, active, on) => {
       const b = document.createElement('button');
-      b.style.cssText = 'width:100%;text-align:left;margin-top:6px;padding:8px 10px';
-      const money = (v) => v >= 1e6 ? '$' + (v / 1e6).toFixed(2) + 'M'
-                         : v >= 1e3 ? '$' + (v / 1e3).toFixed(0) + 'k'
-                         : '$' + v.toFixed(0);
-      const base = r.quote ? lead.get(r.quote) : null;
-      const dev = base && r.onchain ? (r.onchain / base - 1) * 100 : 0;
-      let verdict = '', cls = 'ok';
-      if (!r.ok || !r.key) { verdict = 'ключ не сошёлся — не трогать'; cls = 'bad'; }
-      else if (!r.key.hook.allowed) {
-        verdict = 'ХУК ДЕРЖИТ ЛИКВИДНОСТЬ — вход запрещён'; cls = 'bad';
-      } else if (r.key.native) { verdict = 'сторона — нативный ETH, не поддерживаем'; cls = 'warn'; }
-      // Пул, который не платит, отсекаем ЖЁСТКО и до всех остальных придирок.
-      // Именно такой пул стоил автору ста долларов, и выглядел он при этом
-      // лучше всех: первый по обороту, стейбл в паре, хук без прав на
-      // ликвидность — по старым правилам «годен».
-      else if (r.real && r.real.pays === false) {
-        verdict = `НЕ ПЛАТИТ: ${r.real.swaps} обмен(ов) подряд с нулевой комиссией` +
-                  (r.key.hook.takesSwapCut ? ', хук забирает часть обмена' : '');
-        cls = 'bad';
-      } else if (!STABLE.test(r.key.sym0 || '') && !STABLE.test(r.key.sym1 || '')) {
-        verdict = 'стейбла в паре нет — заходить нечем'; cls = 'warn';
-      } else if (r.real && r.real.pays === null) {
-        verdict = 'платит ли — неизвестно: ' + (r.real.why || 'замер не вышел'); cls = 'warn';
-      } else verdict = 'годен';
-      const step = r.key ? (Math.pow(1.0001, r.key.tickSpacing) - 1) * 100 : 0;
-      b.innerHTML =
-        `<b>${r.pair}</b> <span class="dim num">объём ${money(r.vol)} · ` +
-        `ликв ${money(r.liq)}</span>` +
-        (r.key ? `<br><span class="dim num">в ключе ${feeText(r.key.fee)} · ` +
-                 // Главное число строки: сколько пул ВЗЯЛ с последних обменов.
-                 // В ключе может стоять флаг плавающей комиссии, и тогда поле
-                 // не говорит ничего.
-                 `<span class="${r.real?.pays ? 'ok' : 'warn'}">на деле ${
-                    r.real?.pays ? (r.real.median / 10000).toFixed(3) + '%'
-                                 : r.real?.pays === false ? '0.000%' : '?'}</span> · ` +
-                 `шаг ${step.toFixed(2)}% · минимальный отступ ` +
-                 `${((1 - Math.pow(1.0001, -r.key.tickSpacing)) * 100).toFixed(2)}%</span>` : '') +
-        (r.onchain ? `<br><span class="dim num">цена в цепочке ${fmtPrice(r.onchain)} ` +
-                     `${r.quote}</span>` : '') +
-        `<br><span class="${cls}">${verdict}</span>` +
-        (Math.abs(dev) > 1
-          ? `<span class="warn"> · на ${dev > 0 ? '+' : ''}${dev.toFixed(1)}% ` +
-            `от ведущего пула в ${r.quote} — расходится</span>` : '');
-      if (cls === 'bad') b.disabled = true;
-      else b.onclick = () => { $('pool').value = r.poolId; loadPool(); };
+      b.textContent = label;
+      b.style.cssText = 'padding:4px 8px;font-size:11px';
+      if (active) b.className = 'on';
+      b.onclick = on;
       host.appendChild(b);
+    };
+    mk('новый вход', !watching, () => { watching = null; drawWatchBar(); recalc(); });
+    for (const o of openList) {
+      mk(`${o.pair} #${o.id}`, watching && watching.id === o.id, async () => {
+        watching = o;
+        drawWatchBar();
+        // Пул позиции может отличаться от загруженного — тогда и цена, и
+        // шкала были бы не от той пары. Подгружаем нужный.
+        if (!state.pool || state.pool.poolId !== o.poolId) {
+          $('pool').value = o.poolId;
+          await loadPool();
+          watching = o;            // loadPool мог перерисовать панель
+          drawWatchBar();
+        }
+        recalc();
+      });
     }
   }
 
@@ -627,7 +673,12 @@
       $('v-side').innerHTML = p.oneSided
         ? '<span class="ok">да</span>' : '<span class="bad">НЕТ</span>';
       const asked = below ? -state.gap : state.gap;
-      drawChart(p);
+      // Если следим за открытой позицией и загружен ЕЁ пул — рисуем её
+      // границы, а не будущий вход. Панель «что получится» слева при этом
+      // по-прежнему про новый вход: это разные вопросы.
+      const w = watching && state.pool && state.pool.poolId === watching.poolId
+        ? { tickLower: watching.tickLower, tickUpper: watching.tickUpper } : null;
+      drawChart(w || p);
       $('rangeinfo').innerHTML = Math.abs(gapShown - asked) > 1
         ? `<div class="hint warn">просил ${asked}%, шаг пула позволяет только ` +
           `${gapShown.toFixed(2)}% — это ограничение пула, не ошибка</div>` : '';
@@ -658,6 +709,25 @@
   function feeText(fee) {
     if (fee >= 0x800000) return 'плавающая';
     return (fee / 10000).toFixed(3) + '%';
+  }
+
+  // Замер комиссии по пулу не меняется за минуту, а стоит запроса к журналу.
+  // Без кэша повторный выбор той же монеты снова ждал бы все замеры заново.
+  // ЗА ЧЕМ СЛЕДИТ ВЕРХНЯЯ ШКАЛА.
+  //
+  // Раньше она всегда рисовала БУДУЩИЙ вход из формы слева. Когда позиции уже
+  // открыты, это сбивает с толку: на шкале одно, в таблице другое, а если
+  // загруженный пул вообще не тот, в котором стоит позиция, — шкала не имеет
+  // к ней отношения. Теперь можно выбрать, за чем смотреть.
+  let watching = null;          // {id, pair, poolId, tickLower, tickUpper}
+  let openList = [];            // открытые позиции для переключателя
+
+  const feeCache = new Map();
+  async function feeRealityCached(poolId, latest) {
+    if (feeCache.has(poolId)) return feeCache.get(poolId);
+    const r = await C.poolFeeReality(logsRpc(), poolId, latest);
+    feeCache.set(poolId, r);
+    return r;
   }
 
   const STABLE = /^(usdg|usdc|usdt|dai|usde|usdc\.e|frax|tusd)$/i;
@@ -868,6 +938,7 @@
     if (!ids.length) { tb.innerHTML = '<tr><td colspan="7" class="hint">позиций нет</td></tr>'; return; }
     tb.innerHTML = '';
     let shown = 0;
+    const found = [];              // для переключателя верхней шкалы
     for (const id of ids.slice(0, 40)) {
       let liq = 0n, info = null;
       try {
@@ -1022,6 +1093,10 @@
                  (inside ? '<span class="ok">внутри</span>'
                          : `<span class="warn">до входа ${away.toFixed(1)}%</span>`);
       }
+      // Запоминаем позицию для переключателя шкалы: пара, пул и границы.
+      found.push({ id: String(id), pair: `${sym0}/${sym1}`, poolId,
+                   tickLower: t.tickLower, tickUpper: t.tickUpper });
+
       const tr = document.createElement('tr');
       tr.innerHTML =
         `<td class="num">${id}<br><span class="${inRange ? 'ok' : 'dim'}">${
@@ -1076,6 +1151,11 @@
       })();
     }
     if (!shown) tb.innerHTML = '<tr><td colspan="7" class="hint">открытых позиций нет</td></tr>';
+    // Список для переключателя обновляем ПОСЛЕ обхода: если проход устарел,
+    // до сюда мы не дойдём, и старый список не будет затёрт наполовину.
+    openList = found;
+    if (watching && !found.some(o => o.id === watching.id)) watching = null;
+    drawWatchBar();
   }
 
   // PoolId считается из ключа — тот же приём, что и при загрузке пула.
