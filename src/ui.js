@@ -20,7 +20,7 @@
   const KEY = 'lp-evm-rh';
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '3.0';
+  const VERSION = '3.1';
   const LEDGER = 'lp-evm-rh-ledger';   // память о входах: без неё PnL не посчитать
 
   const state = {
@@ -991,7 +991,9 @@
     }
     if (stale()) return;
     if (!ids.length) { tb.innerHTML = '<tr><td colspan="7" class="hint">позиций нет</td></tr>'; return; }
-    tb.innerHTML = '';
+    // Таблицу НЕ очищаем здесь: впереди отсев пустых оболочек, и на это время
+    // должно оставаться «читаю…». Пустая таблица читается как «позиций нет».
+    tb.innerHTML = `<tr><td colspan="7" class="hint">читаю ${ids.length} позиций…</td></tr>`;
     let shown = 0;
     const found = [];              // для переключателя верхней шкалы
     // СНАЧАЛА ОТСЕИВАЕМ ПУСТЫЕ, ПОТОМ РЕЖЕМ СПИСОК.
@@ -1004,15 +1006,34 @@
     //
     // Проверка ликвидности — это один eth_call на позицию, дешевле, чем
     // потерять доступ к выходу.
+    // ОТСЕВ ПАРАЛЛЕЛЬНО, А НЕ ПО ОДНОЙ.
+    //
+    // Первая версия этой правки шла по всем NFT подряд: у этого кошелька их
+    // больше сотни, один eth_call на каждую — и таблица стояла пустой почти
+    // полминуты. Автор увидел пустой список и решил, что позиций нет.
+    // Лечится не возвратом к срезу (из-за него позиция и терялась), а тем,
+    // что запросы идут пачками.
+    //
+    // Восемь за раз: свой узел это держит спокойно, а очередь из ста
+    // тридцати превращается в полтора десятка кругов.
     const live = [];
-    for (const id of ids) {
-      try {
-        const q = await C.readPositionLiquidity(state.rpc, id);
-        if (q > 0n) live.push({ id, liq: q });
-      } catch (e) { /* не прочиталась — не выдаём за пустую, просто пропуск */ }
+    const BATCH = 8;
+    for (let i = 0; i < ids.length; i += BATCH) {
+      const part = ids.slice(i, i + BATCH);
+      const got = await Promise.all(part.map(async (id) => {
+        try {
+          const q = await C.readPositionLiquidity(state.rpc, id);
+          return q > 0n ? { id, liq: q } : null;
+        } catch (e) { return null; }   // не прочиталась — не выдаём за пустую
+      }));
       if (stale()) return;
+      for (const g of got) if (g) live.push(g);
       if (live.length >= 40) break;               // столько всё равно не бывает
     }
+    if (stale()) return;
+    // Заголовок «читаю…» держим до первой строки: пустая таблица читается как
+    // «позиций нет», а это не то же самое, что «ещё считаю».
+    tb.innerHTML = '';
     for (const { id, liq } of live) {
       let info = null;
       try {
