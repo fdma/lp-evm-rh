@@ -20,7 +20,7 @@
   const KEY = 'lp-evm-rh';
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '3.3';
+  const VERSION = '3.4';
   const LEDGER = 'lp-evm-rh-ledger';   // память о входах: без неё PnL не посчитать
 
   const state = {
@@ -153,7 +153,21 @@
         $('poolinfo').innerHTML = '<div class="hint">ищу пулы в цепочке…</div>';
         try {
           const latest = Number(BigInt(await logsRpc()('eth_blockNumber', [])));
-          const onchain = await C.poolsOfToken(logsRpc(), t[0], latest);
+          // СНАЧАЛА СВЕЖЕЕ. Блок здесь 0.101 с, то есть сутки — это 852 тысячи
+          // блоков. Новую монету вставляют через часы после запуска, поэтому
+          // трёх суток хватает почти всегда, а лезть в 55 миллионов блоков на
+          // приболевшем узле означает ждать минутами.
+          const DAY = 852000;
+          let onchain = [];
+          for (const [depth, label] of [[3 * DAY, 'за трое суток'],
+                                        [20 * DAY, 'за три недели'],
+                                        [latest, 'по всей истории']]) {
+            $('poolinfo').innerHTML =
+              `<div class="hint">ищу пулы в цепочке ${label}…</div>`;
+            onchain = await C.poolsOfToken(logsRpc(), t[0], latest,
+                                           latest - depth, 12);
+            if (onchain.length) break;
+          }
           if (onchain.length) {
             log(`в цепочке нашёл ${onchain.length} пул(ов), показываю свежие ` +
                 `— оборот из цепочки не виден, смотри на «платит на деле»`, 'ok');
@@ -276,7 +290,7 @@
       // экране не менялось ничего: ждать было нечего, но и понять это было
       // нельзя. Лучше через десять секунд честно сказать, что не дождались.
       const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-      const timer = ctl ? setTimeout(() => ctl.abort(), 10000) : null;
+      const timer = ctl ? setTimeout(() => ctl.abort(), 6000) : null;
       const r = await fetch('https://api.dexscreener.com/latest/dex/search?q=' + addr,
                             ctl ? { signal: ctl.signal } : undefined);
       if (timer) clearTimeout(timer);
@@ -294,7 +308,7 @@
         .sort((a, b) => b.vol - a.vol);
     } catch (e) {
       log('список пулов не пришёл: ' + (e.name === 'AbortError'
-        ? 'сводка DexScreener не ответила за 10 с' : e.message), 'bad');
+        ? 'сводка DexScreener не ответила за 6 с' : e.message), 'bad');
       return [];
     }
   }
@@ -1002,6 +1016,11 @@
     } catch (e) { setTimeout(bindEntry, 4000); }
   }
 
+  // Номера позиций, у которых ликвидность оказалась нулевой. Живёт в памяти
+  // страницы: после перезагрузки проверим заново, чтобы не унаследовать
+  // ошибочный вывод, но внутри сеанса не переспрашиваем.
+  const emptyIds = new Set();
+
   // ── позиции ─────────────────────────────────────────────────────────────
   async function loadPositions() {
     const run = ++posRun;
@@ -1061,16 +1080,26 @@
     const live = [];
     const BATCH = 8;
     for (let i = 0; i < ids.length; i += BATCH) {
-      const part = ids.slice(i, i + BATCH);
+      // Пустые оболочки, которые уже видели, второй раз не спрашиваем.
+      // Закрытая позиция обратно не наполняется — терминал этого не умеет и
+      // не будет. За сеанс это превращает повторный обход ста сорока восьми
+      // позиций в почти мгновенный.
+      const part = ids.slice(i, i + BATCH).filter(id => !emptyIds.has(String(id)));
       const got = await Promise.all(part.map(async (id) => {
         try {
           const q = await C.readPositionLiquidity(state.rpc, id);
+          if (q === 0n) emptyIds.add(String(id));
           return q > 0n ? { id, liq: q } : null;
         } catch (e) { return null; }   // не прочиталась — не выдаём за пустую
       }));
       if (stale()) return;
       for (const g of got) if (g) live.push(g);
       if (live.length >= 40) break;               // столько всё равно не бывает
+      // Видно, что работа идёт, а не «зависло».
+      if (i % (BATCH * 4) === 0) {
+        tb.innerHTML = `<tr><td colspan="7" class="hint">читаю позиции… ` +
+          `${Math.min(i + BATCH, ids.length)} из ${ids.length}</td></tr>`;
+      }
     }
     if (stale()) return;
     // Заголовок «читаю…» держим до первой строки: пустая таблица читается как

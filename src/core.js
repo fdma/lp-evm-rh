@@ -277,13 +277,20 @@ function rawToShownPct(rawPct, inverted) {
 const INIT_TOPIC =
   '0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438';
 
-async function poolsOfToken(rpc, token, latest) {
+// from — с какого блока искать. По всей истории лезть НЕ НАДО: новую монету
+// вставляют через часы после её появления, а полная история — это 55 млн
+// блоков, и на приболевшем узле деление такого отрезка растягивается на
+// минуты. Автор ждал пять минут и не дождался. Сначала смотрим свежее.
+//
+// budget — потолок запросов на каждую из двух сторон пары.
+async function poolsOfToken(rpc, token, latest, from = 0, budget = 12) {
   const pad = '0x' + addrWord(token);
   const out = new Map();
   for (const topics of [[INIT_TOPIC, null, pad], [INIT_TOPIC, null, null, pad]]) {
     let logs = [];
     try {
-      logs = await getLogsSplit(rpc, { address: RH.poolManager, topics }, 0, latest);
+      logs = await getLogsSplit(rpc, { address: RH.poolManager, topics },
+                                Math.max(0, from), latest, { left: budget });
     } catch (e) { continue; }
     for (const l of logs) {
       const id = (l.topics[1] || '').toLowerCase();
