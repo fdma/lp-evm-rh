@@ -20,7 +20,7 @@
   const KEY = 'lp-evm-rh';
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '3.4';
+  const VERSION = '3.5';
   const LEDGER = 'lp-evm-rh-ledger';   // память о входах: без неё PnL не посчитать
 
   const state = {
@@ -137,13 +137,23 @@
     const raw = $('pool').value.trim();
     const m = raw.match(/0x[0-9a-fA-F]{64}/);
     let poolId = m ? m[0] : null;
+    if (poolId) {
+      // Говорим ВСЛУХ, что распознали. Если в поле остался старый PoolId, а
+      // сверху вставлен адрес монеты, терминал возьмёт PoolId — и со стороны
+      // это выглядит как «нажимаю, а ничего не происходит».
+      log(`вижу PoolId ${poolId.slice(0, 10)}…${poolId.slice(-6)}`);
+    }
     if (!poolId) {
       const t = raw.match(/0x[0-9a-fA-F]{40}/);
       if (!t) { log('не вижу ни PoolId, ни адреса монеты', 'bad'); return; }
+      log(`вижу адрес монеты ${t[0].slice(0, 10)}…${t[0].slice(-6)}`);
       // Отзыв на нажатие СРАЗУ, до всякой сети: иначе кнопка выглядит мёртвой.
       log('ищу пулы этой монеты…');
       $('poolinfo').innerHTML = '<div class="hint">ищу пулы монеты…</div>';
+      const tSearch = performance.now();
       const list = await poolsByToken(t[0]);
+      log(`сводка ответила за ${(performance.now() - tSearch).toFixed(0)} мс: ` +
+          `${list.length} пул(ов)`);
       if (!list.length) {
         // ЗАПАСНОЙ ПУТЬ — САМА ЦЕПОЧКА. Сводка DexScreener может не ответить,
         // а у события Initialize обе стороны пары проиндексированы, поэтому
@@ -327,6 +337,7 @@
     let latest = 0;
     try { latest = Number(BigInt(await logsRpc()('eth_blockNumber', []))); } catch (e) { }
 
+    const tRows = performance.now();
     const rows = await Promise.all(top.map(async (p) => {
       try {
         const k = await C.loadPool(state.rpc, p.poolId, window.keccak256);
@@ -431,6 +442,9 @@
         host.appendChild(b);
       }
     };
+
+    log(`разобрал ${rows.length} пул(ов) за ${(performance.now() - tRows).toFixed(0)} мс, ` +
+        `замеряю комиссии`);
 
     // СПИСОК ПОКАЗЫВАЕМ СРАЗУ, ЗАМЕРЫ ДОПИСЫВАЕМ ПОТОМ.
     //
