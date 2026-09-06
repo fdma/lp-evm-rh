@@ -20,7 +20,7 @@
   const KEY = 'lp-evm-rh';
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '3.2';
+  const VERSION = '3.3';
   const LEDGER = 'lp-evm-rh-ledger';   // память о входах: без неё PnL не посчитать
 
   const state = {
@@ -140,8 +140,34 @@
     if (!poolId) {
       const t = raw.match(/0x[0-9a-fA-F]{40}/);
       if (!t) { log('не вижу ни PoolId, ни адреса монеты', 'bad'); return; }
+      // Отзыв на нажатие СРАЗУ, до всякой сети: иначе кнопка выглядит мёртвой.
+      log('ищу пулы этой монеты…');
+      $('poolinfo').innerHTML = '<div class="hint">ищу пулы монеты…</div>';
       const list = await poolsByToken(t[0]);
-      if (!list.length) { log('пулов этой монеты не нашёл', 'bad'); return; }
+      if (!list.length) {
+        // ЗАПАСНОЙ ПУТЬ — САМА ЦЕПОЧКА. Сводка DexScreener может не ответить,
+        // а у события Initialize обе стороны пары проиндексированы, поэтому
+        // полный список пулов монеты стоит двух запросов. Оборота и глубины
+        // там нет — цепочка их не хранит, — зато список честный и полный.
+        log('сводка не помогла, ищу пулы прямо в цепочке…');
+        $('poolinfo').innerHTML = '<div class="hint">ищу пулы в цепочке…</div>';
+        try {
+          const latest = Number(BigInt(await logsRpc()('eth_blockNumber', [])));
+          const onchain = await C.poolsOfToken(logsRpc(), t[0], latest);
+          if (onchain.length) {
+            log(`в цепочке нашёл ${onchain.length} пул(ов), показываю свежие ` +
+                `— оборот из цепочки не виден, смотри на «платит на деле»`, 'ok');
+            await showPoolChoice(onchain.slice(0, 10).map(o => ({
+              poolId: o.poolId, pair: null, liq: null, vol: null, price: 0,
+            })), t[0]);
+            return;
+          }
+        } catch (e) { log('и в цепочке не нашёл: ' + e.message, 'bad'); }
+        log('пулов этой монеты не нашёл', 'bad');
+        $('poolinfo').innerHTML = '<div class="hint bad">пулов этой монеты не нашёл. ' +
+          'Проверь адрес монеты, либо вставь PoolId напрямую.</div>';
+        return;
+      }
       // Выбор за автором: молча взять «самый глубокий» значит иногда
       // войти в пул, который отстаёт от рынка.
       log(`нашёл ${list.length} пул(ов) — выбери в списке справа от поля`, 'ok');
@@ -245,7 +271,15 @@
   // включая отклонение цены от ведущего пула.
   async function poolsByToken(addr) {
     try {
-      const r = await fetch('https://api.dexscreener.com/latest/dex/search?q=' + addr);
+      // ТАЙМАУТ ОБЯЗАТЕЛЕН. Запрос идёт в чужую сводку, и с телефона он может
+      // висеть сколько угодно. Автор пять минут жал «Загрузить пул», и на
+      // экране не менялось ничего: ждать было нечего, но и понять это было
+      // нельзя. Лучше через десять секунд честно сказать, что не дождались.
+      const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = ctl ? setTimeout(() => ctl.abort(), 10000) : null;
+      const r = await fetch('https://api.dexscreener.com/latest/dex/search?q=' + addr,
+                            ctl ? { signal: ctl.signal } : undefined);
+      if (timer) clearTimeout(timer);
       const d = await r.json();
       return (d.pairs || [])
         .filter(p => p.chainId === 'robinhood' &&
@@ -258,7 +292,11 @@
           price: Number(p.priceUsd) || 0,
         }))
         .sort((a, b) => b.vol - a.vol);
-    } catch (e) { return []; }
+    } catch (e) {
+      log('список пулов не пришёл: ' + (e.name === 'AbortError'
+        ? 'сводка DexScreener не ответила за 10 с' : e.message), 'bad');
+      return [];
+    }
   }
 
   async function showPoolChoice(list, coinAddr) {
@@ -309,12 +347,13 @@
     // он не платит поставщику ликвидности. Это разные вопросы — «где
     // настоящая цена» и «где мне платят».
     const lead = new Map();
-    for (const r of [...rows].sort((a, b) => b.vol - a.vol)) {
+    for (const r of [...rows].sort((a, b) => (b.vol || 0) - (a.vol || 0))) {
       if (!r.onchain || !r.quote) continue;
       if (!lead.has(r.quote)) lead.set(r.quote, r.onchain);
     }
 
-    const money = (v) => v >= 1e6 ? '$' + (v / 1e6).toFixed(2) + 'M'
+    const money = (v) => v == null ? '—'
+                       : v >= 1e6 ? '$' + (v / 1e6).toFixed(2) + 'M'
                        : v >= 1e3 ? '$' + (v / 1e3).toFixed(0) + 'k'
                        : '$' + v.toFixed(0);
 
@@ -356,7 +395,10 @@
                      : r.real && r.real.pays === false ? '0.000%'
                      : r.pending ? '…' : '?';
         b.innerHTML =
-          '<b>' + esc(r.pair) + '</b> <span class="dim num">объём ' + money(r.vol) +
+          // Имя пары берём у ключа, если он прочитан: при поиске по цепочке
+          // сводки нет и подставлять оттуда нечего.
+          '<b>' + esc(r.key ? `${r.key.sym0}/${r.key.sym1}` : (r.pair || '?')) +
+          '</b> <span class="dim num">объём ' + money(r.vol) +
           ' · ликв ' + money(r.liq) + '</span>' +
           (r.key ? '<br><span class="dim num">в ключе ' + feeText(r.key.fee) + ' · ' +
                    '<span class="' + (r.real && r.real.pays ? 'ok' : 'warn') + '">на деле ' +
@@ -381,7 +423,7 @@
     // Раньше список ждал, пока замерятся все восемь пулов: восемь запросов к
     // журналу по очереди, и всё это время на экране висело «читаю пулы…».
     // Автор справедливо сказал, что новый пул грузится очень долго.
-    rows.sort((a, b) => b.vol - a.vol);
+    rows.sort((a, b) => (b.vol || 0) - (a.vol || 0));
     for (const r of rows) r.pending = !!(latest && r.key && r.ok);
     render(true);
 
@@ -397,7 +439,7 @@
       }
       // Всё замерено — расставляем по-честному: сначала платящие.
       rows.sort((a, b) => (Number(b.real && b.real.pays === true) -
-                           Number(a.real && a.real.pays === true)) || (b.vol - a.vol));
+                           Number(a.real && a.real.pays === true)) || ((b.vol || 0) - (a.vol || 0)));
       render(false);
     }
   }

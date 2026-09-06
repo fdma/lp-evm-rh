@@ -261,6 +261,50 @@ function rawToShownPct(rawPct, inverted) {
   return (d - 1) * 100;
 }
 
+// ── ПУЛЫ МОНЕТЫ ПРЯМО ИЗ ЦЕПОЧКИ ─────────────────────────────────────────
+//
+// Список пулов монеты берётся из сводки DexScreener, и это единственное
+// место, где терминал зависит от чужого сервера. Когда сводка не отвечает —
+// а с телефона это бывает, — кнопка «Загрузить пул» выглядит мёртвой.
+//
+// Между тем всё нужное лежит в цепочке: у события Initialize ОБЕ стороны
+// пары проиндексированы, поэтому найти все пулы монеты стоит двух запросов
+// по всей истории, независимо от её глубины.
+//
+// Чего здесь нет и не будет: оборота и глубины. Их цепочка не хранит, и
+// считать их обходом всех обменов слишком дорого. Поэтому это запасной путь:
+// список полный, но без сортировки по объёму.
+const INIT_TOPIC =
+  '0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438';
+
+async function poolsOfToken(rpc, token, latest) {
+  const pad = '0x' + addrWord(token);
+  const out = new Map();
+  for (const topics of [[INIT_TOPIC, null, pad], [INIT_TOPIC, null, null, pad]]) {
+    let logs = [];
+    try {
+      logs = await getLogsSplit(rpc, { address: RH.poolManager, topics }, 0, latest);
+    } catch (e) { continue; }
+    for (const l of logs) {
+      const id = (l.topics[1] || '').toLowerCase();
+      if (!id) continue;
+      const w = words(l.data);
+      out.set(id, {
+        poolId: id,
+        currency0: '0x' + (l.topics[2] || '').slice(26),
+        currency1: '0x' + (l.topics[3] || '').slice(26),
+        fee: Number(BigInt('0x' + w[0])),
+        tickSpacing: Number(toSigned(BigInt('0x' + w[1]), 256)),
+        hooks: '0x' + w[2].slice(24),
+        block: Number(BigInt(l.blockNumber)),
+      });
+    }
+  }
+  // Свежие первыми: у монеты, которой пара дней, старых пулов и не бывает,
+  // а у старой свежий пул обычно и есть живой.
+  return [...out.values()].sort((a, b) => b.block - a.block);
+}
+
 // ── свои позиции, БЕЗ обозревателя ───────────────────────────────────────
 //
 // Раньше список брался у Blockscout, и он не работал никогда: обозреватель
@@ -1261,6 +1305,7 @@ const API = {
   priceAtClose, priceFromSqrt, findMint, txFlows, priceAtBlock, blockTime,
   readAllPositions, readPositionEvents, MODIFY_TOPIC, SWAP_TOPIC,
   poolFeeReality, getLogsSplit, askedToRawPct, rawToShownPct,
+  poolsOfToken, INIT_TOPIC,
   assertChain, assertContracts, words, toSigned, stripHex, addrWord, hex,
   buildMintCalldata, encodeMintParams, encodeSettlePair, encodeUnlockData,
   readAllowances, buildErc20Approve, buildPermit2Approve, planApprovals, simulate,
