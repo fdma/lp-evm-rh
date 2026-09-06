@@ -20,7 +20,7 @@
   const KEY = 'lp-evm-rh';
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '3.5';
+  const VERSION = '3.6';
   const LEDGER = 'lp-evm-rh-ledger';   // память о входах: без неё PnL не посчитать
 
   const state = {
@@ -135,16 +135,30 @@
   async function loadPool() {
     if (!state.rpc && !(await checkRpc())) return;
     const raw = $('pool').value.trim();
-    const m = raw.match(/0x[0-9a-fA-F]{64}/);
-    let poolId = m ? m[0] : null;
+
+    // БЕРЁМ ПОСЛЕДНЕЕ, А НЕ САМОЕ ДЛИННОЕ.
+    //
+    // Автор сказал дословно: «новую цашку ДОБАВИЛ». То есть в поле остался
+    // старый PoolId, а адрес монеты дописан к нему. Прежний разбор искал
+    // сначала 64 знака и находил старый PoolId — терминал послушно
+    // перезагружал ТОТ ЖЕ пул. Со стороны это ровно «жму, а ничего не
+    // происходит»: кнопка живая, панель та же.
+    //
+    // Что дописано последним, то человек и имел в виду.
+    const found = [...raw.matchAll(/0x[0-9a-fA-F]{40,64}/g)]
+      .map(x => x[0]).filter(s => s.length === 66 || s.length === 42);
+    const pick = found.length ? found[found.length - 1] : null;
+    let poolId = pick && pick.length === 66 ? pick : null;
+    const tokenAddr = pick && pick.length === 42 ? pick : null;
+    if (found.length > 1) {
+      log(`в поле ${found.length} адреса — беру последний, ` +
+          `он и дописан последним`, 'warn');
+    }
     if (poolId) {
-      // Говорим ВСЛУХ, что распознали. Если в поле остался старый PoolId, а
-      // сверху вставлен адрес монеты, терминал возьмёт PoolId — и со стороны
-      // это выглядит как «нажимаю, а ничего не происходит».
       log(`вижу PoolId ${poolId.slice(0, 10)}…${poolId.slice(-6)}`);
     }
     if (!poolId) {
-      const t = raw.match(/0x[0-9a-fA-F]{40}/);
+      const t = tokenAddr ? [tokenAddr] : null;
       if (!t) { log('не вижу ни PoolId, ни адреса монеты', 'bad'); return; }
       log(`вижу адрес монеты ${t[0].slice(0, 10)}…${t[0].slice(-6)}`);
       // Отзыв на нажатие СРАЗУ, до всякой сети: иначе кнопка выглядит мёртвой.
@@ -1866,6 +1880,9 @@
 
   $('b-rpc').onclick = checkRpc;
   $('b-pool').onclick = loadPool;
+  // Очистить поле одним нажатием: на телефоне дописать адрес к старому
+  // проще, чем стереть, и именно из-за этого терминал грузил тот же пул.
+  { const b = $('b-poolclear'); if (b) b.onclick = () => { $('pool').value = ''; $('pool').focus(); }; }
   $('b-arm').onclick = arm;
   $('b-open').onclick = open;
   $('b-pos').onclick = loadPositions;

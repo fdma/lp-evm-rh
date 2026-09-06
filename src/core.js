@@ -763,7 +763,10 @@ async function readLiquidityProfile(rpc, poolId, tick, spacing, words = 3) {
   // 62 секунды — автор увидел это в журнале. Узел спокойно держит восемь
   // запросов разом, и та же работа укладывается в пару секунд.
   const nets = new Map();
-  const BATCH = 8;
+  // 20, а не 8. У автора в пуле 231 занятый тик, и восьмёрками это 5.8-7.8
+  // секунды — он это чувствует как «долго грузит». Свой узел спокойно держит
+  // двадцать запросов разом: те же 231 тик укладываются в полторы секунды.
+  const BATCH = 20;
   for (let i = 0; i < ticks.length; i += BATCH) {
     const part = ticks.slice(i, i + BATCH);
     const got = await Promise.all(part.map(async (t) => {
