@@ -20,7 +20,7 @@
   const KEY = 'lp-evm-rh';
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '3.6';
+  const VERSION = '3.7';
   const LEDGER = 'lp-evm-rh-ledger';   // память о входах: без неё PnL не посчитать
 
   const state = {
@@ -104,7 +104,10 @@
       const b = document.createElement('button');
       b.textContent = t;
       if (state.intent === k) b.classList.add('on');
-      b.onclick = () => { state.intent = k; sideRow(); recalc(); save(); };
+      b.onclick = () => {
+        state.intent = k; sideRow(); amtRow(); recalc(); save();
+        loadBalance().catch(() => {});
+      };
       host.appendChild(b);
     }
   }
@@ -294,6 +297,8 @@
       startPricePump();
       save();
       loadProfile();
+      amtRow();
+      loadBalance().catch(() => {});
     } catch (e) { log('пул не загрузился: ' + e.message, 'bad'); }
   }
 
@@ -1048,6 +1053,78 @@
   // страницы: после перезагрузки проверим заново, чтобы не унаследовать
   // ошибочный вывод, но внутри сеанса не переспрашиваем.
   const emptyIds = new Set();
+
+  // ── БАЛАНС ТОКЕНА ВЗНОСА ────────────────────────────────────────────────
+  //
+  // В режиме «продать монету за стейбл» сумма вводится в ШТУКАХ МОНЕТЫ, и
+  // набирать их руками неудобно: у монеты по 0.0046 это шестизначное число.
+  // Баланс терминал и так читает перед открытием кошелька — просто делаем
+  // это раньше и показываем.
+  let depBal = null;          // {token, sym, dec, human}
+
+  async function loadBalance() {
+    $('bal').textContent = '';
+    depBal = null;
+    if (!state.pool || !state.account) return;
+    let dep;
+    try { dep = resolveSide(); } catch (e) { return; }
+    const token = dep.token;
+    const sym = token.toLowerCase() === (state.pool.currency0 || '').toLowerCase()
+      ? state.pool.sym0 : state.pool.sym1;
+    try {
+      const raw = BigInt(await C.ethCall(state.rpc, token,
+        C.SEL.balanceOf + C.addrWord(state.account)));
+      const dec = state.decimals[token] ?? await tokenDecimals(token);
+      const human = Number(raw) / Math.pow(10, dec);
+      depBal = { token, sym, dec, human };
+      $('bal').innerHTML = `на кошельке <b class="num">${fmtNum(human)}</b> ${esc(sym)}`;
+    } catch (e) {
+      // Молчаливый ноль здесь опаснее пустоты: по нему нельзя считать доли.
+      $('bal').innerHTML = '<span class="warn">баланс не прочитался</span>';
+    }
+    amtRow();
+  }
+
+  // Строка суммы: в покупке — доллары, в продаже — доли своего баланса.
+  function amtRow() {
+    const sell = state.intent === 'sell';
+    const sym = depBal ? depBal.sym : (sell ? 'монета' : 'USDG');
+    $('l-amt').textContent = sell ? `сколько монеты продаём, ${sym}` : `сумма, ${sym}`;
+    if (!sell) {
+      // Суммы под реальную работу: прежние 1/2/5/10 остались от проверок на
+      // живых деньгах, когда важно было рисковать двумя долларами. Автор
+      // сказал, что теми кнопками не пользуется вовсе.
+      chips($('r-amt'), [50, 100, 200, 250, 500], '', () => state.amount,
+            v => state.amount = v);
+      return;
+    }
+    // Доли от баланса. 100% намеренно НЕ значение по умолчанию: подставить
+    // весь баланс и оставить его выбранным — это ровно то состояние, в
+    // котором легче всего нажать «ВОЙТИ» не глядя.
+    const host = $('r-amt');
+    host.innerHTML = '';
+    for (const pct of [25, 50, 75, 100]) {
+      const b = document.createElement('button');
+      b.textContent = pct + '%';
+      b.disabled = !depBal;
+      b.onclick = () => {
+        if (!depBal) return;
+        state.amount = depBal.human * pct / 100;
+        amtRow(); recalc(); save();
+        log(`взял ${pct}% баланса: ${fmtNum(state.amount)} ${depBal.sym}`);
+      };
+      host.appendChild(b);
+    }
+    const own = document.createElement('input');
+    own.type = 'text'; own.className = 'own'; own.placeholder = 'своё';
+    own.value = state.amount ? String(state.amount) : '';
+    own.onchange = () => {
+      const v = parseFloat(String(own.value).replace(',', '.'));
+      if (!isFinite(v) || v <= 0) { own.style.borderColor = 'var(--bad)'; return; }
+      own.style.borderColor = ''; state.amount = v; recalc(); save();
+    };
+    host.appendChild(own);
+  }
 
   // ── позиции ─────────────────────────────────────────────────────────────
   async function loadPositions() {
@@ -1873,7 +1950,7 @@
 
   // ── запуск ──────────────────────────────────────────────────────────────
   load();
-  chips($('r-amt'), [1, 2, 5, 10, 50, 100], '', () => state.amount, v => state.amount = v);
+  amtRow();
   chips($('r-width'), [15, 30, 50, 70], '%', () => state.width, v => state.width = v);
   chips($('r-gap'), [1, 3, 5, 10], '%', () => state.gap, v => state.gap = v);
   sideRow();
@@ -1902,6 +1979,7 @@
       // узлу, он от них отвечает «internal server error», и страдают ПОЗИЦИИ.
       // Нужна история — есть кнопка.
       loadPositions();
+      loadBalance().catch(() => {});
     } catch (e) { log('кошелёк: ' + e.message, 'bad'); }
   };
 
