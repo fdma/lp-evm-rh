@@ -1299,7 +1299,8 @@
       // запроса, дающих всего 1.7 часа истории, и узел на них отвечал
       // «internal server error». Один запрос по всей истории и дешевле,
       // и полнее: фильтр по адресу делает глубину бесплатной.
-      ids = (await C.readAllPositions(logsRpc(), state.account)).map(x => x.id);
+      const from = C.RH.deepLogs ? 0 : -(C.RH.logsWindow || 5000);
+      ids = (await C.readAllPositions(logsRpc(), state.account, from)).map(x => x.id);
     } catch (e) { log('позиции не прочитались: ' + e.message, 'warn'); }
     // Свои позиции знаем сами: обозреватель индексирует новую NFT с
     // задержкой до полуминуты, и всё это время позиция «пропадала».
@@ -1919,7 +1920,16 @@
     tb.innerHTML = '<tr><td colspan="4" class="hint">читаю цепочку…</td></tr>';
 
     let all = [];
-    try { all = await C.readAllPositions(logsRpc(), state.account); }
+    // Там, где узел не хранит глубину, «история сделок» честно невозможна:
+    // спрашивать её значит ждать минуты и получить «Load failed».
+    if (!C.RH.deepLogs && (!state.rpcUrl || /publicnode\.com/i.test(state.rpcUrl))) {
+      tb.innerHTML = '<tr><td colspan="4" class="hint">в этой сети публичный узел ' +
+        'хранит только недавние блоки — истории сделок по нему не собрать. ' +
+        'Нужен архивный узел; открытые позиции при этом видны как обычно.</td></tr>';
+      return;
+    }
+    try { all = await C.readAllPositions(logsRpc(), state.account,
+                                         C.RH.deepLogs ? 0 : -(C.RH.logsWindow || 5000)); }
     catch (e) {
       tb.innerHTML = '<tr><td colspan="4" class="hint">узел не отдал историю: ' +
                      (e.message || '') + '</td></tr>';

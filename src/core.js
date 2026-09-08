@@ -73,6 +73,9 @@ const CHAINS = {
     rpcHint: 'https://bnb-mainnet.g.alchemy.com/v2/… (свой узел — глубже история)',
     storeKey: 'lp-bsc',
     ledgerKey: 'lp-bsc-ledger',
+    // Сколько недавних блоков спрашивать у журнала. Узел хранит немного;
+    // 5000 блоков это около часа и один запрос вместо двух десятков отказов.
+    logsWindow: 5000,
     // Вход в пары с нативной монетой пока не собран: её нельзя провести через
     // Permit2, нужен путь через значение транзакции и SWEEP.
     nativeEntryBlocked: true,
@@ -742,12 +745,22 @@ const MODIFY_TOPIC =
 // Раньше список собирался окнами на 60 000 блоков назад. При блоке в 0.1 с
 // это 1.7 часа — всё, что старше, просто исчезало. Фильтр по адресу делает
 // запрос дешёвым независимо от глубины: 103 позиции за 277 мс.
-async function readAllPositions(rpc, owner) {
+// НАЧАЛО ОТРЕЗКА ЗАДАЁТСЯ СНАРУЖИ, И ЭТО НЕ ПРИДИРКА.
+//
+// В сети Robinhood публичный узел отдаёт журнал с нулевого блока, и один
+// запрос по всей истории дёшев. В BSC узел хранит только недавние блоки, и
+// запрос с нуля превращается в два десятка отказов «archive requests
+// require...», каждый из которых делит отрезок пополам. У автора это заняло
+// три минуты и закончилось «Load failed» в браузере телефона; позицию спас
+// журнал терминала, а не цепочка. Поэтому там, где глубины нет, спрашиваем
+// сразу недавнее окно.
+async function readAllPositions(rpc, owner, fromBlock = 0) {
   const latest = Number(BigInt(await rpc('eth_blockNumber', [])));
+  const from = Math.max(0, fromBlock < 0 ? latest + fromBlock : fromBlock);
   const logs = await getLogsSplit(rpc, {
     address: RH.positionManager,
     topics: [TRANSFER_TOPIC, null, '0x' + addrWord(owner)],
-  }, 0, latest);
+  }, from, latest);
   const seen = new Map();
   for (const l of logs) {
     const id = BigInt(l.topics[3]).toString();
