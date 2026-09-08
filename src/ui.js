@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '4.2';
+  const VERSION = '4.3';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -937,6 +937,23 @@
   // BNB, поэтому BNB здесь тоже считается денежной стороной: именно ею
   // измеряется цена монеты и ею же заходят в диапазон сверху вниз.
   // Имя STABLE оставлено, чтобы правки из того терминала переносились сюда.
+  // ЗАПИСЬ ВХОДА СТАРОГО ОБРАЗЦА.
+  //
+  // До 08.09.2026 в журнал попадало КОЛИЧЕСТВО внесённого токена, а не его
+  // стоимость в стейбле. Для входа стейблом это одно и то же, а для входа
+  // монетой — нет: 434198 MADE сравнивались со 159.68 USDG, и выходил
+  // «убыток −99.96%» на сделке, которая ничего подобного не значила.
+  //
+  // Новые записи помечены полем depIsStable. У старых его нет, и если число
+  // входа несопоставимо с тем, что вернулось, доверять ему нельзя: честнее
+  // сказать «не считаю», чем показать выдуманный минус.
+  function entryUsable(rec, gotValue) {
+    if (!rec || rec.amountIn == null) return false;
+    if (rec.depIsStable !== undefined) return true;      // новая запись
+    if (!(gotValue > 0)) return true;
+    return rec.amountIn < gotValue * 50;                 // старая, но правдоподобная
+  }
+
   const STABLE = /^(usdt|usdc|busd|fdusd|usd1|dai|usde|frax|tusd|usdg|bnb|wbnb)$/i;
 
   // Символ денежной стороны текущего пула. До загрузки пула — USDT как
@@ -1173,11 +1190,38 @@
       log('вход отправлен: ' + h, 'ok');
       // Запоминаем вход: сумму, цену и время. Сеть этого не хранит, а без
       // него честного итога после закрытия не посчитать.
-      pendingEntry = { amountIn: state.amount, tEntry: Date.now(),
-                       priceIn: priceOf(state.slot0.tick), hash: h,
+      // ВНЕСЁННОЕ ЗАПИСЫВАЕМ В СТЕЙБЛЕ, А НЕ В ТОМ, ЧЕМ ЗАШЛИ.
+      //
+      // Здесь была ошибка, которую автор поймал на живой сделке. В режиме
+      // «продать монету за стейбл» вносится МОНЕТА, и сюда попадало её
+      // количество — 434198.78 MADE. Потом итог сравнивал это число с
+      // деньгами, вернувшимися в USDG, и карточка показала «убыток
+      // −$434039.10, −99.96%» на сделке, где вернулось 159.68 USDG.
+      //
+      // Правило то же, что при чтении из цепочки и у Кристала с Метеорой:
+      // внесённое оценивается ПО ЦЕНЕ ВХОДА. Цена монеты в стейбле —
+      // это priceOf(); стейбл сам себе равен.
+      const stIdx = stableSide();
+      const stableAddr = stIdx === null ? null
+        : (stIdx === 1 ? key.currency1 : key.currency0);
+      const depIsStable = stableAddr != null &&
+        dep.token.toLowerCase() === stableAddr.toLowerCase();
+      const priceCoin = priceOf(state.slot0.tick);      // стейбла за монету
+      const amountInStable = depIsStable ? state.amount
+                                         : state.amount * (priceCoin || 0);
+      const depSymbol = dep.token.toLowerCase() === (key.currency0 || '').toLowerCase()
+        ? state.pool.sym0 : state.pool.sym1;
+      pendingEntry = { amountIn: amountInStable, tEntry: Date.now(),
+                       // То, чем реально зашли — для честной подписи в карточке.
+                       amountInToken: state.amount, symIn: depSymbol,
+                       depIsStable,
+                       priceIn: priceCoin, hash: h,
                        token0: key.currency0, token1: key.currency1,
                        pair: `${state.pool.sym0}/${state.pool.sym1}`,
                        fee: state.pool.fee };
+      if (!depIsStable && !priceCoin) {
+        log('цена входа не прочиталась — итог по этой позиции будет неточным', 'warn');
+      }
       setTimeout(() => bindEntry(), 6000);
       setTimeout(loadPositions, 6000);
     } catch (e) {
@@ -1489,7 +1533,11 @@
 
       const pnlOf = (rec) => {
         let pnlStr = '—';
-      if (rec && rec.amountIn != null && total != null) {
+      if (rec && rec.amountIn != null && total != null &&
+          !entryUsable(rec, (total || 0) + (feesValue || 0))) {
+        pnlStr = '<span class="warn">вход записан в монете, а не в стейбле — ' +
+                 'итог по этой позиции не считаю</span>';
+      } else if (rec && rec.amountIn != null && total != null) {
         // ИТОГ = стоимость позиции ПЛЮС накопленные комиссии.
         // Раньше комиссии показывались отдельной зелёной строкой, но в итог
         // не входили: позиция с +13.29 комиссий показывала минус 6.11.
@@ -1864,7 +1912,9 @@
       const mins = rec && rec.tEntry ? (Date.now() - rec.tEntry) / 60000 : null;
       let line = `ЗАКРЫТО ${tokenId}: вернулось ${back0.toFixed(4)} + ` +
                  `${back1.toFixed(4)} ${symQuote} = ${got.toFixed(4)} ${symQuote}`;
-      if (rec && rec.amountIn != null) {
+      if (rec && rec.amountIn != null && !entryUsable(rec, got)) {
+        line += ' | вход записан в монете, а не в стейбле — итог не считаю';
+      } else if (rec && rec.amountIn != null) {
         // То, что вынули раньше (комиссии, половина), входит в итог наравне
         // с тем, что вернулось сейчас. Иначе закрытие остатка выглядело бы
         // убытком ровно на снятую сумму.
@@ -2162,7 +2212,13 @@
     g.font = '400 20px ui-sans-serif,system-ui,sans-serif';
     const mins = rec.tEntry && rec.closed
       ? Math.max(1, Math.round((rec.closed - rec.tEntry) / 60000)) + ' мин в позиции' : '';
-    g.fillText(`${rec.amountIn} → ${(rec.got ?? 0).toFixed(2)}   ${mins}`, 52, 452);
+    // Подпись показывает вход так, как он БЫЛ: если заходили монетой —
+    // её количество и рядом во что это превратилось по цене входа.
+    const inTxt = rec.amountInToken != null && rec.depIsStable === false
+      ? `${Number(rec.amountInToken).toLocaleString('ru', { maximumFractionDigits: 2 })} ` +
+        `${rec.symIn || ''} (≈${Number(rec.amountIn || 0).toFixed(2)})`
+      : `${Number(rec.amountIn || 0).toFixed(2)}`;
+    g.fillText(`${inTxt} → ${(rec.got ?? 0).toFixed(2)}   ${mins}`, 52, 452);
     g.textAlign = 'right';
     g.fillText('LP EVM RH', W - 52, 452);
     return cv;
