@@ -1056,7 +1056,7 @@
       return;
     }
 
-    const snapPool = state.pool, snapAmount = state.amount, snapSlot = state.slot0;
+    const snapPool = state.pool, snapAmount = state.amount;
     try {
       const bal = BigInt(await C.ethCall(state.rpc, dep.token,
         C.SEL.balanceOf + C.addrWord(state.account)));
@@ -1107,27 +1107,52 @@
 
     const t0 = performance.now();
     const key = state.pool;
-    const sqrtL = C.getSqrtRatioAtTick(p.tickLower);
-    const sqrtU = C.getSqrtRatioAtTick(p.tickUpper);
+    // ПЛАН ПЕРЕСЧИТЫВАЕМ ПОСЛЕ ВСЕХ ПРОВЕРОК, А НЕ ДО НИХ.
+    //
+    // Цена в терминале обновляется каждые 250 мс, и раньше здесь стоял план,
+    // посчитанный ДО запросов к узлу. Пока шли проверки баланса и разрешений,
+    // цена успевала смениться, и сторож ниже отменял вход словами «пул или
+    // сумма сменились». Автор нажимал ВОЙТИ трижды подряд и трижды получал
+    // отказ — при том что ни пул, ни сумму он не трогал.
+    //
+    // Правильный ответ не в том, чтобы ослабить сторожа: он защищает от входа
+    // по устаревшему плану. Правильный — считать план по САМОЙ СВЕЖЕЙ цене,
+    // когда все проверки уже позади.
+    const pf = recalc();
+    if (!pf || !pf.oneSided) {
+      log('пока шли проверки, цена ушла и диапазон перестал быть односторонним — ' +
+          'нажми ещё раз', 'warn');
+      return;
+    }
+    const sqrtL = C.getSqrtRatioAtTick(pf.tickLower);
+    const sqrtU = C.getSqrtRatioAtTick(pf.tickUpper);
     const amt = amountRaw();
     // Односторонняя позиция: ниже цены она состоит только из currency1,
     // выше — только из currency0.
-    const liquidity = p.oneSided && dep.side === 'down'
+    const liquidity = pf.oneSided && dep.side === 'down'
       ? C.liquidityForAmount1(sqrtL, sqrtU, amt)
       : C.liquidityForAmount0(sqrtL, sqrtU, amt);
     // Неиспользуемой стороне ставим 0: если цена войдёт в диапазон, пока
     // автор подписывает, транзакция откажет, а не потратит второй токен.
     const data = C.buildMintCalldata({
-      key, tickLower: p.tickLower, tickUpper: p.tickUpper, liquidity,
+      key, tickLower: pf.tickLower, tickUpper: pf.tickUpper, liquidity,
       amount0Max: dep.side === 'down' ? 0n : amt,
       amount1Max: dep.side === 'down' ? amt : 0n,
       owner: state.account,
       deadline: Math.floor(Date.now() / 1000) + 90,
     });
-    // Пока шли запросы, пул или сумму могли переключить — тогда план уже не
-    // про то, что на экране.
-    if (state.pool !== snapPool || state.amount !== snapAmount || state.slot0 !== snapSlot) {
+    // Сторож остался, но сторожит он ПУЛ И СУММУ, а не тик цены.
+    //
+    // Цена меняется четыре раза в секунду, и требовать её неизменности значит
+    // не пускать никогда. Смена пула или суммы — другое дело: это значит, что
+    // человек передумал, пока шли запросы, и отправлять старое нельзя.
+    // Свежесть цены обеспечена тем, что план посчитан строкой выше.
+    if (state.pool !== snapPool || state.amount !== snapAmount) {
       log('пул или сумма сменились, пока я считал — вход отменён, нажми ещё раз', 'warn');
+      return;
+    }
+    if (Date.now() - state.slot0At > 5000) {
+      log('цена перестала обновляться — вход не отправляю, проверь узел', 'bad');
       return;
     }
     log(`собрал за ${(performance.now() - t0).toFixed(1)} мс, открываю кошелёк`);
