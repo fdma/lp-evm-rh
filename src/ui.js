@@ -2282,6 +2282,23 @@
   }
   drawChains();
 
+  // Если сайт уже разрешён в кошельке, подхватываем адрес молча — без окна
+  // и без нажатий. Иначе после каждого обновления страницы панель позиций
+  // пишет «подключи кошелёк», и выглядит это так, будто терминал потерял
+  // открытую позицию.
+  (async () => {
+    const w = await W.reconnect();
+    if (!w) return;
+    state.account = w.address;
+    $('d-wallet').className = 'dot on';
+    $('s-wallet').textContent = w.address.slice(0, 6) + '…' + w.address.slice(-4);
+    log('кошелёк уже разрешён здесь: ' + w.address, 'ok');
+    if (w.chainId !== C.RH.chainId)
+      log(`но кошелёк в сети ${w.chainId}, а нужна ${C.RH.chainId} (${C.RH.label}) — ` +
+          'переключи в Rabby или нажми «Подключить»', 'warn');
+    else loadPositions();
+  })();
+
   const rpcEl = $('rpc'); if (rpcEl) rpcEl.placeholder = C.RH.rpcHint || '';
   const verEl = $('ver');
   if (verEl) verEl.textContent = `${C.RH.label} · v${VERSION}`;

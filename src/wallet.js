@@ -20,6 +20,23 @@ window.RHWallet = (() => {
     return p;
   }
 
+  // ТИХОЕ ВОССТАНОВЛЕНИЕ СВЯЗИ.
+  //
+  // eth_accounts, в отличие от eth_requestAccounts, НЕ открывает окно: он
+  // возвращает адрес, только если этот сайт уже был разрешён в кошельке.
+  // Нужно вот зачем: после каждого обновления страницы связь считалась
+  // потерянной, панель писала «подключи кошелёк», и автор решил, что
+  // терминал не видит его открытую позицию. Позиция была на месте.
+  async function reconnect() {
+    try {
+      const p = provider();
+      const accounts = await p.request({ method: 'eth_accounts' });
+      if (!accounts || !accounts.length) return null;
+      const chainId = Number(BigInt(await p.request({ method: 'eth_chainId' })));
+      return { address: accounts[0], chainId, provider: p };
+    } catch (e) { return null; }
+  }
+
   async function connect() {
     const p = provider();
     const accounts = await p.request({ method: 'eth_requestAccounts' });
@@ -61,5 +78,5 @@ window.RHWallet = (() => {
     try { provider().on('chainChanged', cb); } catch (e) { /* нет кошелька */ }
   }
 
-  return { connect, send, ensureChain, onAccountsChanged, onChainChanged };
+  return { connect, reconnect, send, ensureChain, onAccountsChanged, onChainChanged };
 })();
