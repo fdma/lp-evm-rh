@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '4.1';
+  const VERSION = '4.2';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -1417,9 +1417,6 @@
 
       // СОСТАВ: сколько чего лежит сейчас и сколько это в стейбле.
       let comp = '—', valueStr = '—', total = null, stableSym = sym1, feesValue = 0;
-      // Состав позиции нужен и таблице, и подписям кнопок: человек должен
-      // видеть, ЧТО именно он заберёт, до того как нажал.
-      let amt0 = null, amt1 = null, fee0 = 0, fee1 = 0;
       if (s0) {
         const a = C.amountsForLiquidity(
           s0.sqrtPriceX96, C.getSqrtRatioAtTick(t.tickLower),
@@ -1427,7 +1424,6 @@
         const raw = Math.pow(1.0001, s0.tick) * Math.pow(10, d0 - d1);
         const n0 = Number(a.amount0) / Math.pow(10, d0);
         const n1 = Number(a.amount1) / Math.pow(10, d1);
-        amt0 = n0; amt1 = n1;
         // СТОИМОСТЬ СЧИТАЕМ В СТЕЙБЛЕ, а не в currency1.
         // Здесь была ошибка: у пары USDG/TAOBAO стоимость выходила
         // «3335 TAOBAO», а итог показывал +166690%. Стейбл может стоять
@@ -1444,7 +1440,6 @@
         if (fees) {
           const g0 = Number(fees.fee0) / Math.pow(10, d0);
           const g1 = Number(fees.fee1) / Math.pow(10, d1);
-          fee0 = g0; fee1 = g1;
           feesValue = st === 1 ? g0 * raw + g1 : g0 + (raw ? g1 / raw : 0);
         }
         valueStr = `${total.toFixed(4)} ${esc(stableSym)}` +
@@ -1570,67 +1565,26 @@
         // ликвидности — форма вызова та самая, что сверена байт в байт с
         // настоящими транзакциями Krystal. Все три варианта прогнаны
         // симуляцией на живой позиции: проходят.
-        `<td style="white-space:nowrap">` + (() => {
-          // ЧЕТЫРЕ КНОПКИ, И КАЖДАЯ ПОДПИСАНА ТЕМ, ЧТО РЕАЛЬНО ПРИДЁТ.
-          //
-          // Автор просил отдельные кнопки «забрать стейбл» и «забрать монету»,
-          // с тикером той монеты, которую фармим. Тикер — сделал. А вот выбрать
-          // СТОРОНУ вывода в Uniswap V4 нельзя, и это не моя лень: уменьшение
-          // ликвидности возвращает обе стороны в той пропорции, в какой они
-          // лежат в позиции при текущей цене. Пока цена ВНЕ диапазона, позиция
-          // состоит из одного токена — тогда «забрать монету» честно означает
-          // именно монету. Как только цена внутри, в позиции оба, и кнопка,
-          // обещающая одну сторону, была бы враньём. Поэтому она в этот момент
-          // гаснет и говорит почему.
-          const num = (v) => v == null ? '?' :
-            (Math.abs(v) >= 1000 ? Math.round(v).toLocaleString('ru')
-                                 : v.toFixed(Math.abs(v) < 1 ? 4 : 2));
-          const has0 = amt0 != null && amt0 > 0, has1 = amt1 != null && amt1 > 0;
-          const both = has0 && has1;
-          // Сторона, которой позиция сейчас является целиком.
-          const soleSym = both ? null : (has0 ? sym0 : has1 ? sym1 : null);
-          const soleAmt = both ? null : (has0 ? amt0 : has1 ? amt1 : null);
-          const feesTxt = (fee0 > 0 || fee1 > 0)
-            ? [fee0 > 0 ? num(fee0) + ' ' + sym0 : null,
-               fee1 > 0 ? num(fee1) + ' ' + sym1 : null].filter(Boolean).join(' + ')
-            : 'пока пусто';
-          const halfTxt = amt0 == null ? '' :
-            [has0 ? num(amt0 / 2) + ' ' + sym0 : null,
-             has1 ? num(amt1 / 2) + ' ' + sym1 : null].filter(Boolean).join(' + ');
-          const allTxt = amt0 == null ? '' :
-            [has0 ? num(amt0) + ' ' + sym0 : null,
-             has1 ? num(amt1) + ' ' + sym1 : null].filter(Boolean).join(' + ');
-          const sole = soleSym
-            ? `<button style="padding:4px 6px;font-size:11px" ` +
-              `title="позиция сейчас состоит только из ${esc(soleSym)} — забрать её целиком">` +
-              `Забрать ${esc(soleSym)}<br><span class="dim" style="font-size:9px">` +
-              `${num(soleAmt)} ${esc(soleSym)}</span></button> `
-            : `<button disabled style="padding:4px 6px;font-size:11px;opacity:.45" ` +
-              `title="цена внутри диапазона: в позиции сейчас обе стороны. Uniswap V4 отдаёт их только вместе, ` +
-              `выбрать одну нельзя — это устройство протокола, а не ограничение терминала">` +
-              `Забрать одну<br><span class="dim" style="font-size:9px">нельзя: в позиции обе` +
-              `</span></button> `;
-          return `<button style="padding:4px 6px;font-size:11px" ` +
-            `title="забрать накопленные комиссии; тело позиции остаётся в пуле целиком">` +
-            `Комиссии<br><span class="dim" style="font-size:9px">${esc(feesTxt)}` +
-            `</span></button> ` +
-            `<button style="padding:4px 6px;font-size:11px" ` +
-            `title="забрать комиссии и половину тела; вторая половина продолжает работать">` +
-            `Половина<br><span class="dim" style="font-size:9px">${esc(halfTxt) || '+ все комиссии'}` +
-            `</span></button> ` +
-            sole +
-            `<button class="danger" style="padding:4px 6px;font-size:11px">` +
-            `Закрыть<br><span class="dim" style="font-size:9px">${esc(allTxt) || 'всё и выход'}` +
-            `</span></button>`;
-        })() + `</td>`;
+        `<td style="white-space:nowrap">` +
+        // Названия пишем от того, ЧТО ОСТАНЕТСЯ, а не от того, что уйдёт.
+        // «Комиссии» и «½» автор принял за одно и то же — и правильно
+        // усомнился: с виду обе «забирают деньги». Разница в теле позиции.
+        `<button style="padding:4px 6px;font-size:11px" ` +
+        `title="забрать накопленные комиссии; тело позиции остаётся в пуле целиком">` +
+        `Комиссии<br><span class="dim" style="font-size:9px">тело целиком остаётся` +
+        `</span></button> ` +
+        `<button style="padding:4px 6px;font-size:11px" ` +
+        `title="забрать комиссии и половину тела; вторая половина продолжает работать">` +
+        `Половина<br><span class="dim" style="font-size:9px">+ все комиссии` +
+        `</span></button> ` +
+        `<button class="danger" style="padding:4px 6px;font-size:11px">` +
+        `Закрыть<br><span class="dim" style="font-size:9px">всё и выход` +
+        `</span></button></td>`;
       {
         const bs = tr.querySelectorAll('button');
         bs[0].onclick = () => closePosition(id, 0n, info.key, total, stableSym, 'fees');
         bs[1].onclick = () => closePosition(id, liq / 2n, info.key, total, stableSym, 'half');
-        // Третья кнопка — та самая «забрать монету/стейбл». Когда она активна,
-        // позиция односторонняя, и «забрать эту сторону» и есть закрытие.
-        if (!bs[2].disabled) bs[2].onclick = () => closePosition(id, liq, info.key, total, stableSym, 'all');
-        bs[3].onclick = () => closePosition(id, liq, info.key, total, stableSym, 'all');
+        bs[2].onclick = () => closePosition(id, liq, info.key, total, stableSym, 'all');
       }
       // Проверяем ВПЛОТНУЮ к записи: между прошлой проверкой и этим местом
       // стоят запросы в сеть, и за это время мог начаться новый проход.
