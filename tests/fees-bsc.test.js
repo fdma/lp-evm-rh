@@ -10,7 +10,24 @@ const assert = require('node:assert');
 const C = require('../src/core.js');
 C.useChain('bsc');   // терминал теперь двухсетевой, тест выбирает сеть сам
 
-const rpc = C.makeRpc(C.RH.publicRpc);
+// Общий узел иногда отвечает «Too Many Requests» на ровном месте — чаще всего
+// потому, что в этот момент по нему работает что-то ещё моё. Тест, который
+// краснеет от чужой нагрузки, ничего не проверяет и приучает не смотреть на
+// красное. Поэтому чтения повторяем.
+const _raw = C.makeRpc(C.RH.publicRpc);
+const _sleep = ms => new Promise(r => setTimeout(r, ms));
+const rpc = async (m, p) => {
+  let last = null;
+  for (let i = 0; i < 4; i++) {
+    try { return await _raw(m, p); }
+    catch (e) {
+      last = e;
+      if (!/too many|rate|429|internal server err|timeout|fetch failed/i.test(e.message || '')) throw e;
+      await _sleep(1200 * (i + 1));
+    }
+  }
+  throw last;
+};
 
 // Тот же капкан, но на BSC. Пул QQQB/USDC: в ключе комиссия 0, хук с правом
 // забирать часть обмена, и по факту 47 обменов подряд с нулевой выплатой —

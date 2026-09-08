@@ -21,10 +21,16 @@
   // ПЕРВЫМ: от него зависят и адреса контрактов, и ключи памяти.
   const CHAIN_KEY = 'lp-chain';
   const chainName = (() => {
+    let saved = null;
+    try { saved = localStorage.getItem(CHAIN_KEY); } catch (e) { }
+    if (C.CHAINS[saved]) return saved;
+    // Кто пришёл впервые — попадает в ту сеть, которую обещает ссылка.
+    // Страница лежит по двум адресам, и открывший .../lp-bsc/ ждёт BSC,
+    // а не Robinhood. Свой выбор, если он был, всегда важнее адреса.
     try {
-      const v = localStorage.getItem(CHAIN_KEY);
-      return C.CHAINS[v] ? v : 'robinhood';
-    } catch (e) { return 'robinhood'; }
+      if (/bsc|bnb/i.test(location.pathname)) return 'bsc';
+    } catch (e) { }
+    return 'robinhood';
   })();
   C.useChain(chainName);
 
@@ -41,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '4.0.1';
+  const VERSION = '4.0.2';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
