@@ -211,9 +211,15 @@
   </div>
 </main>
 
-<script src="src/keccak.js"></script>
-<script src="src/core.js"></script>
-<script src="src/wallet.js"></script>
-<script src="src/ui.js"></script>
+<!-- НОМЕР СБОРКИ В АДРЕСЕ ФАЙЛОВ — НЕ УКРАШЕНИЕ.
+     Safari на телефоне держит старый js в кэше долго, и GitHub Pages сам
+     просит хранить его десять минут. Автор дважды получал «починенную»
+     страницу со старым кодом и справедливо писал, что ничего не изменилось.
+     Меняется номер — меняется адрес, и браузер обязан скачать заново.
+     ПРИ КАЖДОЙ ПРАВКЕ js ЭТОТ НОМЕР И VERSION В ui.js МЕНЯЮТСЯ ВМЕСТЕ. -->
+<script src="src/keccak.js?v=4.0.1"></script>
+<script src="src/core.js?v=4.0.1"></script>
+<script src="src/wallet.js?v=4.0.1"></script>
+<script src="src/ui.js?v=4.0.1"></script>
 </body>
 </html>
