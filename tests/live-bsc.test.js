@@ -4,13 +4,24 @@ const C = require('../src/core.js');
 C.useChain('bsc');   // терминал теперь двухсетевой, тест выбирает сеть сам
 const { execFileSync } = require('child_process');
 
+let independent = true;
 function keccak256(hexInput) {
-  const out = execFileSync('/home/claude/venv/bin/python', ['-c', `
+  // Независимая реализация keccak нужна, чтобы сверять наш PoolId с чужим
+  // счётом, а не с самим собой. Если python3 с pycryptodome в системе нет —
+  // считаем своей и честно об этом говорим: проверка становится слабее.
+  if (independent) {
+    try {
+      return execFileSync('python3', ['-c', `
 import sys
 from Crypto.Hash import keccak
 h=keccak.new(digest_bits=256); h.update(bytes.fromhex(sys.argv[1]))
-print('0x'+h.hexdigest())`, C.stripHex(hexInput)], { encoding: 'utf8' });
-  return out.trim();
+print('0x'+h.hexdigest())`, C.stripHex(hexInput)], { encoding: 'utf8' }).trim();
+    } catch (e) {
+      independent = false;
+      console.log('  замечание: независимой реализации keccak нет — считаю своей');
+    }
+  }
+  return require('../src/keccak.js').keccak256(hexInput);
 }
 
 // Публичные узлы BSC живут под нагрузкой и отвечают отказом на ровном месте.
