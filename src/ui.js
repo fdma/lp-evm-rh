@@ -1080,6 +1080,31 @@
       return;
     }
 
+    // РАЗРЕШЕНИЯ ПРОВЕРЯЕМ ДО КОШЕЛЬКА, А НЕ ПОСЛЕ.
+    //
+    // Поймано на первом же входе в новой сети. У автора разрешение
+    // ERC20 -> Permit2 стояло, а Permit2 -> PositionManager не было: в новой
+    // сети его никто не выдавал. Транзакция собралась, окно Rabby открылось,
+    // и только там симуляция сказала «execution revert». Понять из этого,
+    // что не хватает разрешения, нельзя ничем.
+    //
+    // Симуляция терминала идёт параллельно и её ответ приходит уже при
+    // открытом окне — поздно. Один запрос до отправки решает вопрос.
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      const plan = await C.planApprovals(state.rpc, dep.token, state.account,
+                                         amountRaw(), 1800, now);
+      if (plan.steps.length) {
+        log('не хватает разрешений: ' + plan.steps.map(x => x.what).join(', ') +
+            '. Нажми «ARM — выдать разрешения», потом входи. ' +
+            'Без этого кошелёк покажет «execution revert».', 'bad');
+        return;
+      }
+    } catch (e) {
+      log('разрешения не проверились: ' + e.message + ' — вход не отправляю', 'bad');
+      return;
+    }
+
     const t0 = performance.now();
     const key = state.pool;
     const sqrtL = C.getSqrtRatioAtTick(p.tickLower);
