@@ -12,6 +12,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const C = require('../src/core.js');
+C.useChain('robinhood');   // ядро стало двухсетевым — выбираем явно
 
 // Настоящий пул автора: USDG/ROBINCAT, шаг 300 тиков, стейбл первый.
 const TICK = 315976, SPACING = 300, INVERTED = true;

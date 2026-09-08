@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>LP EVM RH</title>
+<title>LP — Uniswap V4</title>
 <style>
   :root{
     --bg:#0a0e14; --panel:#111820; --line:#1e2833; --line2:#2a3846;
@@ -75,11 +75,27 @@
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   @media(max-width:640px){.grid2{grid-template-columns:1fr}}
 </style>
+<style>
+/* Переключатель сети: две кнопки, активная подсвечена. Специально крупные —
+   на телефоне промахнуться по ним нельзя, это выбор сети, а не мелочь. */
+.chains { display:inline-flex; gap:4px; margin-left:6px }
+.chains button {
+  padding:4px 10px; font-size:12px; line-height:1.2; border-radius:6px;
+  border:1px solid var(--line, #2a2f3a); background:transparent;
+  color:var(--dim, #8a90a0); cursor:pointer;
+}
+.chains button.on {
+  background:var(--accent, #2b6cff); border-color:var(--accent, #2b6cff); color:#fff;
+}
+</style>
 </head>
 <body>
 
 <header>
-  <h1>LP EVM RH <span id="ver" style="color:var(--dim);font-weight:400;font-size:11px;letter-spacing:0"></span></h1>
+  <h1>LP <span id="ver" style="color:var(--dim);font-weight:400;font-size:11px;letter-spacing:0"></span></h1>
+  <!-- Переключатель сети. Стоит первым, потому что от него зависит всё
+       остальное: адреса контрактов, узел, память браузера. -->
+  <span class="chains" id="chains"></span>
   <span class="pill"><span class="dot" id="d-rpc"></span><span id="s-rpc">узел не проверен</span></span>
   <span class="pill"><span class="dot" id="d-wallet"></span><span id="s-wallet">кошелёк не подключён</span></span>
   <span class="pill"><span class="dot" id="d-price"></span><span id="s-price">цена стоит</span></span>
@@ -93,7 +109,7 @@
     <div class="card">
       <h2>узел и кошелёк</h2>
       <label>адрес RPC (свой, быстрый)</label>
-      <input type="text" id="rpc" placeholder="https://robinhood-mainnet.g.alchemy.com/v2/…">
+      <input type="text" id="rpc" placeholder="">
       <div class="row" style="margin-top:7px">
         <button id="b-rpc">Проверить узел</button>
         <button id="b-wallet">Подключить Rabby</button>

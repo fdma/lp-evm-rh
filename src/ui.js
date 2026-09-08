@@ -17,11 +17,39 @@
 (() => {
   const C = window.RHCore, W = window.RHWallet;
   const $ = (id) => document.getElementById(id);
-  const KEY = 'lp-evm-rh';
+  // ВЫБОР СЕТИ. Сохраняется отдельно от всех прочих настроек и читается
+  // ПЕРВЫМ: от него зависят и адреса контрактов, и ключи памяти.
+  const CHAIN_KEY = 'lp-chain';
+  const chainName = (() => {
+    try {
+      const v = localStorage.getItem(CHAIN_KEY);
+      return C.CHAINS[v] ? v : 'robinhood';
+    } catch (e) { return 'robinhood'; }
+  })();
+  C.useChain(chainName);
+
+  // ПАМЯТЬ БРАУЗЕРА У РАЗНЫХ СЕТЕЙ ДОЛЖНА БЫТЬ РАЗНОЙ.
+  //
+  // Страницы лежат на одном домене, а localStorage делится по домену, а не по
+  // папке. С общим ключом версия для BSC подхватывала настройки для
+  // Robinhood: чужой адрес узла, чужой список недавних пулов, чужую ширину.
+  //
+  // Опаснее другое: в журнале входов лежат суммы, по которым считается итог
+  // позиции, а номера позиций в разных сетях независимы и могут совпасть.
+  // Общий журнал означал бы итог, посчитанный от чужого входа. Ключи заданы
+  // в описании сети и МЕНЯТЬ ИХ НЕЛЬЗЯ — вместе с ключом потеряется история.
+  const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '3.8';
-  const LEDGER = 'lp-evm-rh-ledger';   // память о входах: без неё PnL не посчитать
+  const VERSION = '4.0';
+
+  // Нативная монета сети записывается нулевым адресом. Нужна и на входе
+  // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
+  // не бывает.
+  const TRANSFER_TOPIC =
+    '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+  const isNative = a => /^0x0{40}$/i.test(a || '');
+  const LEDGER = C.RH.ledgerKey;       // память о входах: без неё PnL не посчитать
 
   const state = {
     rpc: null, rpcUrl: '', account: null,
@@ -318,26 +346,59 @@
       // висеть сколько угодно. Автор пять минут жал «Загрузить пул», и на
       // экране не менялось ничего: ждать было нечего, но и понять это было
       // нельзя. Лучше через десять секунд честно сказать, что не дождались.
+      // У КАЖДОЙ СЕТИ СВОЯ СВОДКА, И ЭТО НЕ ВКУСОВЩИНА.
+      //
+      // DexScreener знает сеть Robinhood, но пулы Uniswap V4 в BSC не
+      // показывает вовсе: по запросу отдаёт только пары V2 и V3 с адресом в
+      // 42 символа. Я сам на этом обжёгся и сказал автору, что V4 в BSC нет,
+      // — а он там есть, просто сводка о нём молчит.
+      //
+      // Для BSC берём GeckoTerminal и фильтруем строго по площадке: у
+      // PancakeSwap Infinity идентификаторы пулов тоже 32-байтные, но живут
+      // они в ДРУГОМ singleton, и такой пул увёл бы транзакцию не туда.
       const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-      const timer = ctl ? setTimeout(() => ctl.abort(), 6000) : null;
-      const r = await fetch('https://api.dexscreener.com/latest/dex/search?q=' + addr,
-                            ctl ? { signal: ctl.signal } : undefined);
-      if (timer) clearTimeout(timer);
-      const d = await r.json();
-      return (d.pairs || [])
-        .filter(p => p.chainId === 'robinhood' &&
-                     /^0x[0-9a-fA-F]{64}$/.test(p.pairAddress || ''))
-        .map(p => ({
-          poolId: p.pairAddress.toLowerCase(),
-          pair: `${p.baseToken?.symbol || '?'}/${p.quoteToken?.symbol || '?'}`,
-          liq: p.liquidity?.usd || 0,
-          vol: p.volume?.h24 || 0,
-          price: Number(p.priceUsd) || 0,
-        }))
-        .sort((a, b) => b.vol - a.vol);
+      const timer = ctl ? setTimeout(() => ctl.abort(), 8000) : null;
+      const opts = Object.assign({ headers: { accept: 'application/json' } },
+                                 ctl ? { signal: ctl.signal } : {});
+      let out = [];
+      if (C.RH.poolSource === 'geckoterminal') {
+        const r = await fetch(
+          `https://api.geckoterminal.com/api/v2/networks/${C.RH.geckoNetwork}/tokens/${addr}/pools`,
+          opts);
+        if (timer) clearTimeout(timer);
+        const d = await r.json();
+        out = (d.data || [])
+          .filter(x => (x.relationships?.dex?.data?.id) === C.RH.geckoDex &&
+                       /^0x[0-9a-fA-F]{64}$/.test(x.attributes?.address || ''))
+          .map(x => {
+            const a = x.attributes;
+            return {
+              poolId: a.address.toLowerCase(),
+              pair: (a.name || '?').replace(/\s+\d+(\.\d+)?%$/, ''),
+              liq: Number(a.reserve_in_usd) || 0,
+              vol: Number(a.volume_usd?.h24) || 0,
+              price: Number(a.base_token_price_usd) || 0,
+            };
+          });
+      } else {
+        const r = await fetch('https://api.dexscreener.com/latest/dex/search?q=' + addr, opts);
+        if (timer) clearTimeout(timer);
+        const d = await r.json();
+        out = (d.pairs || [])
+          .filter(p => p.chainId === C.RH.dexscreenerChain &&
+                       /^0x[0-9a-fA-F]{64}$/.test(p.pairAddress || ''))
+          .map(p => ({
+            poolId: p.pairAddress.toLowerCase(),
+            pair: `${p.baseToken?.symbol || '?'}/${p.quoteToken?.symbol || '?'}`,
+            liq: p.liquidity?.usd || 0,
+            vol: p.volume?.h24 || 0,
+            price: Number(p.priceUsd) || 0,
+          }));
+      }
+      return out.sort((a, b) => b.vol - a.vol);
     } catch (e) {
       log('список пулов не пришёл: ' + (e.name === 'AbortError'
-        ? 'сводка DexScreener не ответила за 6 с' : e.message), 'bad');
+        ? 'сводка не ответила за 8 с' : e.message), 'bad');
       return [];
     }
   }
@@ -540,7 +601,7 @@
   async function tokenSymbol(a) {
     // Нулевой адрес — это нативная монета сети, у неё нет контракта и
     // спрашивать symbol() не у кого. Без этого в списке пулов стоял «?».
-    if (/^0x0{40}$/i.test(a || '')) return 'ETH';
+    if (isNative(a)) return C.RH.nativeSymbol;
     try {
       const r = await C.ethCall(state.rpc, a, C.SEL.symbol);
       const b = r.slice(2);
@@ -856,7 +917,21 @@
     return r;
   }
 
-  const STABLE = /^(usdg|usdc|usdt|dai|usde|usdc\.e|frax|tusd)$/i;
+  // ДЕНЕЖНАЯ СТОРОНА ПАРЫ.
+  //
+  // На Robinhood это всегда был стейбл. На BSC автор фармит и в USDT, и в
+  // BNB, поэтому BNB здесь тоже считается денежной стороной: именно ею
+  // измеряется цена монеты и ею же заходят в диапазон сверху вниз.
+  // Имя STABLE оставлено, чтобы правки из того терминала переносились сюда.
+  const STABLE = /^(usdt|usdc|busd|fdusd|usd1|dai|usde|frax|tusd|usdg|bnb|wbnb)$/i;
+
+  // Символ денежной стороны текущего пула. До загрузки пула — USDT как
+  // самый частый случай на этой сети; это только подпись, не расчёт.
+  function quoteSym() {
+    const st = stableSide();
+    if (st === null || !state.pool) return 'USDT';
+    return st === 1 ? state.pool.sym1 : state.pool.sym0;
+  }
 
   function stableSide() {
     if (!state.pool) return null;
@@ -957,6 +1032,22 @@
     // Снимок того, на чём строился план: всё, что после await, обязано
     // относиться к тому же пулу и той же сумме. Иначе в calldata попадут
     // тики одного пула и ключ другого.
+    // ПАРА С НАТИВНЫМ BNB — ПОКА НЕ ВХОДИМ.
+    //
+    // Ядро читает такие пулы правильно, а вот вход в них устроен иначе:
+    // нативную сторону нельзя перевести через Permit2, её надо отправить
+    // значением транзакции и добрать SWEEP на возврат сдачи. Пока этот путь
+    // не собран и не проверен на цепочке, честнее отказать, чем открыть окно
+    // кошелька с транзакцией, которую никто не проверял на живых деньгах.
+    // Смотреть, считать и закрывать уже открытую позицию это не мешает.
+    if (C.RH.nativeEntryBlocked &&
+        (isNative(state.pool.currency0) || isNative(state.pool.currency1))) {
+      log(`в паре с нативным ${C.RH.nativeSymbol} вход пока не собран — нужен путь ` +
+          'через значение транзакции и SWEEP. Пул читается и считается, но ' +
+          'входить через терминал в него рано. Пары со стейблом работают.', 'bad');
+      return;
+    }
+
     const snapPool = state.pool, snapAmount = state.amount, snapSlot = state.slot0;
     try {
       const bal = BigInt(await C.ethCall(state.rpc, dep.token,
@@ -1042,13 +1133,30 @@
   let pendingEntry = null;
   async function bindEntry() {
     if (!pendingEntry) return;
+    // НОМЕР ПОЗИЦИИ БЕРЁМ ИЗ КВИТАНЦИИ, А НЕ У ОБОЗРЕВАТЕЛЯ.
+    //
+    // В версии для Robinhood здесь стоял запрос в Blockscout. На BSC такого
+    // обозревателя с открытым API нет: BscScan просит ключ. Но лезть наружу
+    // и не надо — номер NFT лежит в самой квитанции транзакции, которую
+    // отдаёт узел: это событие Transfer от PositionManager, где получатель —
+    // наш адрес, а третья тема и есть номер. Так надёжнее и работает в любой
+    // сети, где бы ни оказался терминал.
     try {
-      const r = await fetch(
-        `https://robinhoodchain.blockscout.com/api/v2/transactions/${pendingEntry.hash}`);
-      const tx = await r.json();
-      const nft = (tx.token_transfers || []).find(t =>
-        (t.token?.address_hash || '').toLowerCase() === C.RH.positionManager);
-      const id = nft && (nft.total?.token_id || nft.token_id);
+      const TRANSFER =
+        '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+      const rc = await state.rpc('eth_getTransactionReceipt', [pendingEntry.hash]);
+      if (!rc) { setTimeout(bindEntry, 4000); return; }
+      if (rc.status && BigInt(rc.status) === 0n) {
+        log('вход не прошёл: сеть отклонила транзакцию', 'bad');
+        pendingEntry = null; return;
+      }
+      const me = (state.account || '').toLowerCase().replace(/^0x/, '').padStart(64, '0');
+      const mint = (rc.logs || []).find(l =>
+        (l.address || '').toLowerCase() === C.RH.positionManager &&
+        (l.topics || [])[0] === TRANSFER &&
+        ((l.topics || [])[2] || '').toLowerCase().endsWith(me) &&
+        (l.topics || []).length === 4);
+      const id = mint ? String(BigInt(mint.topics[3])) : null;
       if (!id) { setTimeout(bindEntry, 4000); return; }
       ledger.put(String(id), pendingEntry);
       log(`вход записан: позиция ${id}, ${pendingEntry.amountIn} по цене ` +
@@ -1097,14 +1205,17 @@
   // Строка суммы: в покупке — доллары, в продаже — доли своего баланса.
   function amtRow() {
     const sell = state.intent === 'sell';
-    const sym = depBal ? depBal.sym : (sell ? 'монета' : 'USDG');
+    const sym = depBal ? depBal.sym : (sell ? 'монета' : quoteSym());
     $('l-amt').textContent = sell ? `сколько монеты продаём, ${sym}` : `сумма, ${sym}`;
     if (!sell) {
       // Суммы под реальную работу: прежние 1/2/5/10 остались от проверок на
       // живых деньгах, когда важно было рисковать двумя долларами. Автор
       // сказал, что теми кнопками не пользуется вовсе.
-      chips($('r-amt'), [50, 100, 200, 250, 500], '', () => state.amount,
-            v => state.amount = v);
+      // В долларах и в BNB нужны РАЗНЫЕ кнопки. Пятьсот BNB — это полмиллиона
+      // долларов; такую кнопку нельзя показывать рядом с «войти».
+      const inBnb = /^(bnb|wbnb)$/i.test(depBal ? depBal.sym : quoteSym());
+      chips($('r-amt'), inBnb ? [0.05, 0.1, 0.25, 0.5, 1] : [50, 100, 200, 250, 500],
+            '', () => state.amount, v => state.amount = v);
       return;
     }
     // Доли от баланса. 100% намеренно НЕ значение по умолчанию: подставить
@@ -1333,7 +1444,7 @@
           const netPct = rec.amountIn ? net / rec.amountIn * 100 : 0;
           pnlStr += `<br><span class="dim">закрыть и продать сейчас:</span>` +
                     `<br><b class="${net >= 0 ? 'ok' : 'bad'}">${net >= 0 ? '+' : ''}` +
-                    `${net.toFixed(2)} USDG (${netPct >= 0 ? '+' : ''}${netPct.toFixed(2)}%)</b>` +
+                    `${net.toFixed(2)} ${esc(stableSym)} (${netPct >= 0 ? '+' : ''}${netPct.toFixed(2)}%)</b>` +
                     `<br><span class="dim">= ${cashOut.toFixed(2)} на руки, ` +
                     `комиссия продажи учтена</span>`;
         }
@@ -1553,13 +1664,21 @@
                           : `${m.verb.toUpperCase()} НЕ ПРОЙДЁТ: ` + r.why,
                      r.ok ? 'ok' : 'bad'));
     state.busy = true;
+    // Баланс нативной монеты ДО отправки. Нужен только когда одна из сторон
+    // пары — сам BNB: его возврат не виден ни в одном событии.
+    let nativeBefore = null;
+    if (isNative(key.currency0) || isNative(key.currency1)) {
+      try { nativeBefore = BigInt(await state.rpc('eth_getBalance',
+                                                  [state.account, 'latest'])); }
+      catch (e) { nativeBefore = null; }
+    }
     try {
       const h = await W.send({ from: state.account, to: C.RH.positionManager, data });
       log(`${m.verb} отправлено: ` + h, 'ok');
       // ЧЕСТНЫЙ ИТОГ. Считаем по тому, что реально вернулось, а не по
-      // ожиданиям: читаем переводы самой транзакции закрытия.
-      if (mode === 'all') settleClose(h, tokenId, rec, symQuote, key);
-      else settleTake(h, tokenId, symQuote, key, m.verb);
+      // ожиданиям: читаем квитанцию самой транзакции.
+      if (mode === 'all') settleClose(h, tokenId, rec, symQuote, key, nativeBefore);
+      else settleTake(h, tokenId, symQuote, key, m.verb, nativeBefore);
       setTimeout(loadPositions, 5000);
     } catch (e) {
       log('кошелёк отказал: ' + e.message, 'bad');
@@ -1572,27 +1691,68 @@
   // Поэтому забранное складывается в ledger, а PnL прибавляет его к тому, что
   // осталось внутри. Позиция стоит ровно столько, сколько в ней лежит ПЛЮС всё,
   // что из неё уже вынуто.
-  async function settleTake(hash, tokenId, symQuote, key, verb) {
-    for (let i = 0; i < 12; i++) {
-      await new Promise(r => setTimeout(r, 2500));
-      let tx = null;
-      try {
-        const r = await fetch(
-          `https://robinhoodchain.blockscout.com/api/v2/transactions/${hash}`);
-        tx = await r.json();
-      } catch (e) { continue; }
-      if (!tx || !tx.status) continue;
-      if (tx.status !== 'ok') { log(`${verb} НЕ прошло: ` + (tx.result || ''), 'bad'); return; }
+  // ЧТО ВЕРНУЛОСЬ НАМ ИЗ ТРАНЗАКЦИИ — ПО КВИТАНЦИИ УЗЛА.
+  //
+  // В версии для Robinhood это читалось из Blockscout: у него готовый список
+  // переводов токенов. На BSC открытого обозревателя нет, BscScan просит ключ,
+  // и полагаться на чужой сервис ради денежной цифры всё равно не хочется.
+  // Квитанция транзакции содержит всё нужное.
+  //
+  // ОДНА ТОНКОСТЬ, ИЗ-ЗА КОТОРОЙ ЭТО НЕ ПРОСТО «СЧИТАТЬ Transfer».
+  // Нативный BNB события Transfer НЕ порождает. В паре монета/BNB половина
+  // возврата пришла бы невидимой, и итог показал бы убыток там, где его нет.
+  // Поэтому нативную сторону считаем по изменению баланса кошелька, вычитая
+  // потраченный газ. Если баланс «до» снять не успели — так и говорим, а не
+  // подставляем ноль: ноль здесь выглядит как настоящая цифра.
 
-      let back0 = 0, back1 = 0;
-      for (const t of (tx.token_transfers || [])) {
-        if ((t.to?.hash || '').toLowerCase() !== state.account.toLowerCase()) continue;
-        const a = (t.token?.address_hash || '').toLowerCase();
-        const dec = Number(t.token?.decimals || 18);
-        const v = Number(t.total?.value || 0) / Math.pow(10, dec);
-        if (a === key.currency0.toLowerCase()) back0 += v;
-        if (a === key.currency1.toLowerCase()) back1 += v;
+  async function receiptBack(hash, key, nativeBefore) {
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setTimeout(r, 2500));
+      let rc = null;
+      try { rc = await state.rpc('eth_getTransactionReceipt', [hash]); }
+      catch (e) { continue; }
+      if (!rc) continue;
+      if (rc.status != null && BigInt(rc.status) === 0n) return { failed: true };
+
+      const me = state.account.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+      const back = { 0: 0, 1: 0 };
+      let nativeUnknown = false;
+      for (const idx of [0, 1]) {
+        const cur = idx === 0 ? key.currency0 : key.currency1;
+        if (isNative(cur)) {
+          if (nativeBefore == null) { nativeUnknown = true; continue; }
+          try {
+            const after = BigInt(await state.rpc('eth_getBalance',
+                                                 [state.account, 'latest']));
+            const gas = BigInt(rc.gasUsed || 0) *
+                        BigInt(rc.effectiveGasPrice || rc.gasPrice || 0);
+            const delta = after - BigInt(nativeBefore) + gas;
+            back[idx] = delta > 0n ? Number(delta) / 1e18 : 0;
+          } catch (e) { nativeUnknown = true; }
+          continue;
+        }
+        let dec = 18;
+        try { dec = await tokenDecimals(cur); } catch (e) { }
+        for (const l of (rc.logs || [])) {
+          if ((l.address || '').toLowerCase() !== cur.toLowerCase()) continue;
+          if ((l.topics || [])[0] !== TRANSFER_TOPIC) continue;
+          if (((l.topics || [])[2] || '').toLowerCase().slice(-64) !== me) continue;
+          back[idx] += Number(BigInt(l.data || '0x0')) / Math.pow(10, dec);
+        }
       }
+      return { back0: back[0], back1: back[1], nativeUnknown };
+    }
+    return { timeout: true };
+  }
+
+  async function settleTake(hash, tokenId, symQuote, key, verb, nativeBefore) {
+    {
+      const r = await receiptBack(hash, key, nativeBefore);
+      if (r.failed) { log(`${verb} НЕ прошло: сеть отклонила транзакцию`, 'bad'); return; }
+      if (r.timeout) { log(`${verb}: подтверждения не дождался, проверь кошелёк`, 'warn'); return; }
+      const back0 = r.back0, back1 = r.back1;
+      if (r.nativeUnknown)
+        log(`${verb}: нативную сторону посчитать не смог, в итоге только токен`, 'warn');
       let price = 0;
       try {
         const s0 = await C.readSlot0(state.rpc, poolIdOf(key));
@@ -1612,31 +1772,16 @@
           `итог считаю с учётом этого.`, 'ok');
       return;
     }
-    log(`${verb}: подтверждения не дождался, проверь кошелёк`, 'warn');
   }
 
-  async function settleClose(hash, tokenId, rec, symQuote, key) {
-    for (let i = 0; i < 12; i++) {
-      await new Promise(r => setTimeout(r, 2500));
-      let tx = null;
-      try {
-        const r = await fetch(
-          `https://robinhoodchain.blockscout.com/api/v2/transactions/${hash}`);
-        tx = await r.json();
-      } catch (e) { continue; }
-      if (!tx || !tx.status) continue;
-      if (tx.status !== 'ok') { log('закрытие НЕ прошло: ' + (tx.result || ''), 'bad'); return; }
-      // сколько чего вернулось нам
-      let back0 = 0, back1 = 0;
-      for (const t of (tx.token_transfers || [])) {
-        const to = (t.to?.hash || '').toLowerCase();
-        if (to !== state.account.toLowerCase()) continue;
-        const a = (t.token?.address_hash || '').toLowerCase();
-        const dec = Number(t.token?.decimals || 18);
-        const v = Number(t.total?.value || 0) / Math.pow(10, dec);
-        if (a === key.currency0.toLowerCase()) back0 += v;
-        if (a === key.currency1.toLowerCase()) back1 += v;
-      }
+  async function settleClose(hash, tokenId, rec, symQuote, key, nativeBefore) {
+    {
+      const r = await receiptBack(hash, key, nativeBefore);
+      if (r.failed) { log('закрытие НЕ прошло: сеть отклонила транзакцию', 'bad'); return; }
+      if (r.timeout) { log('закрытие: подтверждения не дождался, проверь кошелёк', 'warn'); return; }
+      const back0 = r.back0, back1 = r.back1;
+      if (r.nativeUnknown)
+        log('закрытие: нативную сторону посчитать не смог, в итоге только токен', 'warn');
       let price = 0;                              // сырая: currency1 за currency0
       try {
         const s0 = await C.readSlot0(state.rpc, poolIdOf(key));
@@ -1675,12 +1820,23 @@
       log(line, rec && rec.amountIn != null && got >= rec.amountIn ? 'ok' : 'warn');
       return;
     }
-    log('закрытие отправлено, но подтверждения не дождался — проверь в обозревателе', 'warn');
   }
 
-  // Узел для журнала событий: публичный, у него нет ограничения глубины.
+  // Узел для журнала событий.
+  //
+  // На Robinhood публичный узел отдавал любую глубину, и это было даром.
+  // На BSC всё наоборот: dataseed события не отдаёт вовсе, а тот, что отдаёт,
+  // держит только недавние блоки и на старый отрезок отвечает «archive
+  // requests require a personal token». Ядро это понимает и берёт новую
+  // половину отрезка вместо деления вслепую, но за глубокой историей нужен
+  // свой узел. Если он вставлен в поле сверху — берём его, он лучше.
   let _logsRpc = null;
   function logsRpc() {
+    // Там, где публичный узел отдаёт любую глубину, он и лучше: свой узел
+    // (например Alchemy) режет eth_getLogs десятью блоками. Там, где публичный
+    // держит только недавние блоки, наоборот — свой узел единственный шанс
+    // увидеть историю.
+    if (!C.RH.deepLogs && state.rpc && state.rpcUrl) return state.rpc;
     if (!_logsRpc) _logsRpc = C.makeRpc(C.RH.publicRpc);
     return _logsRpc;
   }
@@ -1995,7 +2151,17 @@
       $('d-wallet').className = 'dot on';
       $('s-wallet').textContent = w.address.slice(0, 6) + '…' + w.address.slice(-4);
       log('кошелёк подключён: ' + w.address, 'ok');
-      if (w.chainId !== C.RH.chainId) log(`кошелёк в сети ${w.chainId} — переключи на 4663`, 'warn');
+      // Сеть переключаем сразу, а не в момент подписи. Иначе автор сначала
+      // соберёт вход, а потом упрётся в отказ на самом последнем шаге.
+      if (w.chainId !== C.RH.chainId) {
+        log(`кошелёк в сети ${w.chainId}, а нужна ${C.RH.chainId} (BNB Chain) — прошу переключить`, 'warn');
+        try {
+          await W.ensureChain(w.provider);
+          log('сеть переключена на BNB Chain', 'ok');
+        } catch (e) {
+          log(e.message + '. В Rabby выбери BNB Chain и нажми «Подключить» ещё раз', 'bad');
+        }
+      }
       // Позиции — сразу: ради них и подключаемся, и там кнопка «Закрыть».
       // История сама не грузится: это десятки запросов к общему публичному
       // узлу, он от них отвечает «internal server error», и страдают ПОЗИЦИИ.
@@ -2045,10 +2211,39 @@
   }
 
   drawPools();
-  const verEl = $('ver'); if (verEl) verEl.textContent = 'v' + VERSION;
+
+  // ── ПЕРЕКЛЮЧАТЕЛЬ СЕТИ ──────────────────────────────────────────────────
+  //
+  // Переключение перезагружает страницу, и это сделано намеренно. Сеть меняет
+  // адреса контрактов, узел, ключи памяти, кэш цен, профиль ликвидности и
+  // список позиций. Подменять всё это на живой странице — верный способ
+  // оставить где-нибудь хвост от прошлой сети и посчитать по нему деньги.
+  // Перезагрузка занимает мгновение и не оставляет хвостов вовсе.
+  function drawChains() {
+    const host = $('chains');
+    if (!host) return;
+    host.innerHTML = '';
+    for (const [name, c] of Object.entries(C.CHAINS)) {
+      const b = document.createElement('button');
+      b.textContent = c.label;
+      if (name === chainName) b.className = 'on';
+      b.onclick = () => {
+        if (name === chainName) return;
+        if (state.busy) { log('идёт отправка — сеть не переключаю', 'warn'); return; }
+        try { localStorage.setItem(CHAIN_KEY, name); } catch (e) { }
+        location.reload();
+      };
+      host.appendChild(b);
+    }
+  }
+  drawChains();
+
+  const rpcEl = $('rpc'); if (rpcEl) rpcEl.placeholder = C.RH.rpcHint || '';
+  const verEl = $('ver');
+  if (verEl) verEl.textContent = `${C.RH.label} · v${VERSION}`;
   // Наружу отдаём только показ карточки: пригодится и для проверки, и
   // чтобы можно было открыть карточку по прошлой сделке из консоли.
   window.RHTerminal = { showCard, drawCard, version: VERSION };
-  log(`терминал ${VERSION} загружен. Enter — вход, R — обновить позиции.`);
+  log(`терминал ${VERSION}, сеть ${C.RH.label} (${C.RH.chainId}). Enter — вход, R — обновить позиции.`);
   if (state.rpcUrl) checkRpc().then(ok => { if (ok && $('pool').value) loadPool(); });
 })();

@@ -1,5 +1,6 @@
 // Сборка закрытия против НАСТОЯЩЕЙ транзакции закрытия автора.
 const C = require('../src/core.js');
+C.useChain('robinhood');   // ядро стало двухсетевым — выбираем явно
 const tx = require('./fixtures/real-close.json');
 const real = tx.raw_input.toLowerCase();
 const data = Buffer.from(real.slice(10), 'hex');

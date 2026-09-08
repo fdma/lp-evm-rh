@@ -1,6 +1,7 @@
 // Проверка ядра на ЖИВОЙ сети и сверка с независимым расчётом.
 // Запуск: node tests/live.test.js
 const C = require('../src/core.js');
+C.useChain('robinhood');   // ядро стало двухсетевым — выбираем явно
 const { createHash } = require('crypto');
 
 // keccak256 берём из внешней утилиты, чтобы не тащить зависимость в браузер:

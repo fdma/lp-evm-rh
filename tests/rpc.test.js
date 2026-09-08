@@ -1,5 +1,6 @@
 // Проверка узла: как терминал будет вести себя с разными адресами.
 const C = require('../src/core.js');
+C.useChain('robinhood');   // ядро стало двухсетевым — выбираем явно
 (async () => {
   const cases = [
     ['публичный Robinhood', C.RH.publicRpc],

@@ -9,17 +9,87 @@
 
 'use strict';
 
-const RH = {
-  chainId: 4663,
-  // Проверено на сети: у всех есть код; PositionManager и StateView
-  // независимо указывают на этот же PoolManager; байткод совпадает с
-  // официальным развёртыванием в Base с точностью до вшитых адресов.
-  poolManager: '0x8366a39cc670b4001a1121b8f6a443a643e40951',
-  positionManager: '0x58daec3116aae6d93017baaea7749052e8a04fa7',
-  stateView: '0xf3334192d15450cdd385c8b70e03f9a6bd9e673b',
-  permit2: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
-  publicRpc: 'https://rpc.mainnet.chain.robinhood.com',
+// ДВЕ СЕТИ В ОДНОМ ТЕРМИНАЛЕ.
+//
+// Uniswap V4 устроен одинаково везде: singleton PoolManager, тот же
+// PositionManager, те же действия в calldata. Значит и терминал нужен один,
+// а сеть — это набор адресов и особенностей узла, а не отдельная программа.
+//
+// Адреса ТОЛЬКО в нижнем регистре: дальше в коде они сравниваются с тем, что
+// вернул узел, без приведения регистра, и контрольная сумма EIP-55 сломала бы
+// сравнение молча.
+const CHAINS = {
+  robinhood: {
+    key: 'robinhood',
+    label: 'Robinhood',
+    chainId: 4663,
+    // Проверено на сети: у всех есть код; PositionManager и StateView
+    // независимо указывают на этот же PoolManager; байткод совпадает с
+    // официальным развёртыванием в Base с точностью до вшитых адресов.
+    poolManager: '0x8366a39cc670b4001a1121b8f6a443a643e40951',
+    positionManager: '0x58daec3116aae6d93017baaea7749052e8a04fa7',
+    stateView: '0xf3334192d15450cdd385c8b70e03f9a6bd9e673b',
+    permit2: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
+    publicRpc: 'https://rpc.mainnet.chain.robinhood.com',
+    blockSec: 2,
+    nativeSymbol: 'ETH',
+    // Публичный узел этой сети отдаёт журнал на любую глубину — это редкость
+    // и это подарок: история позиций читается без своего узла.
+    deepLogs: true,
+    // Список пулов монеты берём из DexScreener: он эту сеть знает.
+    poolSource: 'dexscreener',
+    dexscreenerChain: 'robinhood',
+    rpcHint: 'https://robinhood-mainnet.g.alchemy.com/v2/…',
+    // Память браузера. Ключи РАЗНЫЕ у разных сетей, и менять их нельзя:
+    // в журнале входов лежат суммы, по которым считается итог позиции.
+    storeKey: 'lp-evm-rh',
+    ledgerKey: 'lp-evm-rh-ledger',
+  },
+  bsc: {
+    key: 'bsc',
+    label: 'BNB Chain',
+    chainId: 56,
+    // Проверено на цепочке 08.09.2026: у всех троих есть код, а
+    // PositionManager и StateView независимо возвращают этот же PoolManager.
+    poolManager: '0x28e2ea090877bf75740558f6bfb36a5ffee9e9df',
+    positionManager: '0x7a4a5c919ae2541aed11041a1aeee68f1287f95b',
+    stateView: '0xd13dd3d6e93f276fafc9db9e6bb47c1180aee0c4',
+    permit2: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
+    // Публичные узлы BSC к eth_getLogs недружелюбны: dataseed отвечает
+    // «limit exceeded» и событий не отдаёт вовсе, 1rpc и blockrazor режут
+    // отрезок, drpc отваливается по таймауту. Этот события отдаёт — но
+    // только недавние блоки. За историей нужен свой узел.
+    publicRpc: 'https://bsc-rpc.publicnode.com',
+    blockSec: 0.75,
+    nativeSymbol: 'BNB',
+    deepLogs: false,
+    // DexScreener пулы Uniswap V4 в этой сети не показывает ВООБЩЕ — отдаёт
+    // только пары V2 и V3. Поэтому GeckoTerminal, и строго площадка
+    // uniswap-v4-bsc: у PancakeSwap Infinity идентификаторы тоже 32-байтные,
+    // но singleton другой, и такой пул увёл бы транзакцию не туда.
+    poolSource: 'geckoterminal',
+    geckoNetwork: 'bsc',
+    geckoDex: 'uniswap-v4-bsc',
+    rpcHint: 'https://bnb-mainnet.g.alchemy.com/v2/… (свой узел — глубже история)',
+    storeKey: 'lp-bsc',
+    ledgerKey: 'lp-bsc-ledger',
+    // Вход в пары с нативной монетой пока не собран: её нельзя провести через
+    // Permit2, нужен путь через значение транзакции и SWEEP.
+    nativeEntryBlocked: true,
+  },
 };
+
+// АКТИВНАЯ СЕТЬ. Имя RH историческое — раньше сеть была одна. Это живой
+// объект: переключение подменяет его поля, поэтому все ссылки на RH по коду
+// остаются верными и переписывать их не нужно.
+const RH = {};
+function useChain(name) {
+  const c = CHAINS[name] || CHAINS.robinhood;
+  for (const k of Object.keys(RH)) delete RH[k];
+  Object.assign(RH, c);
+  return RH;
+}
+useChain('robinhood');
 
 // Селекторы посчитаны из подписей, keccak сверен с эталоном.
 const SEL = {
@@ -348,7 +418,16 @@ const RATE_LIMIT_RE = /too many requests|rate limit|429/i;
 // экране это выглядело как «узел не отдал события обмена» у пулов с
 // миллионными оборотами, и автор справедливо сказал, что такого быть не может.
 const LOGS_CAP_RE =
-  /exceeds limit|too many (results|logs|events)|more than|response size|too large|internal server err+or|block range|query returned/i;
+  /exceeds limit|too many (results|logs|events)|more than|response size|too large|internal server err+or|block range|query returned|limited to|must not exceed|maximum block/i;
+
+// ОТКАЗ ПО ГЛУБИНЕ — НЕ ТО ЖЕ, ЧТО ОТКАЗ ПО ОБЪЁМУ.
+//
+// Публичные узлы BSC держат только недавние блоки и на старый fromBlock
+// отвечают «archive requests require a personal token». Делить такой отрезок
+// пополам бессмысленно: старая половина будет отказывать до самого дна, сжигая
+// бюджет запросов. Правильный ответ — взять только НОВУЮ половину и честно
+// сказать, насколько глубоко удалось заглянуть.
+const ARCHIVE_RE = /archive|state (is )?not available|missing trie|pruned/i;
 
 // Делению нужен потолок по ЧИСЛУ ЗАПРОСОВ, а не только по глубине. Первая
 // версия его не имела: запрос без фильтра развалился на сотни кусков, и узел
@@ -371,8 +450,11 @@ async function getLogsSplit(rpc, filter, from, to, state = null) {
     // Не наша ошибка либо делить уже нечего — отдаём как есть. «Too Many
     // Requests» сюда не попадает намеренно: это не предел размера ответа,
     // и деление его только усугубит.
-    if (to - from < 4 || RATE_LIMIT_RE.test(msg) || !LOGS_CAP_RE.test(msg)) throw e;
+    if (to - from < 4 || RATE_LIMIT_RE.test(msg)) throw e;
     const mid = Math.floor((from + to) / 2);
+    // Узел не хранит такую глубину: старую половину даже не пробуем.
+    if (ARCHIVE_RE.test(msg)) return getLogsSplit(rpc, filter, mid + 1, to, st);
+    if (!LOGS_CAP_RE.test(msg)) throw e;
     // Половинки идут ПО ОЧЕРЕДИ, а не параллельно: узел общий, и одновременный
     // залп — прямой путь к «Too Many Requests».
     const a = await getLogsSplit(rpc, filter, from, mid, st);
@@ -1061,7 +1143,7 @@ async function assertContracts(rpc) {
 
 // ── сборка транзакции ────────────────────────────────────────────────────
 //
-// Разобрана НАСТОЯЩАЯ транзакция входа, сделанная через Krystal, и повторена
+// Разобрана НАСТОЯЩАЯ транзакция входа автора (разобрана по цепочке) и повторена
 // байт в байт. Структура:
 //
 //   modifyLiquidities(bytes unlockData, uint256 deadline)
@@ -1127,7 +1209,7 @@ function encodeUnlockData(actionsHex, paramsHex) {
 
 // Закрытие позиции: забрать всю ликвидность и получить оба токена себе.
 //
-// Разобрана настоящая транзакция закрытия, сделанная через Krystal, и
+// Разобрана настоящая транзакция закрытия автора (разобрана по цепочке) и
 // повторена. Заметь: NFT при этом не сгорает, остаётся пустая оболочка —
 // так же ведёт себя и Krystal.
 function encodeDecreaseParams(tokenId, liquidity, amount0Min, amount1Min) {
@@ -1321,6 +1403,7 @@ const API = {
   readAllowances, buildErc20Approve, buildPermit2Approve, planApprovals, simulate,
   buildCloseCalldata, encodeDecreaseParams, encodeTakePair,
   readPositionLiquidity, readPositionPool, MSG_SENDER, unpackTicks, readFees,
+  CHAINS, useChain,
 };
 
 if (typeof module !== 'undefined' && module.exports) module.exports = API;
