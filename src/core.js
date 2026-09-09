@@ -842,10 +842,19 @@ async function readLiquidityProfile(rpc, poolId, tick, spacing, words = 3) {
   const maps = await Promise.all(wordIdx.map(async (w) => {
     const wp = ((BigInt(w) + (1n << 256n)) % (1n << 256n))
       .toString(16).padStart(64, '0');
-    try {
-      return [w, BigInt(await ethCall(rpc, RH.stateView,
-        SEL.getTickBitmap + stripHex(poolId) + wp))];
-    } catch (e) { return null; }
+    // Карту занятых тиков читаем с повторами: потерять здесь один ответ —
+    // значит потерять ЦЕЛОЕ СЛОВО, то есть до 256 тиков сразу. Именно так
+    // график и остаётся без столбиков, когда узел ограничивает частоту.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return [w, BigInt(await ethCall(rpc, RH.stateView,
+          SEL.getTickBitmap + stripHex(poolId) + wp))];
+      } catch (e) {
+        if (!/too many|rate|429|limit/i.test(e.message || '') || attempt === 2) return null;
+        await new Promise(res => setTimeout(res, 400 * (attempt + 1)));
+      }
+    }
+    return null;
   }));
   for (const m of maps) {
     if (!m) continue;
@@ -867,15 +876,33 @@ async function readLiquidityProfile(rpc, poolId, tick, spacing, words = 3) {
   // 20, а не 8. У автора в пуле 231 занятый тик, и восьмёрками это 5.8-7.8
   // секунды — он это чувствует как «долго грузит». Свой узел спокойно держит
   // двадцать запросов разом: те же 231 тик укладываются в полторы секунды.
-  const BATCH = 20;
+  // Десять, а не двадцать: на платном узле двадцать параллельных вызовов
+  // упираются в ограничение по частоте, и часть тиков выпадала из профиля.
+  // Десять с повторами надёжнее и по времени не хуже.
+  const BATCH = 10;
   for (let i = 0; i < ticks.length; i += BATCH) {
     const part = ticks.slice(i, i + BATCH);
     const got = await Promise.all(part.map(async (t) => {
       const tw = ((BigInt(t) + (1n << 256n)) % (1n << 256n))
         .toString(16).padStart(64, '0');
       try {
-        const r = await ethCall(rpc, RH.stateView,
-          SEL.getTickLiquidity + stripHex(poolId) + tw);
+        // ПОВТОР ПРИ ОТКАЗЕ ПО ЧАСТОТЕ.
+        //
+        // Двадцать одновременных вызовов — это ровно то, на что платные узлы
+        // отвечают «слишком часто». Один такой отказ раньше молча выбрасывал
+        // тик из профиля, и на графике не хватало столбиков; при неудачном
+        // стечении выпадали все, и график оставался пустым без объяснения.
+        let r = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            r = await ethCall(rpc, RH.stateView,
+              SEL.getTickLiquidity + stripHex(poolId) + tw);
+            break;
+          } catch (e) {
+            if (!/too many|rate|429|limit/i.test(e.message || '') || attempt === 2) throw e;
+            await new Promise(res => setTimeout(res, 400 * (attempt + 1)));
+          }
+        }
         const w2 = words_(r);
         // Возвращает (uint128 liquidityGross, int128 liquidityNet).
         // ВАЖНО: в ответе int128 расширен знаком до полных 32 байт, поэтому
