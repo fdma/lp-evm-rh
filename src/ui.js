@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '4.6';
+  const VERSION = '4.7';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -1178,27 +1178,39 @@
     // Снимок того, на чём строился план: всё, что после await, обязано
     // относиться к тому же пулу и той же сумме. Иначе в calldata попадут
     // тики одного пула и ключ другого.
-    // ПАРА С НАТИВНЫМ BNB — ПОКА НЕ ВХОДИМ.
+    // ПАРА С НАТИВНОЙ МОНЕТОЙ.
     //
-    // Ядро читает такие пулы правильно, а вот вход в них устроен иначе:
-    // нативную сторону нельзя перевести через Permit2, её надо отправить
-    // значением транзакции и добрать SWEEP на возврат сдачи. Пока этот путь
-    // не собран и не проверен на цепочке, честнее отказать, чем открыть окно
-    // кошелька с транзакцией, которую никто не проверял на живых деньгах.
-    // Смотреть, считать и закрывать уже открытую позицию это не мешает.
-    if (C.RH.nativeEntryBlocked &&
-        (isNative(state.pool.currency0) || isNative(state.pool.currency1))) {
-      log(`в паре с нативным ${C.RH.nativeSymbol} вход пока не собран — нужен путь ` +
-          'через значение транзакции и SWEEP. Пул читается и считается, но ' +
-          'входить через терминал в него рано. Пары со стейблом работают.', 'bad');
-      return;
+    // Нативную сторону нельзя провести через Permit2: она уходит ЗНАЧЕНИЕМ
+    // транзакции, а сдачу возвращает действие SWEEP, добавленное в ядре.
+    // Вносим ровно ту сумму, что в поле: позиция односторонняя, больше
+    // предела contract взять не может, а неиспользованное вернётся само.
+    const depNative = isNative(dep.token);
+    if (depNative) {
+      // Путь собран и проверен симуляцией на живом пуле, но НИ РАЗУ не
+      // проходил живыми деньгами. Об этом надо сказать до окна кошелька,
+      // а не после.
+      log(`вход нативным ${C.RH.nativeSymbol}: он уходит значением транзакции, ` +
+          'сдачу вернёт SWEEP. Этот путь ещё не проверялся живыми деньгами — ' +
+          'первый раз заходи маленькой суммой.', 'warn');
     }
 
     const snapPool = state.pool, snapAmount = state.amount;
     try {
-      const bal = BigInt(await C.ethCall(state.rpc, dep.token,
-        C.SEL.balanceOf + C.addrWord(state.account)));
+      // У нативной монеты нет контракта и нет balanceOf — баланс спрашивается
+      // у самой сети. И запас на газ нужен именно здесь: если внести весь
+      // BNB до копейки, платить за транзакцию будет нечем.
+      const bal = depNative
+        ? BigInt(await state.rpc('eth_getBalance', [state.account, 'latest']))
+        : BigInt(await C.ethCall(state.rpc, dep.token,
+            C.SEL.balanceOf + C.addrWord(state.account)));
       const need = amountRaw();
+      const GAS_RESERVE = 3n * 10n ** 15n;              // 0.003 нативной монеты
+      if (depNative && bal < need + GAS_RESERVE) {
+        log(`на кошельке ${(Number(bal) / 1e18).toFixed(5)} ${C.RH.nativeSymbol}, ` +
+            `а нужно ${state.amount} плюс запас на газ — оставь хотя бы 0.003 ` +
+            `${C.RH.nativeSymbol} на комиссию сети`, 'bad');
+        return;
+      }
       if (bal < need) {
         const d = state.decimals[dep.token] ?? 18;
         const symd = dep.token.toLowerCase() === state.pool.currency0.toLowerCase()
@@ -1230,8 +1242,10 @@
     // открытом окне — поздно. Один запрос до отправки решает вопрос.
     try {
       const now = Math.floor(Date.now() / 1000);
-      const plan = await C.planApprovals(state.rpc, dep.token, state.account,
-                                         amountRaw(), 1800, now);
+      // Нативной монете разрешения не нужны и не бывают: она не токен.
+      const plan = depNative ? { steps: [] }
+        : await C.planApprovals(state.rpc, dep.token, state.account,
+                                amountRaw(), 1800, now);
       if (plan.steps.length) {
         log('не хватает разрешений: ' + plan.steps.map(x => x.what).join(', ') +
             '. Нажми «ARM — выдать разрешения», потом входи. ' +
@@ -1297,11 +1311,15 @@
     state.busy = true;
 
     // Симуляция ПАРАЛЛЕЛЬНО: ответ придёт, пока читаешь окно Rabby.
-    C.simulate(state.rpc, state.account, C.RH.positionManager, data)
+    // В паре с нативной монетой она уходит значением транзакции; сдачу
+    // вернёт SWEEP, добавленный в сборку.
+    const txValue = depNative ? amountRaw() : 0n;
+    C.simulate(state.rpc, state.account, C.RH.positionManager, data, txValue)
       .then(r => log(r.ok ? 'симуляция: пройдёт' : 'СИМУЛЯЦИЯ НЕ ПРОШЛА: ' + r.why,
                      r.ok ? 'ok' : 'bad'));
     try {
-      const h = await W.send({ from: state.account, to: C.RH.positionManager, data });
+      const h = await W.send({ from: state.account, to: C.RH.positionManager, data,
+                              value: '0x' + txValue.toString(16) });
       log('вход отправлен: ' + h, 'ok');
       // Запоминаем вход: сумму, цену и время. Сеть этого не хранит, а без
       // него честного итога после закрытия не посчитать.

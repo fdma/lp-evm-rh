@@ -57,3 +57,44 @@ test('выход в плюсе не превращается в минус', () 
   const good = stableQty + coinQty * coinPrice * (1 - share);
   assert.ok(good > 90 && good < 100, 'честный расчёт даёт около 97.5');
 });
+
+// 3. ВХОД В ПАРУ С НАТИВНОЙ МОНЕТОЙ.
+//
+// Собран 09.09.2026. Нативная монета уходит значением транзакции, а сдачу
+// возвращает SWEEP. Проверяем ровно то, что можно проверить без сети: в
+// сборке появляется третье действие, и только когда одна из сторон нативная.
+const C = require('../src/core.js');
+
+test('в паре с нативной монетой в сборку добавляется SWEEP', () => {
+  const base = {
+    tickLower: 100, tickUpper: 200, liquidity: 1000n,
+    amount0Max: 5n * 10n ** 15n, amount1Max: 0n,
+    owner: '0x00000000000000000000000000000000000000ff',   // адрес для теста, ничей
+    deadline: 1788900000,
+  };
+  const usual = C.buildMintCalldata({
+    ...base,
+    key: { currency0: '0x55d398326f99059ff775485246999027b3197955',
+           currency1: '0xc8fb80fcc03f699c70ff0cc08c09106288888888',
+           fee: 10000, tickSpacing: 200,
+           hooks: '0x0000000000000000000000000000000000000000' },
+  });
+  const native = C.buildMintCalldata({
+    ...base,
+    key: { currency0: '0x0000000000000000000000000000000000000000',
+           currency1: '0xc8fb80fcc03f699c70ff0cc08c09106288888888',
+           fee: 10000, tickSpacing: 200,
+           hooks: '0x0000000000000000000000000000000000000000' },
+  });
+  assert.ok(native.length > usual.length,
+            'сборка с нативной стороной обязана быть длиннее на действие SWEEP');
+  // Два действия против трёх: 0x020d против 0x020d14.
+  assert.ok(usual.includes('020d'), 'обычный вход: MINT_POSITION + SETTLE_PAIR');
+  assert.ok(native.includes('020d14'), 'нативный вход: те же плюс SWEEP');
+});
+
+test('нативной монетой считается только нулевой адрес', () => {
+  assert.strictEqual(C.isNativeCurrency('0x0000000000000000000000000000000000000000'), true);
+  assert.strictEqual(C.isNativeCurrency('0x55d398326f99059ff775485246999027b3197955'), false);
+  assert.strictEqual(C.isNativeCurrency(''), false);
+});

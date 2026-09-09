@@ -76,9 +76,11 @@ const CHAINS = {
     // Сколько недавних блоков спрашивать у журнала. Узел хранит немного;
     // 5000 блоков это около часа и один запрос вместо двух десятков отказов.
     logsWindow: 5000,
-    // Вход в пары с нативной монетой пока не собран: её нельзя провести через
-    // Permit2, нужен путь через значение транзакции и SWEEP.
-    nativeEntryBlocked: true,
+    // Вход в пары с нативной монетой СОБРАН 09.09.2026: она уходит значением
+    // транзакции, сдачу возвращает SWEEP. Проверено симуляцией на живом пуле
+    // CTM/BNB: с value проходит, без value — откат, то есть работает именно
+    // значение, а не случайность. Живыми деньгами ещё не проверялось.
+    nativeEntryBlocked: false,
   },
 };
 
@@ -128,6 +130,10 @@ const ACTION = {
   MINT_POSITION: 0x02,
   SETTLE_PAIR: 0x0d,
   TAKE_PAIR: 0x11,
+  // Возврат сдачи в нативной монете. Нужен там, где одна сторона пары —
+  // сам BNB: его нельзя провести через Permit2, он идёт значением
+  // транзакции, а значение всегда округляется вверх с запасом.
+  SWEEP: 0x14,
 };
 
 // Особые адреса-получатели в PositionManager: 1 означает «тому, кто прислал
@@ -1315,14 +1321,42 @@ async function readPositionPool(rpc, tokenId) {
   };
 }
 
+// ВХОД В ПАРУ С НАТИВНОЙ МОНЕТОЙ.
+//
+// Нативная монета (BNB в BSC, ETH в других сетях) записывается нулевым
+// адресом и живёт не как токен: её нельзя ни разрешить через Permit2, ни
+// перевести с кошелька контрактом. Она уходит ЗНАЧЕНИЕМ транзакции.
+//
+// Отсюда два отличия от обычного входа:
+//   * к транзакции добавляется value, и его берут с запасом — точную сумму
+//     до вэя предсказать нельзя, цена может дрогнуть между расчётом и блоком;
+//   * поэтому в конец добавляется SWEEP, который возвращает отправителю всё,
+//     что не ушло в позицию. Без него запас остался бы у контракта.
+//
+// Получатель сдачи — address(1), то есть «тот, кто прислал транзакцию»: та же
+// договорённость, что и в закрытии позиции, сверенная с настоящей
+// транзакцией байт в байт.
+const isNativeCurrency = (a) => /^0x0{40}$/i.test(a || '');
+
+function encodeSweep(currency, recipient) {
+  return waddr(currency) + waddr(recipient);
+}
+
 function buildMintCalldata({ key, tickLower, tickUpper, liquidity,
                              amount0Max, amount1Max, owner, deadline }) {
+  const native = isNativeCurrency(key.currency0) || isNativeCurrency(key.currency1);
   const actions = ACTION.MINT_POSITION.toString(16).padStart(2, '0') +
-                  ACTION.SETTLE_PAIR.toString(16).padStart(2, '0');
+                  ACTION.SETTLE_PAIR.toString(16).padStart(2, '0') +
+                  (native ? ACTION.SWEEP.toString(16).padStart(2, '0') : '');
   const p0 = encodeMintParams(key, tickLower, tickUpper, liquidity,
                               amount0Max, amount1Max, owner);
   const p1 = encodeSettlePair(key.currency0, key.currency1);
-  const unlock = encodeUnlockData(actions, [p0, p1]);
+  const params = [p0, p1];
+  if (native) {
+    const nat = isNativeCurrency(key.currency0) ? key.currency0 : key.currency1;
+    params.push(encodeSweep(nat, MSG_SENDER));
+  }
+  const unlock = encodeUnlockData(actions, params);
   const unlockBytes = unlock.length / 2;
   const data = SEL.modifyLiquidities +
     w(64) + w(deadline) +
@@ -1393,9 +1427,13 @@ async function planApprovals(rpc, token, owner, amountNeeded, ttlSeconds, nowUni
 }
 
 // Симуляция. Обязательна: дешёвый способ узнать об отказе до подписи.
-async function simulate(rpc, from, to, data) {
+async function simulate(rpc, from, to, data, value) {
   try {
-    await rpc('eth_call', [{ from, to, data }, 'latest']);
+    // value нужен для входа в пару с нативной монетой: без него узел
+    // отвергнет вызов, и «симуляция не прошла» сказала бы неправду о сборке.
+    const call = { from, to, data };
+    if (value != null && value !== 0n) call.value = '0x' + BigInt(value).toString(16);
+    await rpc('eth_call', [call, 'latest']);
     return { ok: true };
   } catch (e) {
     return { ok: false, why: e.message };
@@ -1414,7 +1452,7 @@ const API = {
   assertChain, assertContracts, words, toSigned, stripHex, addrWord, hex,
   buildMintCalldata, encodeMintParams, encodeSettlePair, encodeUnlockData,
   readAllowances, buildErc20Approve, buildPermit2Approve, planApprovals, simulate,
-  buildCloseCalldata, encodeDecreaseParams, encodeTakePair,
+  buildCloseCalldata, encodeDecreaseParams, encodeTakePair, encodeSweep, isNativeCurrency,
   readPositionLiquidity, readPositionPool, MSG_SENDER, unpackTicks, readFees,
   CHAINS, useChain,
 };
