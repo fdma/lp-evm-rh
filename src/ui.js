@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '4.3';
+  const VERSION = '4.4';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -333,6 +333,8 @@
       loadProfile();
       amtRow();
       loadBalance().catch(() => {});
+      // Выпуск монеты читаем один раз на пул: из него считается капитализация.
+      loadSupply().catch(() => {});
     } catch (e) { log('пул не загрузился: ' + e.message, 'bad'); }
   }
 
@@ -673,13 +675,99 @@
     return { coin: state.pool.sym0, stable: state.pool.sym1 };
   }
 
+  // ── ЦЕНА ИЛИ КАПИТАЛИЗАЦИЯ ──────────────────────────────────────────────
+  //
+  // Просьба автора: ставить границы и читать диапазон не по цене монеты, а по
+  // капитализации. У мемкоина цена вида 0.000359391 не измеряется на глаз, а
+  // «капа 1.8 млн» понятна сразу.
+  //
+  // Математика при этом НЕ МЕНЯЕТСЯ. Капитализация — это цена, умноженная на
+  // выпуск, а выпуск у таких монет постоянный. Значит проценты ширины и
+  // отступа в обоих измерениях одинаковы до последнего знака, и переключатель
+  // трогает только показ. Тики, ликвидность и сборка транзакции — те же.
+  //
+  // ЧЕСТНАЯ ОГОВОРКА: это капа ПО ПОЛНОМУ ВЫПУСКУ (FDV). Если часть монет
+  // сожжена или заморожена, настоящая рыночная капитализация меньше. Врать
+  // тут нельзя, поэтому так и подписано.
+  let unit = 'price';                       // 'price' | 'cap'
+  try { const u = localStorage.getItem(KEY + '-unit'); if (u === 'cap') unit = 'cap'; }
+  catch (e) { }
+
+  // Выпуск монеты кэшируем по адресу: в таблице позиций монеты РАЗНЫЕ, и
+  // считать капу чужой позиции по выпуску загруженного пула нельзя — это
+  // был бы уверенно показанный неверный миллион.
+  const supplyCache = new Map();
+  async function supplyOf(token) {
+    if (!token) return null;
+    const k = token.toLowerCase();
+    if (supplyCache.has(k)) return supplyCache.get(k);
+    let n = null;
+    try {
+      const raw = BigInt(await C.ethCall(state.rpc, token, '0x18160ddd'));
+      const d = state.decimals[token] ?? await tokenDecimals(token);
+      const v = Number(raw) / Math.pow(10, d);
+      n = v > 0 ? v : null;
+    } catch (e) { n = null; }
+    supplyCache.set(k, n);
+    return n;
+  }
+
+  async function loadSupply() {
+    state.supply = null;
+    if (!state.pool) return;
+    const st = stableSide();
+    if (st === null) return;
+    const coin = st === 1 ? state.pool.currency0 : state.pool.currency1;
+    state.supply = await supplyOf(coin);
+    drawUnits();
+  }
+
+  const capOf = (price) => state.supply ? price * state.supply : null;
+  const fmtCap = (v) => v == null ? '—'
+    : v >= 1e9 ? (v / 1e9).toFixed(2) + ' млрд'
+    : v >= 1e6 ? (v / 1e6).toFixed(2) + ' млн'
+    : v >= 1e3 ? (v / 1e3).toFixed(1) + ' тыс'
+    : v.toFixed(2);
+
+  function drawUnits() {
+    const host = $('unitbar');
+    if (!host) return;
+    host.innerHTML = '';
+    const mk = (name, label, on, disabled, title) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.style.cssText = 'padding:3px 10px;font-size:11px;margin:0';
+      if (on) b.className = 'go';
+      if (disabled) { b.disabled = true; b.style.opacity = '.45'; }
+      if (title) b.title = title;
+      b.onclick = () => {
+        if (disabled) return;
+        unit = name;
+        try { localStorage.setItem(KEY + '-unit', name); } catch (e) { }
+        drawUnits(); showPrice(); recalc();
+      };
+      host.appendChild(b);
+    };
+    mk('price', 'цена', unit === 'price', false, 'показывать цену монеты');
+    mk('cap', 'капитализация', unit === 'cap', !state.supply,
+       state.supply ? 'показывать капитализацию по полному выпуску'
+                    : 'выпуск монеты не прочитался — капу показать не из чего');
+  }
+
   function showPrice() {
     if (!state.slot0) return;
     const p = priceOf(state.slot0.tick);
-    $('price').textContent = p < 0.01 ? p.toPrecision(6) : p.toFixed(6);
     const n = names();
-    $('pricesub').textContent =
-      `${esc(n.stable)} за 1 ${esc(n.coin)} · тик ${state.slot0.tick}`;
+    if (unit === 'cap' && state.supply) {
+      $('price').textContent = fmtCap(capOf(p));
+      $('pricesub').textContent =
+        `капитализация в ${esc(n.stable)} по полному выпуску · ` +
+        `цена ${p < 0.01 ? p.toPrecision(6) : p.toFixed(6)} · тик ${state.slot0.tick}`;
+    } else {
+      $('price').textContent = p < 0.01 ? p.toPrecision(6) : p.toFixed(6);
+      $('pricesub').textContent =
+        `${esc(n.stable)} за 1 ${esc(n.coin)} · тик ${state.slot0.tick}`;
+    }
   }
 
   // Распределение ликвидности: где именно стоят чужие позиции.
@@ -804,9 +892,16 @@
     g.beginPath(); g.moveTo(xn, 4); g.lineTo(xn - 5, -3); g.lineTo(xn + 5, -3);
     g.closePath(); g.fill();
 
-    $('c-lo').textContent = fmtPrice(left);
-    $('c-hi').textContent = fmtPrice(right);
-    $('c-now').textContent = 'цена ' + fmtPrice(now);
+    // Шкала под графиком — в тех же единицах, что и всё остальное.
+    if (unit === 'cap' && state.supply) {
+      $('c-lo').textContent = fmtCap(capOf(left));
+      $('c-hi').textContent = fmtCap(capOf(right));
+      $('c-now').textContent = 'капа ' + fmtCap(capOf(now));
+    } else {
+      $('c-lo').textContent = fmtPrice(left);
+      $('c-hi').textContent = fmtPrice(right);
+      $('c-now').textContent = 'цена ' + fmtPrice(now);
+    }
 
     // ГЛАВНОЕ ЧИСЛО, а не картинка: сколько цене ещё идти до диапазона.
     // Пока она снаружи, позиция не работает и комиссий не приносит.
@@ -852,8 +947,18 @@
       $('v-dep').textContent = `${state.amount} ${depSym}`;
       // При перевороте цены нижняя граница становится верхней.
       const a = priceOf(p.tickLower), b = priceOf(p.tickUpper);
-      $('v-lo').textContent = fmtPrice(Math.min(a, b));
-      $('v-hi').textContent = fmtPrice(Math.max(a, b));
+      const lo = Math.min(a, b), hi = Math.max(a, b);
+      if (unit === 'cap' && state.supply) {
+        $('l-lo').textContent = 'Min капа';
+        $('l-hi').textContent = 'Max капа';
+        $('v-lo').textContent = fmtCap(capOf(lo));
+        $('v-hi').textContent = fmtCap(capOf(hi));
+      } else {
+        $('l-lo').textContent = 'Min Price';
+        $('l-hi').textContent = 'Max Price';
+        $('v-lo').textContent = fmtPrice(lo);
+        $('v-hi').textContent = fmtPrice(hi);
+      }
       // Проценты показываем В ТОЙ ЖЕ ЦЕНЕ, что и Min/Max выше и график ниже.
       const gapShown = rawToShown(p.gapReal);
       const widthShown = rawToShown(p.widthReal);
@@ -1590,8 +1695,13 @@
         const inside = nowP >= bLo && nowP <= bHi;
         const near = nowP < bLo ? bLo : bHi;
         const away = Math.abs(near / nowP - 1) * 100;
-        bounds = `<span class="dim">Min</span> ${fmtPrice(bLo)}<br>` +
-                 `<span class="dim">Max</span> ${fmtPrice(bHi)}<br>` +
+        // Границы позиции — в тех же единицах, что и весь экран. Выпуск берём
+        // у МОНЕТЫ ЭТОЙ позиции, а не у загруженного пула.
+        const coinAddr = stIdx === 0 ? info.key.currency1 : info.key.currency0;
+        const sup = unit === 'cap' ? await supplyOf(coinAddr) : null;
+        const showB = (v) => sup ? fmtCap(v * sup) : fmtPrice(v);
+        bounds = `<span class="dim">${sup ? 'Min капа' : 'Min'}</span> ${showB(bLo)}<br>` +
+                 `<span class="dim">${sup ? 'Max капа' : 'Max'}</span> ${showB(bHi)}<br>` +
                  (inside ? '<span class="ok">внутри</span>'
                          : `<span class="warn">до входа ${away.toFixed(1)}%</span>`);
       }

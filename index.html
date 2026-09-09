@@ -153,6 +153,10 @@
     <div class="grid2">
       <div class="card">
         <h2>цена сейчас</h2>
+        <!-- Переключатель единиц. Мемкоин в цене выглядит как 0.000359391 —
+             такое число нечем измерить на глаз. Капитализация читается сразу.
+             Математика одна и та же: капа это цена, умноженная на выпуск. -->
+        <div class="row" id="unitbar" style="gap:6px;margin-bottom:6px"></div>
         <div class="big num" id="price">—</div>
         <div class="hint" id="pricesub">пул не загружен</div>
         <!-- Переключатель того, ЧТО показано на шкале: планируемый вход или
@@ -175,8 +179,8 @@
       </div>
       <div class="card">
         <h2>что получится</h2>
-        <div class="kv"><span>Min Price</span><b class="num" id="v-lo">—</b></div>
-        <div class="kv"><span>Max Price</span><b class="num" id="v-hi">—</b></div>
+        <div class="kv"><span id="l-lo">Min Price</span><b class="num" id="v-lo">—</b></div>
+        <div class="kv"><span id="l-hi">Max Price</span><b class="num" id="v-hi">—</b></div>
         <div class="kv"><span>отступ</span><b class="num" id="v-gap">—</b></div>
         <div class="kv"><span>ширина</span><b class="num" id="v-width">—</b></div>
         <div class="kv"><span>односторонняя</span><b id="v-side">—</b></div>
@@ -217,9 +221,9 @@
      страницу со старым кодом и справедливо писал, что ничего не изменилось.
      Меняется номер — меняется адрес, и браузер обязан скачать заново.
      ПРИ КАЖДОЙ ПРАВКЕ js ЭТОТ НОМЕР И VERSION В ui.js МЕНЯЮТСЯ ВМЕСТЕ. -->
-<script src="src/keccak.js?v=4.3"></script>
-<script src="src/core.js?v=4.3"></script>
-<script src="src/wallet.js?v=4.3"></script>
-<script src="src/ui.js?v=4.3"></script>
+<script src="src/keccak.js?v=4.4"></script>
+<script src="src/core.js?v=4.4"></script>
+<script src="src/wallet.js?v=4.4"></script>
+<script src="src/ui.js?v=4.4"></script>
 </body>
 </html>
