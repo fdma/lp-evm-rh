@@ -2,6 +2,14 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
+<!-- САМА СТРАНИЦА НЕ ДОЛЖНА ЛЕЖАТЬ В КЭШЕ.
+     Адреса скриптов с номером сборки лежат ВНУТРИ этого файла, а GitHub Pages
+     просит браузер хранить его десять минут. Из-за этого после выкладки автор
+     дважды видел старую версию, хотя на сервере лежала новая: обновлялся не
+     тот файл. Просим браузер каждый раз спрашивать сервер — html крошечный,
+     проверка стоит одного запроса. -->
+<meta http-equiv="Cache-Control" content="no-cache, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
 <title>LP — Uniswap V4</title>
 <style>
   :root{
