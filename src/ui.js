@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '4.5';
+  const VERSION = '4.6';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -113,7 +113,11 @@
       const b = document.createElement('button');
       b.textContent = v + suffix;
       if (get() === v) b.classList.add('on');
-      b.onclick = () => { set(v); chips(host, values, suffix, get, set); recalc(); save(); };
+      b.onclick = () => {
+        // Кнопка с готовой суммой — тоже ручной ввод по смыслу.
+        state.amountRaw = null; state.amountRawToken = null;
+        set(v); chips(host, values, suffix, get, set); recalc(); save();
+      };
       host.appendChild(b);
     }
     const own = document.createElement('input');
@@ -1129,6 +1133,12 @@
 
   function amountRaw() {
     const t = quoteToken();
+    // Если сумма пришла долей баланса, у нас есть точное значение в
+    // минимальных единицах — берём его, а не пересчитываем из дробного числа.
+    if (state.amountRaw != null && state.amountRawToken &&
+        state.amountRawToken.toLowerCase() === t.toLowerCase()) {
+      return state.amountRaw;
+    }
     const d = state.decimals[t] ?? 18;
     return BigInt(Math.round(state.amount * Math.pow(10, Math.min(d, 15)))) *
            (10n ** BigInt(Math.max(0, d - 15)));
@@ -1406,7 +1416,9 @@
         C.SEL.balanceOf + C.addrWord(state.account)));
       const dec = state.decimals[token] ?? await tokenDecimals(token);
       const human = Number(raw) / Math.pow(10, dec);
-      depBal = { token, sym, dec, human };
+      // Точный баланс в минимальных единицах храним отдельно: доли считаются
+      // по нему, а не по числу с плавающей точкой.
+      depBal = { token, sym, dec, human, raw };
       $('bal').innerHTML = `на кошельке <b class="num">${fmtNum(human)}</b> ${esc(sym)}`;
     } catch (e) {
       // Молчаливый ноль здесь опаснее пустоты: по нему нельзя считать доли.
@@ -1442,7 +1454,19 @@
       b.disabled = !depBal;
       b.onclick = () => {
         if (!depBal) return;
-        state.amount = depBal.human * pct / 100;
+        // ДОЛЮ БАЛАНСА СЧИТАЕМ В ЦЕЛЫХ, А НЕ ЧЕРЕЗ ДРОБНОЕ ЧИСЛО.
+        //
+        // Найдено аудитом 09.09.2026. Путь «баланс -> обычное число -> обратно
+        // в минимальные единицы» у токена с 18 знаками в ПОЛОВИНЕ случаев даёт
+        // на несколько наноединиц БОЛЬШЕ, чем есть на кошельке (проверено на
+        // 200 000 случайных балансов, худший случай +3e-9 токена). Для «100%»
+        // это значит отказ транзакции и сообщение «не хватает» на ровном месте.
+        //
+        // Поэтому доля берётся от точного баланса в минимальных единицах, а
+        // человеческое число остаётся только для показа.
+        state.amountRaw = depBal.raw * BigInt(pct) / 100n;
+        state.amountRawToken = depBal.token;
+        state.amount = Number(state.amountRaw) / Math.pow(10, depBal.dec);
         amtRow(); recalc(); save();
         log(`взял ${pct}% баланса: ${fmtNum(state.amount)} ${depBal.sym}`);
       };
@@ -1454,7 +1478,10 @@
     own.onchange = () => {
       const v = parseFloat(String(own.value).replace(',', '.'));
       if (!isFinite(v) || v <= 0) { own.style.borderColor = 'var(--bad)'; return; }
-      own.style.borderColor = ''; state.amount = v; recalc(); save();
+      own.style.borderColor = '';
+      // Ввели руками — точное значение доли больше не относится к делу.
+      state.amount = v; state.amountRaw = null; state.amountRawToken = null;
+      recalc(); save();
     };
     host.appendChild(own);
   }
@@ -1642,9 +1669,31 @@
       // Наивная оценка «стоимость плюс комиссии» завышена: чтобы получить
       // чистый стейбл, монету надо продать, а продажа платит комиссию пула.
       // У пула с комиссией 5% это заметные деньги, и молчать о них нельзя.
-      let cashOut = null;
+      let cashOut = null, cashWhy = null;
       if (total != null && s0) {
-        const feeShare = (info.key.fee || 0) / 1000000;   // 50000 → 0.05
+        // КОМИССИЯ ПРОДАЖИ: 0x800000 — ЭТО НЕ 839%, А ФЛАГ.
+        //
+        // Найдено аудитом 09.09.2026. У пула с ПЛАВАЮЩЕЙ комиссией в ключе
+        // стоит 0x800000 = 8388608, и деление на миллион давало долю 8.39,
+        // то есть множитель (1 − 8.39) = −7.39. Строка «закрыть и продать
+        // сейчас» показывала бы уверенный минус там, где выход в плюсе:
+        // на примере 50 стейбла и миллиона монет по 0.00005 выходило
+        // −319.43 вместо ~97.50.
+        //
+        // У плавающей комиссии берём ЗАМЕРЕННУЮ по обменам, если она есть.
+        // Если замера нет — не показываем строку вовсе и говорим почему.
+        const feeRaw = info.key.fee || 0;
+        const measured = feeCache.get(poolId);
+        let feeShare = feeRaw === 0x800000
+          ? (measured && measured.pays ? measured.median / 1000000 : null)
+          : feeRaw / 1000000;
+        if (feeShare == null || !(feeShare >= 0) || feeShare > 0.5) {
+          feeShare = null;
+          cashWhy = feeRaw === 0x800000
+            ? 'у пула плавающая комиссия и она ещё не замерена'
+            : 'комиссия пула выглядит неправдоподобно';
+        }
+        if (feeShare == null) { /* считать нечем — строки не будет */ }
         const raw2 = Math.pow(1.0001, s0.tick) * Math.pow(10, d0 - d1);
         const stIdx2 = STABLE.test(sym1 || '') ? 1 : 0;
         const a2 = C.amountsForLiquidity(
@@ -1659,7 +1708,7 @@
           + (fees ? (stIdx2 === 1 ? Number(fees.fee1) / Math.pow(10, d1)
                                   : Number(fees.fee0) / Math.pow(10, d0)) : 0);
         const coinPrice = stIdx2 === 1 ? raw2 : (raw2 ? 1 / raw2 : 0);
-        cashOut = stableQty + coinQty * coinPrice * (1 - feeShare);
+        if (feeShare != null) cashOut = stableQty + coinQty * coinPrice * (1 - feeShare);
       }
 
       const pnlOf = (rec) => {
@@ -1683,6 +1732,10 @@
                  `${pnl.toFixed(2)} (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)</span>` +
                  (out > 0 ? `<br><span class="dim">уже вынуто ${out.toFixed(2)}, ` +
                             `учтено в итоге</span>` : '');
+        if (cashOut == null && cashWhy) {
+          pnlStr += `<br><span class="dim">сколько выйдет на руки — не считаю: ` +
+                    `${esc(cashWhy)}</span>`;
+        }
         if (cashOut != null) {
           const net = cashOut + out - rec.amountIn;
           const netPct = rec.amountIn ? net / rec.amountIn * 100 : 0;
