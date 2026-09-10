@@ -85,6 +85,9 @@ const CHAINS = {
     // Сколько недавних блоков спрашивать у журнала. Узел хранит немного;
     // 5000 блоков это около часа и один запрос вместо двух десятков отказов.
     logsWindow: 5000,
+    // Для поиска выпуска позиции окно шире: фильтр по номеру предельно узкий,
+    // ответ крошечный, а позиция могла открыться несколько часов назад.
+    mintWindow: 60000,
     // Вход в пары с нативной монетой СОБРАН 09.09.2026: она уходит значением
     // транзакции, сдачу возвращает SWEEP. Проверено симуляцией на живом пуле
     // CTM/BNB: с value проходит, без value — откат, то есть работает именно
@@ -560,13 +563,29 @@ async function readHistory(rpc, owner, tokens = [], depth = 60000, windowSize = 
 // событием. На узле Robinhood запрос по номеру NFT сразу по ВСЕЙ истории
 // (53 млн блоков) отвечает за ~120 мс: фильтр по теме сужает поиск до одной
 // записи, поэтому глубина ничего не стоит.
-async function findMint(rpc, tokenId) {
+// ПОИСК ВЫПУСКА ПОЗИЦИИ.
+//
+// Раньше здесь стоял запрос с нулевого блока «по всю историю». В сети
+// Robinhood это дёшево: фильтр по номеру позиции предельно узкий, узел
+// отдаёт мгновенно. А узел BSC на такой запрос отвечает отказом по глубине —
+// и вход просто «не находился». Автор увидел это на своей первой живой
+// позиции в BSC: в колонке итога стояло «вход в цепочке не найден».
+//
+// Поэтому: там, где узел держит всю историю, спрашиваем как раньше; где не
+// держит — берём разумное недавнее окно и позволяем делению отрезка самому
+// сузиться до того, что узел отдаёт.
+async function findMint(rpc, tokenId, fromBlock) {
   const id = '0x' + BigInt(tokenId).toString(16).padStart(64, '0');
-  const logs = await rpc('eth_getLogs', [{
-    fromBlock: '0x0', toBlock: 'latest',
-    address: RH.positionManager,
-    topics: [TRANSFER_TOPIC, null, null, id],
-  }]);
+  const filter = { address: RH.positionManager,
+                   topics: [TRANSFER_TOPIC, null, null, id] };
+  let logs;
+  if (fromBlock == null || fromBlock === 0) {
+    logs = await rpc('eth_getLogs', [{ ...filter, fromBlock: '0x0', toBlock: 'latest' }]);
+  } else {
+    const latest = Number(BigInt(await rpc('eth_blockNumber', [])));
+    const from = fromBlock < 0 ? Math.max(0, latest + fromBlock) : fromBlock;
+    logs = await getLogsSplit(rpc, filter, from, latest, { left: 20 });
+  }
   if (!logs || !logs.length) return null;
   // Самое раннее событие по этому номеру и есть выпуск.
   let first = logs[0];

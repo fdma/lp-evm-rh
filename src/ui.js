@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '5.0';
+  const VERSION = '5.1';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -1973,7 +1973,10 @@
     const p = (async () => {
       // Журнал — только через публичный узел. Alchemy отдаёт eth_getLogs
       // по 10 блоков за раз, и поиск входа там просто не работает.
-      const m = await C.findMint(logsRpc(), id);
+      // Где узел не хранит всю историю (BSC), ищем в недавнем окне: запрос
+      // с нулевого блока там отвергается, и вход «не находится» на ровном месте.
+      const m = await C.findMint(logsRpc(), id,
+                                 C.RH.deepLogs ? 0 : -(C.RH.mintWindow || 60000));
       if (!m) return null;
       const f = await C.txFlows(state.rpc, m.hash, state.account);
       const inflow = f ? f.flows.filter(x => x.dir < 0) : [];
