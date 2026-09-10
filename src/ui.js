@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '5.1';
+  const VERSION = '5.2';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -865,7 +865,7 @@
         ? 'ликвидность пула ещё не прочитана — нажми «Загрузить пул»'
         : (!pr.bars || !pr.bars.length)
           ? 'чужой ликвидности рядом с ценой не нашлось'
-          : 'Синим — где стоит чужая ликвидность. Подписи снизу — отклонение от текущей цены.';
+          : 'Столбиками — где стоит чужая ликвидность. Подписи снизу — отклонение от текущей цены.';
     }
     if (pr && pr.bars && pr.bars.length) {
       let mx = 0n;
@@ -881,8 +881,8 @@
           // «где сколько стоит» видно по цвету, а не только по высоте.
           const a = 0.16 + k * 0.5;
           const gr = g.createLinearGradient(0, h - 14 - hh, 0, h - 14);
-          gr.addColorStop(0, `rgba(${70 + k * 60},${150 + k * 60},${210},${a})`);
-          gr.addColorStop(1, `rgba(${40 + k * 40},${90 + k * 50},${150},${a * 0.5})`);
+          gr.addColorStop(0, `rgba(${120 + k * 47},${205 + k * 20},${175 + k * 17},${a})`);
+          gr.addColorStop(1, `rgba(${33 + k * 40},${58 + k * 50},${48 + k * 40},${a * 0.6})`);
           g.fillStyle = gr;
           const x0 = Math.max(0, xa), x1 = Math.min(w, xb);
           g.fillRect(x0, h - 14 - hh, Math.max(1, x1 - x0 - 1), hh);
@@ -900,9 +900,9 @@
     for (let i = 0; i <= 6; i++) {
       const x = w * i / 6;
       const v = left + (right - left) * i / 6;
-      g.strokeStyle = '#141d27'; g.lineWidth = 1;
+      g.strokeStyle = 'rgba(255,255,255,.07)'; g.lineWidth = 1;
       g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h - 12); g.stroke();
-      g.fillStyle = '#55677a';
+      g.fillStyle = '#788291';
       const rel = (v / now - 1) * 100;
       g.fillText((rel >= 0 ? '+' : '') + rel.toFixed(0) + '%',
                  Math.min(w - 14, Math.max(14, x)), h - 2);
@@ -917,7 +917,7 @@
       grad.addColorStop(1, 'rgba(38,208,124,.06)');
       g.fillStyle = grad;
       g.fillRect(x0, 8, Math.max(2, x1 - x0), h - 22);
-      g.strokeStyle = '#26d07c'; g.lineWidth = 2;
+      g.strokeStyle = '#81d8ad'; g.lineWidth = 2;
       for (const x of [x0, x1]) {
         g.beginPath(); g.moveTo(x, 6); g.lineTo(x, h - 14); g.stroke();
       }
@@ -929,11 +929,11 @@
 
     // текущая цена
     const xn = X(now);
-    g.strokeStyle = '#f0a742'; g.lineWidth = 2;
+    g.strokeStyle = '#e2b87b'; g.lineWidth = 2;
     g.setLineDash([4, 3]);
     g.beginPath(); g.moveTo(xn, 4); g.lineTo(xn, h - 10); g.stroke();
     g.setLineDash([]);
-    g.fillStyle = '#f0a742';
+    g.fillStyle = '#e2b87b';
     g.beginPath(); g.moveTo(xn, 4); g.lineTo(xn - 5, -3); g.lineTo(xn + 5, -3);
     g.closePath(); g.fill();
 
@@ -2448,15 +2448,15 @@
     const cv = document.createElement('canvas');
     cv.width = W; cv.height = H;
     const g = cv.getContext('2d');
-    g.fillStyle = '#07090c'; g.fillRect(0, 0, W, H);
+    g.fillStyle = '#101216'; g.fillRect(0, 0, W, H);
     // мягкое свечение в углу, чтобы не выглядело как таблица
     const glow = g.createRadialGradient(W * 0.78, H * 0.18, 10, W * 0.78, H * 0.18, 420);
     const win = (rec.pnl ?? 0) >= 0;
-    glow.addColorStop(0, win ? 'rgba(38,208,124,.16)' : 'rgba(239,91,91,.14)');
+    glow.addColorStop(0, win ? 'rgba(129,216,173,.16)' : 'rgba(237,147,147,.14)');
     glow.addColorStop(1, 'rgba(0,0,0,0)');
     g.fillStyle = glow; g.fillRect(0, 0, W, H);
 
-    g.fillStyle = '#7d8fa3';
+    g.fillStyle = '#969eab';
     g.font = '600 22px ui-sans-serif,system-ui,sans-serif';
     const head = 'Uniswap V4';
     g.fillText(head, 52, 74);
@@ -2467,9 +2467,9 @@
       const t = (rec.fee / 10000).toFixed(2) + '%';
       g.font = '600 17px ui-sans-serif,system-ui,sans-serif';
       const w = g.measureText(t).width;
-      g.fillStyle = '#1b2632';
+      g.fillStyle = '#20242b';
       g.fillRect(x, 52, w + 24, 30);
-      g.fillStyle = '#dbe4ee';
+      g.fillStyle = '#edf0f4';
       g.fillText(t, x + 12, 74);
     }
 
@@ -2478,11 +2478,11 @@
     g.fillText(rec.pair || 'позиция', 52, 168);
 
     const pct = rec.amountIn ? (rec.pnl / rec.amountIn) * 100 : 0;
-    g.fillStyle = '#7d8fa3';
+    g.fillStyle = '#969eab';
     g.font = '600 30px ui-sans-serif,system-ui,sans-serif';
     g.fillText(win ? 'Прибыль' : 'Убыток', 52, 300);
     g.textAlign = 'right';
-    g.fillStyle = win ? '#26d07c' : '#ef5b5b';
+    g.fillStyle = win ? '#81d8ad' : '#ed9393';
     g.font = '700 40px ui-monospace,Menlo,monospace';
     g.fillText((pct >= 0 ? '+' : '') + pct.toFixed(2) + '%', W - 52, 300);
     g.textAlign = 'left';
