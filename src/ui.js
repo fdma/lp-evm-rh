@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '4.8';
+  const VERSION = '4.9';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -1441,6 +1441,33 @@
   // это раньше и показываем.
   let depBal = null;          // {token, sym, dec, human}
 
+  // ── ЧТО НА КОШЕЛЬКЕ В ЭТОЙ СЕТИ ─────────────────────────────────────────
+  //
+  // Просьба автора: показывать стейблы в BNB Chain так же, как в Robinhood —
+  // «чтобы видно было, с чем можно работать». Раньше баланс появлялся только
+  // ПОСЛЕ загрузки пула и только по той монете, которой заходишь.
+  //
+  // Показываем нативную монету (на неё платится газ) и стейблы сети. Нулевые
+  // не прячем: ноль USDT — это тоже ответ на вопрос «с чем работать».
+  async function loadWalletBalances() {
+    const host = $('walletbal');
+    if (!host) return;
+    if (!state.account || !state.rpc) { host.textContent = ''; return; }
+    const parts = [];
+    try {
+      const nat = BigInt(await state.rpc('eth_getBalance', [state.account, 'latest']));
+      parts.push(`${(Number(nat) / 1e18).toFixed(4)} ${C.RH.nativeSymbol}`);
+    } catch (e) { parts.push(`${C.RH.nativeSymbol} не прочитался`); }
+    for (const t of (C.RH.wallet || [])) {
+      try {
+        const raw = BigInt(await C.ethCall(state.rpc, t.addr,
+          C.SEL.balanceOf + C.addrWord(state.account)));
+        parts.push(`${(Number(raw) / Math.pow(10, t.dec)).toFixed(2)} ${t.sym}`);
+      } catch (e) { parts.push(`${t.sym} не прочитался`); }
+    }
+    host.innerHTML = 'на кошельке: <b>' + parts.map(esc).join('</b> · <b>') + '</b>';
+  }
+
   async function loadBalance() {
     $('bal').textContent = '';
     depBal = null;
@@ -1547,7 +1574,10 @@
       if (!state.account || state.busy || posBusy) return;
       if (typeof document !== 'undefined' && document.hidden) return;
       posBusy = true;
-      try { await loadPositions(); } catch (e) { /* тихо: это фон */ }
+      try {
+        await loadPositions();
+        await loadWalletBalances();
+      } catch (e) { /* тихо: это фон */ }
       finally { posBusy = false; }
     }, 20000);
   }
@@ -2521,6 +2551,8 @@
       $('s-wallet').textContent = w.address.slice(0, 6) + '…' + w.address.slice(-4);
       log('кошелёк подключён: ' + w.address, 'ok');
       startPositionsPump();
+      loadWalletBalances().catch(() => {});
+    loadWalletBalances().catch(() => {});
       // Сеть переключаем сразу, а не в момент подписи. Иначе автор сначала
       // соберёт вход, а потом упрётся в отказ на самом последнем шаге.
       if (w.chainId !== C.RH.chainId) {

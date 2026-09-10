@@ -122,6 +122,9 @@
         <button id="b-rpc">Проверить узел</button>
         <button id="b-wallet">Подключить Rabby</button>
       </div>
+      <!-- Что лежит на кошельке в ЭТОЙ сети. Показывается до загрузки пула:
+           человек должен видеть, с чем он может работать. -->
+      <div class="hint num" id="walletbal" style="margin-top:7px"></div>
       <div class="hint">Ключ хранится только в этом браузере и никуда не отправляется.</div>
     </div>
 
@@ -230,9 +233,9 @@
      страницу со старым кодом и справедливо писал, что ничего не изменилось.
      Меняется номер — меняется адрес, и браузер обязан скачать заново.
      ПРИ КАЖДОЙ ПРАВКЕ js ЭТОТ НОМЕР И VERSION В ui.js МЕНЯЮТСЯ ВМЕСТЕ. -->
-<script src="src/keccak.js?v=4.8"></script>
-<script src="src/core.js?v=4.8"></script>
-<script src="src/wallet.js?v=4.8"></script>
-<script src="src/ui.js?v=4.8"></script>
+<script src="src/keccak.js?v=4.9"></script>
+<script src="src/core.js?v=4.9"></script>
+<script src="src/wallet.js?v=4.9"></script>
+<script src="src/ui.js?v=4.9"></script>
 </body>
 </html>

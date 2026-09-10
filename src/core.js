@@ -40,6 +40,11 @@ const CHAINS = {
     poolSource: 'dexscreener',
     dexscreenerChain: 'robinhood',
     rpcHint: 'https://robinhood-mainnet.g.alchemy.com/v2/…',
+    // Чем заходят в пулы на этой сети. Нужен, чтобы показать кошелёк ДО
+    // загрузки пула: человек должен видеть, с чем он может работать.
+    wallet: [
+      { addr: '0x5fc5360d0400a0fd4f2af552add042d716f1d168', sym: 'USDG', dec: 6 },
+    ],
     // Память браузера. Ключи РАЗНЫЕ у разных сетей, и менять их нельзя:
     // в журнале входов лежат суммы, по которым считается итог позиции.
     storeKey: 'lp-evm-rh',
@@ -71,6 +76,10 @@ const CHAINS = {
     geckoNetwork: 'bsc',
     geckoDex: 'uniswap-v4-bsc',
     rpcHint: 'https://bnb-mainnet.g.alchemy.com/v2/… (свой узел — глубже история)',
+    wallet: [
+      { addr: '0x55d398326f99059ff775485246999027b3197955', sym: 'USDT', dec: 18 },
+      { addr: '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d', sym: 'USDC', dec: 18 },
+    ],
     storeKey: 'lp-bsc',
     ledgerKey: 'lp-bsc-ledger',
     // Сколько недавних блоков спрашивать у журнала. Узел хранит немного;
