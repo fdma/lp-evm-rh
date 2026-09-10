@@ -842,6 +842,38 @@ async function readPositionEvents(rpc, poolId, fromBlock, ids) {
 //
 // Запросов выходит немного: несколько слов карты плюс по одному на каждый
 // занятый тик. Делаем это при загрузке пула, а не в горячем пути.
+// СКОЛЬКО ДЕНЕГ СТОИТ ВПЛОТНУЮ К ЦЕНЕ.
+//
+// У свежей монеты сводки (DexScreener, GeckoTerminal) ещё ничего не знают, и
+// в списке пулов на месте оборота и ликвидности стоят прочерки. Автор
+// справедливо сказал: «не видно, сколько ликвы». Но цепочка знает всё и без
+// сводок — активная ликвидность лежит в самом пуле.
+//
+// Считаем ЧЕСТНУЮ и понятную величину: сколько монеты и стейбла стоит в
+// полосе ±1% вокруг текущей цены. Это не «TVL пула» (его в V4 вообще нельзя
+// назвать одним числом), а ровно то, что важно входящему: какая толщина
+// рядом с ценой.
+//
+//   amount0 = L * (1/√P − 1/√Pb)      amount1 = L * (√P − √Pa)
+async function poolDepth(rpc, poolId, sqrtPriceX96, d0, d1, stableIsFirst, bandPct = 1) {
+  let L;
+  try { L = BigInt(await ethCall(rpc, RH.stateView, SEL.getLiquidity + stripHex(poolId))); }
+  catch (e) { return null; }
+  if (!L || L === 0n) return { stable: 0, coin: 0, total: 0, empty: true };
+  const P = Number(sqrtPriceX96) / Number(Q96);        // √P в единицах цены
+  if (!(P > 0)) return null;
+  const k = Math.sqrt(1 + bandPct / 100);
+  const sqrtP = P, sqrtA = P / k, sqrtB = P * k;
+  const Ln = Number(L);
+  const amount0 = Ln * (1 / sqrtP - 1 / sqrtB) / Math.pow(10, d0);
+  const amount1 = Ln * (sqrtP - sqrtA) / Math.pow(10, d1);
+  const raw = sqrtP * sqrtP * Math.pow(10, d0 - d1);   // c1 за c0
+  const stable = stableIsFirst ? amount0 : amount1;
+  const coin = stableIsFirst ? amount1 : amount0;
+  const coinPrice = stableIsFirst ? (raw ? 1 / raw : 0) : raw;
+  return { stable, coin, total: stable + coin * coinPrice, empty: false };
+}
+
 async function readLiquidityProfile(rpc, poolId, tick, spacing, words = 3) {
   const compressed = Math.floor(tick / spacing);
   const centerWord = compressed >> 8;
@@ -1489,7 +1521,7 @@ const API = {
   buildMintCalldata, encodeMintParams, encodeSettlePair, encodeUnlockData,
   readAllowances, buildErc20Approve, buildPermit2Approve, planApprovals, simulate,
   buildCloseCalldata, encodeDecreaseParams, encodeTakePair, encodeSweep, isNativeCurrency,
-  readPositionLiquidity, readPositionPool, MSG_SENDER, unpackTicks, readFees,
+  readPositionLiquidity, readPositionPool, MSG_SENDER, unpackTicks, readFees, poolDepth,
   CHAINS, useChain,
 };
 

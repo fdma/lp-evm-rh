@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '4.9';
+  const VERSION = '5.0';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -441,9 +441,10 @@
         // Сводка сама отстаёт: по GRASS она давала 0.00278, тогда как пул
         // в тот же момент стоял на 0.0036. Мерить отставание отстающей
         // линейкой бессмысленно.
-        let onchain = null, quote = null;
+        let onchain = null, quote = null, s0raw = null;
         try {
           const s0v = await C.readSlot0(state.rpc, p.poolId);
+          s0raw = s0v;                       // пригодится для глубины у цены
           const dd0 = await tokenDecimals(k.currency0);
           const dd1 = await tokenDecimals(k.currency1);
           const raw = C.priceFromSqrt(s0v.sqrtPriceX96, dd0, dd1);
@@ -451,7 +452,7 @@
           onchain = coinIs0 ? raw : (raw ? 1 / raw : 0);
           quote = coinIs0 ? k.sym1 : k.sym0;
         } catch (e) { /* цена не прочиталась */ }
-        return { ...p, key: k, ok: k.poolIdOk, onchain, quote,
+        return { ...p, key: k, ok: k.poolIdOk, onchain, quote, slot0: s0raw,
                  real: { pays: null, why: 'не замерено' } };
       } catch (e) { return { ...p, key: null, ok: false }; }
     }));
@@ -523,8 +524,14 @@
           // Имя пары берём у ключа, если он прочитан: при поиске по цепочке
           // сводки нет и подставлять оттуда нечего.
           '<b>' + esc(r.key ? `${r.key.sym0}/${r.key.sym1}` : (r.pair || '?')) +
-          '</b> <span class="dim num">объём ' + money(r.vol) +
-          ' · ликв ' + money(r.liq) + '</span>' +
+          '</b> <span class="dim num">' +
+          (r.liq || r.vol
+            ? 'объём ' + money(r.vol) + ' · ликв ' + money(r.liq)
+            : r.depth
+              ? 'в ±1% от цены ' + money(r.depth.total) +
+                ' <span class="dim">(' + money(r.depth.stable) + ' стейблом)</span>'
+              : 'сводка о пуле молчит — считаю глубину по цепочке…') +
+          '</span>' +
           (r.key ? '<br><span class="dim num">в ключе ' + feeText(r.key.fee) + ' · ' +
                    '<span class="' + (r.real && r.real.pays ? 'ok' : 'warn') + '">на деле ' +
                    onDeal + '</span> · шаг ' + step.toFixed(2) + '% · минимальный отступ ' +
@@ -562,6 +569,19 @@
         if (!r.pending) continue;
         try { r.real = await feeRealityCached(r.poolId, latest); }
         catch (e) { r.real = { pays: null, why: 'узел не ответил' }; }
+        // ГЛУБИНА У ЦЕНЫ. У свежей монеты сводки ещё ничего не знают, и в
+        // строке стоят прочерки вместо оборота и ликвидности. Цепочка знает:
+        // считаем, сколько денег стоит в полосе ±1% вокруг цены. Это честнее
+        // «TVL пула», которого в V4 одним числом и не бывает.
+        if (!r.liq && r.key && r.slot0) {
+          try {
+            const d0 = state.decimals[r.key.currency0] ?? await tokenDecimals(r.key.currency0);
+            const d1 = state.decimals[r.key.currency1] ?? await tokenDecimals(r.key.currency1);
+            const stFirst = STABLE.test(r.key.sym0 || '');
+            r.depth = await C.poolDepth(state.rpc, r.poolId, r.slot0.sqrtPriceX96,
+                                        d0, d1, stFirst, 1);
+          } catch (e) { r.depth = null; }
+        }
         r.pending = false;
         render(true);
       }
