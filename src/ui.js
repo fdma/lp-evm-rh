@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '5.2';
+  const VERSION = '5.3';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -335,6 +335,10 @@
       startPricePump();
       save();
       loadProfile();
+      // График цены: первая загрузка окна, дальше только новые блоки.
+      candles = []; candleFrom = 0; candleTo = 0;
+      drawFrames();
+      loadCandles().catch(() => {});
       amtRow();
       loadBalance().catch(() => {});
       // Выпуск монеты читаем один раз на пул: из него считается капитализация.
@@ -665,6 +669,13 @@
         $('s-price').textContent = 'цена живая';
         showPrice();
         recalc();
+        drawPrice();
+        // Дочитываем новые обмены не чаще раза в 30 секунд: это запрос
+        // журнала, а цена и без него уже живая.
+        if (Date.now() - lastCandleAt > 30000) {
+          lastCandleAt = Date.now();
+          loadCandles().catch(() => {});
+        }
       } catch (e) {
         $('d-price').className = 'dot bad';
         $('s-price').textContent = 'цена не читается';
@@ -768,7 +779,7 @@
         if (disabled) return;
         unit = name;
         try { localStorage.setItem(KEY + '-unit', name); } catch (e) { }
-        drawUnits(); showPrice(); recalc();
+        drawUnits(); showPrice(); recalc(); drawPrice();
       };
       host.appendChild(b);
     };
@@ -819,6 +830,142 @@
       state.profile = null;
       log('распределение не прочиталось: ' + e.message +
           ' — столбиков не будет, нажми «Загрузить пул» ещё раз', 'warn');
+    }
+  }
+
+  // ── ГРАФИК ЦЕНЫ ─────────────────────────────────────────────────────────
+  //
+  // Автор попросил всё на одном экране: чтобы график и терминал были рядом,
+  // а не на двух страницах. Цену берём там же, где и всё остальное — из
+  // событий обмена: в каждом Swap записан тик, то есть цена на тот блок.
+  //
+  // Сначала грузим окно назад, дальше только новые блоки: перечитывать
+  // собранное бессмысленно и дорого. На сетях, где узел держит только
+  // недавнее (BSC), окно само упрётся в то, что он отдаёт, и это честно
+  // видно по подписи.
+  let candles = [], candleFrom = 0, candleTo = 0, frameHours = 1, lastCandleAt = 0;
+  const FRAMES = [1, 4, 12];
+
+  async function loadCandles() {
+    if (!state.pool || !state.slot0) return;
+    const sec = C.RH.blockSec || 2;
+    const perHour = Math.round(3600 / sec);
+    const latest = Number(BigInt(await logsRpc()('eth_blockNumber', [])));
+    const want = latest - frameHours * perHour;
+    // Продолжаем с того места, где остановились, если окно то же.
+    const from = (candleTo && want >= candleFrom) ? candleTo + 1 : Math.max(0, want);
+    if (from > latest) return;
+    let logs = [];
+    try {
+      logs = await C.getLogsSplit(logsRpc(), {
+        address: C.RH.poolManager, topics: [C.SWAP_TOPIC, state.pool.poolId],
+      }, from, latest, { left: candleTo ? 4 : 12 });
+    } catch (e) { return; }
+    if (from !== candleTo + 1) { candles = []; candleFrom = from; }
+    candleTo = latest;
+    const d0 = state.decimals[state.pool.currency0] ?? 18;
+    const d1 = state.decimals[state.pool.currency1] ?? 18;
+    const inverted = stableSide() === 0;
+    const perMin = Math.max(1, Math.round(60 / sec));
+    for (const l of logs) {
+      const w = C.words(l.data);
+      if (w.length < 5) continue;
+      const tick = Number(C.toSigned(BigInt('0x' + w[4]), 256));
+      const rawP = Math.pow(1.0001, tick) * Math.pow(10, d0 - d1);
+      const px = inverted ? (rawP ? 1 / rawP : 0) : rawP;
+      if (!(px > 0)) continue;
+      const b = Number(BigInt(l.blockNumber));
+      const bucket = Math.floor(b / perMin);
+      const last = candles[candles.length - 1];
+      if (last && last.bucket === bucket) {
+        last.h = Math.max(last.h, px); last.l = Math.min(last.l, px); last.c = px;
+      } else candles.push({ bucket, o: px, h: px, l: px, c: px });
+    }
+    while (candles.length > 400) candles.shift();
+    drawPrice();
+  }
+
+  function drawFrames() {
+    const host = $('px-frames');
+    if (!host) return;
+    host.innerHTML = '';
+    for (const f of FRAMES) {
+      const b = document.createElement('button');
+      b.textContent = f + 'ч';
+      b.style.cssText = 'padding:2px 8px;font-size:11px;margin:0';
+      if (f === frameHours) b.className = 'on';
+      b.onclick = () => {
+        frameHours = f; candles = []; candleFrom = 0; candleTo = 0;
+        drawFrames(); loadCandles().catch(() => {});
+      };
+      host.appendChild(b);
+    }
+  }
+
+  function drawPrice() {
+    const cv = $('pxchart');
+    if (!cv || !state.slot0 || !state.pool) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth, h = 132;
+    if (cv.width !== w * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+    const g = cv.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    const now = priceOf(state.slot0.tick);
+    const title = $('px-title');
+    if (!candles.length) {
+      if (title) title.textContent = 'цена: обменов за это время не было';
+      g.fillStyle = '#788291';
+      g.font = '11px ui-sans-serif,system-ui,sans-serif';
+      g.fillText('обменов не нашлось — рисовать нечего', 10, h / 2);
+      return;
+    }
+    // Полоса позиции — если смотрим открытую или считаем вход.
+    const band = watching && state.pool.poolId === watching.poolId
+      ? { lo: Math.min(priceOf(watching.tickLower), priceOf(watching.tickUpper)),
+          hi: Math.max(priceOf(watching.tickLower), priceOf(watching.tickUpper)) }
+      : null;
+    const vals = candles.flatMap(c => [c.h, c.l]).concat([now]);
+    if (band) vals.push(band.lo, band.hi);
+    let lo = Math.min(...vals), hi = Math.max(...vals);
+    const padV = (hi - lo) * 0.08 || hi * 0.02 || 1;
+    lo -= padV; hi += padV;
+    const padR = 62, padB = 14;
+    const X = i => (i / Math.max(1, candles.length - 1)) * (w - padR - 8) + 8;
+    const Y = v => h - padB - ((v - lo) / (hi - lo)) * (h - padB - 10);
+    const fmt = v => (unit === 'cap' && state.supply) ? fmtCap(capOf(v)) : fmtPrice(v);
+
+    if (band) {                                  // полоса диапазона
+      const y1 = Y(band.hi), y2 = Y(band.lo);
+      g.fillStyle = 'rgba(129,216,173,.10)';
+      g.fillRect(0, y1, w - padR, y2 - y1);
+      g.strokeStyle = 'rgba(129,216,173,.55)'; g.lineWidth = 1;
+      for (const [v, label] of [[band.hi, 'max'], [band.lo, 'min']]) {
+        const y = Y(v);
+        g.beginPath(); g.moveTo(0, y); g.lineTo(w - padR, y); g.stroke();
+        g.fillStyle = '#81d8ad'; g.font = '10px ui-sans-serif,system-ui,sans-serif';
+        g.fillText(`${label} ${fmt(v)}`, w - padR + 4, y + 3);
+        g.strokeStyle = 'rgba(129,216,173,.55)';
+      }
+    }
+    // линия цены
+    g.strokeStyle = '#7fc4e8'; g.lineWidth = 1.5;
+    g.beginPath();
+    candles.forEach((c, i) => { const y = Y(c.c); i ? g.lineTo(X(i), y) : g.moveTo(X(i), y); });
+    g.stroke();
+    // текущая цена пунктиром
+    const yn = Y(now);
+    g.setLineDash([3, 3]); g.strokeStyle = '#e2b87b'; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(0, yn); g.lineTo(w - padR, yn); g.stroke();
+    g.setLineDash([]);
+    g.fillStyle = '#e2b87b'; g.font = '10px ui-sans-serif,system-ui,sans-serif';
+    g.fillText('сейчас ' + fmt(now), w - padR + 4, yn + 3);
+
+    if (title) {
+      const first = candles[0].o, chg = first ? (now / first - 1) * 100 : 0;
+      title.innerHTML = `цена за ${frameHours} ч · ` +
+        `<span class="${chg >= 0 ? 'ok' : 'bad'}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</span>` +
+        ` <span class="dim">по ${candles.length} минутам с обменами</span>`;
     }
   }
 
