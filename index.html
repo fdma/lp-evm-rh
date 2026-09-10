@@ -189,18 +189,7 @@
              одна из открытых позиций. Без него шкала всегда рисовала будущий
              вход, и при открытых позициях это сбивало с толку. -->
         <div id="watchbar" class="row" style="gap:6px;flex-wrap:wrap;margin-top:8px"></div>
-        <!-- ГРАФИК ЦЕНЫ. Отдельным холстом над картой ликвидности: сначала
-             человек смотрит, куда шла цена, и только потом — где чья
-             ликвидность. Высота небольшая, чтобы на телефоне оба помещались
-             в один экран без прокрутки. -->
-        <div class="row" style="justify-content:space-between;align-items:center;margin-top:10px">
-          <span class="hint" id="px-title">цена за час</span>
-          <span class="row" id="px-frames" style="gap:4px"></span>
-        </div>
-        <canvas id="pxchart" height="132" style="width:100%;margin-top:6px;
-          border-radius:7px;background:var(--inset);display:block"></canvas>
-        <div class="hint" style="margin-top:4px">ЛИКВИДНОСТЬ У ЦЕНЫ</div>
-        <canvas id="chart" height="150" style="width:100%;margin-top:4px;
+        <canvas id="chart" height="150" style="width:100%;margin-top:12px;
           border-radius:7px;background:var(--inset);display:block"></canvas>
         <div class="row" style="justify-content:space-between;margin-top:6px;align-items:center">
           <button id="z-out" title="отдалить — видно ликвидность выше и ниже диапазона"
@@ -259,9 +248,9 @@
      страницу со старым кодом и справедливо писал, что ничего не изменилось.
      Меняется номер — меняется адрес, и браузер обязан скачать заново.
      ПРИ КАЖДОЙ ПРАВКЕ js ЭТОТ НОМЕР И VERSION В ui.js МЕНЯЮТСЯ ВМЕСТЕ. -->
-<script src="src/keccak.js?v=5.3"></script>
-<script src="src/core.js?v=5.3"></script>
-<script src="src/wallet.js?v=5.3"></script>
-<script src="src/ui.js?v=5.3"></script>
+<script src="src/keccak.js?v=5.2.1"></script>
+<script src="src/core.js?v=5.2.1"></script>
+<script src="src/wallet.js?v=5.2.1"></script>
+<script src="src/ui.js?v=5.2.1"></script>
 </body>
 </html>
