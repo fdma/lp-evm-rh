@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '6.1.0';
+  const VERSION = '6.1.1';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -2150,7 +2150,11 @@
           raw[idx] += BigInt(l.data || '0x0');
         }
       }
-      return { back0: back[0], back1: back[1], nativeUnknown,
+      // Газ этой транзакции. Без него «итог» — не итог, а полуправда: на
+      // мелких позициях комиссия сети сопоставима с прибылью.
+      const gasWei = BigInt(rc.gasUsed || 0) *
+                     BigInt(rc.effectiveGasPrice || rc.gasPrice || 0);
+      return { back0: back[0], back1: back[1], nativeUnknown, gasWei,
                raw0: raw[0], raw1: raw[1], dec0: decs[0], dec1: decs[1] };
     }
     return { timeout: true };
@@ -2181,7 +2185,7 @@
           `${back1.toFixed(4)} = ${got.toFixed(4)} ${symQuote}. ` +
           `Всего вынуто из позиции: ${takenOut.toFixed(4)} ${symQuote} — ` +
           `итог считаю с учётом этого.`, 'ok');
-      await autoSellAfter(r, key, mode);
+      await autoSellAfter(r, key, mode, { tokenId, rec: ledger.get(String(tokenId)) });
       return;
     }
   }
@@ -2232,7 +2236,7 @@
         line += ' | вход не записан, итог посчитать не с чем';
       }
       log(line, rec && rec.amountIn != null && got >= rec.amountIn ? 'ok' : 'warn');
-      await autoSellAfter(r, key, 'all');
+      await autoSellAfter(r, key, 'all', { tokenId, rec });
       return;
     }
   }
@@ -2768,6 +2772,96 @@
     return 'timeout';
   }
 
+  // Сколько монеты пришло НАМ в этой транзакции. Читаем по квитанции, а не по
+  // обещанию маршрута: обещание — это до исполнения, а итог считают по факту.
+  async function receivedIn(hash, token) {
+    try {
+      const rc = await state.rpc('eth_getTransactionReceipt', [hash]);
+      if (!rc) return null;
+      const me = state.account.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+      let sum = 0n;
+      for (const l of (rc.logs || [])) {
+        if ((l.address || '').toLowerCase() !== token.toLowerCase()) continue;
+        if ((l.topics || [])[0] !== TRANSFER_TOPIC) continue;
+        if (((l.topics || [])[2] || '').toLowerCase().slice(-64) !== me) continue;
+        sum += BigInt(l.data || '0x0');
+      }
+      const gas = BigInt(rc.gasUsed || 0) * BigInt(rc.effectiveGasPrice || rc.gasPrice || 0);
+      return { amount: sum, gasWei: gas };
+    } catch (e) { return null; }
+  }
+
+  // ЦЕНА НАТИВНОЙ МОНЕТЫ В СТЕЙБЛЕ — чтобы газ можно было назвать в деньгах.
+  //
+  // Берём из пула нативная/стейбл. Журналом такой пул не найти (у стейбла их
+  // слишком много), поэтому ключ вычисляется и пул спрашивается напрямую — то
+  // же, чем пользуется свой маршрутизатор.
+  const nativePriceCache = new Map();
+  async function nativePriceIn(stable, decStable) {
+    const k = (stable || '').toLowerCase();
+    if (nativePriceCache.has(k)) return nativePriceCache.get(k);
+    let price = null;
+    try {
+      const NATIVE = '0x' + '0'.repeat(40);
+      const hub = await C.findPoolsByKey(state.rpc, NATIVE, stable, window.keccak256);
+      const best = hub.slice().sort((a, b) => a.fee - b.fee)[0];
+      if (best) {
+        const s0 = await C.readSlot0(state.rpc, best.poolId);
+        // Нативная монета всегда currency0: нулевой адрес меньше любого другого.
+        price = Math.pow(1.0001, s0.tick) * Math.pow(10, 18 - decStable);
+      }
+    } catch (e) { price = null; }
+    if (price) nativePriceCache.set(k, price);
+    return price;
+  }
+
+  // ЧЕСТНЫЙ ИТОГ ПОЗИЦИИ — после того, как монета ПРОДАНА.
+  //
+  // Строка «ИТОГ» при закрытии считает монету по цене пула. Это оценка: пока
+  // монета не продана, она стоит столько, за сколько её возьмут, а не столько,
+  // сколько показывает тик. Разница на мелком пуле доходила до 8.5%.
+  //
+  // Здесь же складывается то, что произошло на самом деле:
+  //   стейбл, вернувшийся из позиции
+  // + стейбл, вырученный за монету (по квитанции продажи)
+  // − газ всех трёх шагов (закрытие, разрешение, продажа)
+  // − то, что вносили
+  async function reportPnl({ d, ctx, saleHash, gasWei }) {
+    const rec = ctx.rec;
+    const decStable = d.intoDec;
+    if (!rec || rec.amountIn == null || decStable == null) return;
+
+    const sale = await receivedIn(saleHash, d.into);
+    if (!sale) { log('автопродажа: квитанцию продажи прочитать не смог, итог не считаю', 'dim'); return; }
+
+    const stableRawFromClose = (d.side === 0) ? ctx.raw1 : ctx.raw0;
+    const fromClose = Number(stableRawFromClose || 0n) / Math.pow(10, decStable);
+    const fromSale = Number(sale.amount) / Math.pow(10, decStable);
+    const totalGasWei = BigInt(gasWei || 0n) + BigInt(sale.gasWei || 0n);
+
+    const px = await nativePriceIn(d.into, decStable);
+    const gasCost = px ? (Number(totalGasWei) / 1e18) * px : null;
+
+    const got = fromClose + fromSale;
+    const net = gasCost == null ? got : got - gasCost;
+    const pnl = net - rec.amountIn;
+    const pct = rec.amountIn > 0 ? pnl / rec.amountIn * 100 : 0;
+
+    log(`ИТОГ ПО ФАКТУ ${ctx.tokenId}: из позиции ${fromClose.toFixed(6)} + ` +
+        `за монету ${fromSale.toFixed(6)} = ${got.toFixed(6)} ${d.intoSym}` +
+        (gasCost == null ? ' (газ посчитать не смог)'
+                         : ` − газ ${gasCost.toFixed(6)} = ${net.toFixed(6)}`) +
+        ` | вносил ${rec.amountIn.toFixed(6)} → ${pnl >= 0 ? '+' : ''}${pnl.toFixed(6)} ` +
+        `(${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)`,
+        pnl >= 0 ? 'ok' : 'bad');
+
+    // Переписываем итог в журнале сделок: там лежала оценка по цене пула.
+    try {
+      ledger.put(String(ctx.tokenId), { got: net, pnl, soldFor: fromSale, gasCost });
+      showCard(String(ctx.tokenId), { ...(ledger.get(String(ctx.tokenId)) || {}) });
+    } catch (e) { /* карточка не критична */ }
+  }
+
   // ИСПОЛНЕНИЕ.
   //
   // Порядок шагов выстрадан живой продажей, где сеть отклонила три попытки
@@ -2791,6 +2885,10 @@
     try {
       log('автопродажа: ' + d.why);
 
+      // Газ копим со всех шагов: закрытие уже случилось, дальше могут
+      // добавиться разрешение и сама продажа. Без этого «итог» — полуправда.
+      let gasWei = BigInt(ctx.closeGasWei || 0n);
+
       // Адрес роутера узнаём ДО котировки — разрешение выдаём первым.
       const router = await AS.routerFor(chain, d.addr, d.into, d.raw);
 
@@ -2804,6 +2902,11 @@
           const ap = C.buildApproveTo(d.addr, router, MAX);
           const ah = await W.send({ from: state.account, to: ap.to, data: ap.data });
           const st = await waitMined(ah);
+          try {
+            const arc = await state.rpc('eth_getTransactionReceipt', [ah]);
+            if (arc) gasWei += BigInt(arc.gasUsed || 0) *
+                               BigInt(arc.effectiveGasPrice || arc.gasPrice || 0);
+          } catch (e) { /* без газа разрешения итог чуть оптимистичнее */ }
           if (st !== 'ok') {
             log(`автопродажа: разрешение ${st === 'failed' ? 'отклонено сетью' :
                  'не подтвердилось вовремя'} — продажу не отправляю`, 'bad');
@@ -2869,7 +2972,13 @@
         log('автопродажа: продажа отправлена ' + hash, 'ok');
 
         const r = await waitMined(hash);
-        if (r === 'ok') { log(`АВТОПРОДАЖА ПРОШЛА: ${d.sym} → ${d.intoSym}`, 'ok'); return; }
+        if (r === 'ok') {
+          log(`АВТОПРОДАЖА ПРОШЛА: ${d.sym} → ${d.intoSym}`, 'ok');
+          // Итог считаем ПО ФАКТУ: строка при закрытии оценивала монету по
+          // цене пула, а теперь известно, за сколько её реально взяли.
+          await reportPnl({ d, ctx, saleHash: hash, gasWei });
+          return;
+        }
         if (r === 'timeout') {
           log('автопродажа: подтверждения не дождался, проверь кошелёк', 'warn');
           return;
@@ -2895,7 +3004,7 @@
   // Цену пула здесь НЕ считаем: она нужна только предохранителю по убытку, а
   // он берёт её от ТОГО пула, через который пойдёт сделка. Какой это пул, до
   // перебора неизвестно.
-  async function autoSellAfter(r, key, mode) {
+  async function autoSellAfter(r, key, mode, extra = {}) {
     if (!AS.settings.on) return;
     try {
       const sym0 = await tokenSymbol(key.currency0);
@@ -2904,6 +3013,10 @@
         mode, sym0, sym1,
         addr0: key.currency0, addr1: key.currency1,
         raw0: r.raw0, raw1: r.raw1, dec0: r.dec0, dec1: r.dec1,
+        // Для честного итога: что внесли, что уже вернулось стейблом и
+        // сколько стоило само закрытие.
+        tokenId: extra.tokenId, rec: extra.rec,
+        closeGasWei: r.gasWei || 0n,
         // Пул, из которого вышли. Он и есть точка отсчёта для предохранителя:
         // по его цене терминал показывал стоимость позиции.
         homePool: poolIdOf(key),
