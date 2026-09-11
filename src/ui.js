@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '6.2.1';
+  const VERSION = '6.3.0';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -62,6 +62,9 @@
     pool: null, slot0: null, slot0At: 0,
     amount: 2, side: 'down', intent: 'buy', width: 30, gap: 5,
     decimals: {}, pools: [], busy: false, profile: null, profileAt: 0,
+    // В чём набирается своё число при входе монетой: 'coin' — в штуках,
+    // 'quote' — в деньгах. Наружу всегда отдаются штуки.
+    amtUnit: 'coin',
   };
 
   // ── журнал ──────────────────────────────────────────────────────────────
@@ -90,6 +93,7 @@
   const save = () => localStorage.setItem(KEY, JSON.stringify({
     rpcUrl: state.rpcUrl, amount: state.amount, side: state.side,
     width: state.width, gap: state.gap, intent: state.intent, pool: $('pool').value,
+    amtUnit: state.amtUnit,
     pools: state.pools,
   }));
 
@@ -100,6 +104,7 @@
       if (s.pool) $('pool').value = s.pool;
       if (s.amount) state.amount = s.amount;
       if (s.intent) state.intent = s.intent;
+      if (s.amtUnit === 'coin' || s.amtUnit === 'quote') state.amtUnit = s.amtUnit;
       if (s.width) state.width = s.width;
       if (s.gap) state.gap = s.gap;
       if (Array.isArray(s.pools)) state.pools = s.pools;
@@ -659,30 +664,134 @@
     } catch (e) { return '?'; }
   }
 
+  // ── ЦЕНА ПРИХОДИТ САМА, А НЕ ВЫПРАШИВАЕТСЯ ──────────────────────────────
+  //
+  // Опрос четыре раза в секунду — это четыре запроса в секунду ради ответа
+  // «ничего не изменилось». Цена в пуле меняется только при обмене, и обмен —
+  // это событие: узел умеет присылать его сам, как только оно попало в блок.
+  //
+  // Подписка идёт по тому же адресу узла, но по wss вместо https. Проверено на
+  // узле автора: рукопожатие отвечает 101 Switching Protocols, то есть
+  // подписка доступна на том же ключе.
+  //
+  // Опрос при этом НЕ убирается, а замедляется до раза в три секунды и
+  // остаётся страховкой: вебсокет может не подняться (публичный узел его часто
+  // не даёт), молча оборваться или отстать. Живая цена важнее экономии
+  // запросов, поэтому подстраховка тут дешевле доверия.
+  let feed = null, feedTimer = null;
+
+  function stopPriceFeed() {
+    if (feedTimer) { clearTimeout(feedTimer); feedTimer = null; }
+    if (feed) { try { feed.onclose = null; feed.close(); } catch (e) { } feed = null; }
+  }
+
+  // Адрес подписки из адреса узла. Только https: у http и у пустого поля
+  // подписки не бывает, и притворяться тут нечем.
+  function wsUrlFor(httpUrl) {
+    if (!httpUrl || !/^https:\/\//i.test(httpUrl)) return null;
+    return httpUrl.replace(/^https:/i, 'wss:');
+  }
+
+  function startPriceFeed(onPrice) {
+    stopPriceFeed();
+    const url = wsUrlFor(state.rpcUrl);
+    if (!url || typeof WebSocket === 'undefined' || !state.pool) return;
+
+    let tries = 0;
+    const open = () => {
+      let ws;
+      try { ws = new WebSocket(url); } catch (e) { return; }
+      feed = ws;
+
+      ws.onopen = () => {
+        tries = 0;
+        // Событие обмена ИМЕННО ЭТОГО пула: второй топик — его идентификатор.
+        // Без него посыпались бы все обмены сети, а их тысячи.
+        ws.send(JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'eth_subscribe',
+          params: ['logs', { address: C.RH.poolManager,
+                             topics: [C.SWAP_TOPIC, state.pool.poolId] }],
+        }));
+      };
+
+      ws.onmessage = (ev) => {
+        let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+        const l = m && m.params && m.params.result;
+        if (!l || !l.data) return;
+        try {
+          const w = C.words(l.data);
+          // Раскладка слов та же, что читает ядро из журнала обменов:
+          // 0 amount0, 1 amount1, 2 sqrtPriceX96, 3 liquidity, 4 tick.
+          // Тик — int24, РАСШИРЕННЫЙ знаком до 256 бит: при ширине 24
+          // отрицательный тик превращается в 1.16e+77 и цена не считается.
+          onPrice({ sqrtPriceX96: BigInt('0x' + w[2]),
+                    tick: Number(C.toSigned(BigInt('0x' + w[4]), 256)) }, true);
+        } catch (e) { /* чужое сообщение — не наше дело */ }
+      };
+
+      const again = () => {
+        if (feed !== ws) return;              // уже переподключились или ушли
+        feed = null;
+        // Подписка рвётся сама по себе: узлы закрывают простаивающие
+        // соединения. Возвращаемся, но с нарастающей паузой — долбить узел
+        // в цикле хуже, чем минуту пожить на опросе.
+        const wait = Math.min(30000, 1000 * Math.pow(2, tries++));
+        feedTimer = setTimeout(open, wait);
+      };
+      ws.onclose = again;
+      ws.onerror = () => { try { ws.close(); } catch (e) { } };
+    };
+    open();
+  }
+
   // ── цена держится свежей ────────────────────────────────────────────────
   let pump = null;
   function startPricePump() {
     if (pump) clearInterval(pump);
+    let feedAt = 0;                       // когда подписка в последний раз ожила
+
+    const apply = (s, fromFeed) => {
+      state.slot0 = s; state.slot0At = Date.now();
+      if (fromFeed) feedAt = Date.now();
+      const live = Date.now() - feedAt < 30000;
+      $('d-price').className = 'dot on';
+      $('s-price').textContent = live ? 'цена живая (подписка)' : 'цена живая';
+      showPrice();
+      recalc();
+    };
+
     const tick = async () => {
       if (!state.pool || !state.rpc) return;
       try {
-        const s = await C.readSlot0(state.rpc, state.pool.poolId);
-        state.slot0 = s; state.slot0At = Date.now();
-        $('d-price').className = 'dot on';
-        $('s-price').textContent = 'цена живая';
-        showPrice();
-        recalc();
+        apply(await C.readSlot0(state.rpc, state.pool.poolId), false);
       } catch (e) {
         $('d-price').className = 'dot bad';
         $('s-price').textContent = 'цена не читается';
       }
     };
     tick();
-    // Пока идёт отправка, насос молчит. Четыре запроса цены в секунду на том же
-    // узле, где в этот момент считается котировка, — это конкуренция за лимит
-    // узла, а отказ по лимиту стоит 700–1400 мс на пути, где устаревание цены
-    // и есть причина отказов сделки.
-    pump = setInterval(() => { if (!state.busy) tick(); }, 250);
+
+    // Подписка на обмены этого пула: цена меняется в тот же миг, когда обмен
+    // попал в блок, и без единого запроса.
+    startPriceFeed((s) => apply(s, true));
+
+    // Опрос остаётся, но при живой подписке замедляется до раза в три секунды.
+    // Он ловит то, чего подписка не видит: обрыв соединения, отставание узла и
+    // пулы, где обменов давно не было.
+    //
+    // Пока идёт отправка, насос молчит вовсе: четыре запроса цены в секунду на
+    // том же узле, где в этот момент считается котировка, — это конкуренция за
+    // лимит узла, а отказ по лимиту стоит 700–1400 мс на пути, где устаревание
+    // цены и есть причина отказов сделки.
+    let last = 0;
+    pump = setInterval(() => {
+      if (state.busy) return;
+      const live = Date.now() - feedAt < 30000;
+      const every = live ? 3000 : 250;
+      if (Date.now() - last < every) return;
+      last = Date.now();
+      tick();
+    }, 250);
   }
 
   // Сырая цена пула: сколько currency1 за один currency0.
@@ -1528,7 +1637,9 @@
   function amtRow() {
     const sell = state.intent === 'sell';
     const sym = depBal ? depBal.sym : (sell ? 'монета' : quoteSym());
-    $('l-amt').textContent = sell ? `сколько монеты продаём, ${sym}` : `сумма, ${sym}`;
+    $('l-amt').textContent = sell
+      ? `сколько вносим, ${state.amtUnit === 'quote' ? quoteSym() : sym}`
+      : `сумма, ${sym}`;
     if (!sell) {
       // Суммы под реальную работу: прежние 1/2/5/10 остались от проверок на
       // живых деньгах, когда важно было рисковать двумя долларами. Автор
@@ -1569,18 +1680,59 @@
       };
       host.appendChild(b);
     }
+    // В ЧЁМ СЧИТАТЬ СВОЁ ЧИСЛО: В МОНЕТАХ ИЛИ В ДЕНЬГАХ.
+    //
+    // Поле здесь всегда было в штуках монеты — это честно (вносим-то монету),
+    // но думают о позиции не так. «Тридцать» почти всегда означает тридцать
+    // долларов, а не тридцать штук, и у монеты по три копейки разница между
+    // этими тридцатью — тысячекратная.
+    //
+    // Наружу переключатель ничего не меняет: state.amount остаётся В МОНЕТАХ,
+    // деньги переводятся в них здесь же. Весь расчёт ниже не знает об этом
+    // вовсе — и правится ровно одно место, а не пять.
+    const price = state.slot0 ? priceOf(state.slot0.tick) : 0;
+    const units = document.createElement('span');
+    units.className = 'chains';
+    for (const [k, t] of [['coin', sym], ['quote', quoteSym()]]) {
+      const b = document.createElement('button');
+      b.textContent = t;
+      if (state.amtUnit === k) b.className = 'on';
+      // Без цены пула перевести деньги в монеты нечем — и врать, что можно,
+      // нельзя: человек введёт 30 и получит 30 штук вместо тридцати долларов.
+      b.disabled = (k === 'quote' && !price);
+      b.onclick = () => { state.amtUnit = k; amtRow(); save(); };
+      units.appendChild(b);
+    }
+    host.appendChild(units);
+
+    const inQuote = state.amtUnit === 'quote' && price > 0;
     const own = document.createElement('input');
-    own.type = 'text'; own.className = 'own'; own.placeholder = 'своё';
-    own.value = state.amount ? String(state.amount) : '';
+    own.type = 'text'; own.className = 'own';
+    own.placeholder = inQuote ? 'своё, ' + quoteSym() : 'своё';
+    own.value = state.amount
+      ? String(inQuote ? +(state.amount * price).toFixed(6) : state.amount)
+      : '';
     own.onchange = () => {
       const v = parseFloat(String(own.value).replace(',', '.'));
       if (!isFinite(v) || v <= 0) { own.style.borderColor = 'var(--bad)'; return; }
       own.style.borderColor = '';
       // Ввели руками — точное значение доли больше не относится к делу.
-      state.amount = v; state.amountRaw = null; state.amountRawToken = null;
-      recalc(); save();
+      state.amount = inQuote ? v / price : v;
+      state.amountRaw = null; state.amountRawToken = null;
+      amtRow(); recalc(); save();
     };
     host.appendChild(own);
+
+    // Что это в другой единице — чтобы не считать в уме и не промахнуться
+    // на порядок.
+    if (price > 0 && state.amount) {
+      const other = inQuote
+        ? `${fmtNum(state.amount)} ${sym}`
+        : `${fmtNum(state.amount * price)} ${quoteSym()}`;
+      $('bal').innerHTML = (depBal
+        ? `на кошельке <b class="num">${fmtNum(depBal.human)}</b> ${esc(sym)} · `
+        : '') + `вносим <b class="num">${esc(other)}</b>`;
+    }
   }
 
   // ── позиции ─────────────────────────────────────────────────────────────
