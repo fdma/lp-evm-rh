@@ -108,3 +108,82 @@ test('узел без поддержки пачек — работаем по о
   const стало = n.calls.length - было;
   assert.strictEqual(стало, 2, 'второй раз пачкой уже не пробуем');
 });
+
+// ── НОМЕРА ОТВЕТОВ НЕ БЕРУТСЯ НА ВЕРУ ───────────────────────────────────────
+//
+// Самая тихая из возможных поломок: вызов молча получает результат ЧУЖОГО
+// вызова. В списке позиций это строка с чужим пулом, чужими границами и
+// кнопкой «Закрыть», привязанной не к той позиции. Ничего не падает.
+//
+// Узел или прокси вправе перенумеровать номера — балансировщики, объединяющие
+// пачки, так и делают. Поэтому ответ принимается, только если он пришёл ровно
+// один раз и ровно на наш номер; любое расхождение — шлём по одному.
+
+// Узел, который портит номера заданным образом.
+function brokenIds(mangle) {
+  const calls = [];
+  const f = async (url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push(Array.isArray(body) ? body.length : 1);
+    const answer = (r) => ({ jsonrpc: '2.0', id: r.id, result: '0x' + String(r.params[0]) });
+    if (Array.isArray(body)) return { json: async () => mangle(body.map(answer)) };
+    return { json: async () => answer(body) };
+  };
+  return { f, calls };
+}
+
+test('узел вернул одинаковые номера — результаты не раздаются наугад', async () => {
+  // Демонстрация из разбора: все ответы с id 0. Раньше три вызова получали
+  // ["0xc","0xb","0xc"] — первый забирал результат третьего.
+  const n = brokenIds(arr => arr.map(r => ({ ...r, id: 0 })));
+  const rpc = C.makeRpc('http://x', n.f);
+  const r = await Promise.all([1, 2, 3].map(i => rpc('eth_call', [i])));
+  assert.deepStrictEqual(r, ['0x1', '0x2', '0x3'],
+    'каждый обязан получить СВОЙ результат, пусть и ценой отдельных запросов');
+});
+
+test('узел перенумеровал ответы — тоже не раздаём наугад', async () => {
+  // Так ведёт себя прокси, объединяющий пачки: сдвиг номеров на единицу.
+  const n = brokenIds(arr => arr.map(r => ({ ...r, id: r.id + 1 })));
+  const rpc = C.makeRpc('http://x', n.f);
+  const r = await Promise.all([1, 2, 3].map(i => rpc('eth_call', [i])));
+  assert.deepStrictEqual(r, ['0x1', '0x2', '0x3']);
+});
+
+test('номер строкой понимается, а не считается расхождением', async () => {
+  // Иначе каждый вызов уходил бы вторым запросом — вечно, и пачка стоила бы
+  // дороже её отсутствия.
+  const n = brokenIds(arr => arr.map(r => ({ ...r, id: String(r.id) })));
+  const rpc = C.makeRpc('http://x', n.f);
+  const r = await Promise.all([1, 2, 3].map(i => rpc('eth_call', [i])));
+  assert.deepStrictEqual(r, ['0x1', '0x2', '0x3']);
+  assert.strictEqual(n.calls.length, 1, 'должно хватить одной пачки');
+});
+
+test('ответов пришло меньше, чем спрашивали — никого не теряем', async () => {
+  const n = brokenIds(arr => arr.slice(0, 2));
+  const rpc = C.makeRpc('http://x', n.f);
+  const r = await Promise.all([1, 2, 3].map(i => rpc('eth_call', [i])));
+  assert.deepStrictEqual(r, ['0x1', '0x2', '0x3']);
+});
+
+test('сетевой сбой пачку не отключает', async () => {
+  // Обрыв — случайность, а не отсутствие возможности. Если отключать пачку на
+  // первом же 429, один сбой удваивал бы цену каждого прохода до конца сессии.
+  let first = true;
+  const calls = [];
+  const f = async (url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push(Array.isArray(body) ? body.length : 1);
+    if (Array.isArray(body) && first) { first = false; throw new Error('сеть отвалилась'); }
+    const answer = (r) => ({ jsonrpc: '2.0', id: r.id, result: '0x' + String(r.params[0]) });
+    if (Array.isArray(body)) return { json: async () => body.map(answer) };
+    return { json: async () => answer(body) };
+  };
+  const rpc = C.makeRpc('http://x', f);
+  await Promise.all([1, 2].map(i => rpc('eth_call', [i])));   // пачка упала, ушли по одному
+  const было = calls.length;
+  const r = await Promise.all([3, 4].map(i => rpc('eth_call', [i])));
+  assert.deepStrictEqual(r, ['0x3', '0x4']);
+  assert.strictEqual(calls.length - было, 1, 'вторая волна снова пачкой');
+});

@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '6.6.0';
+  const VERSION = '6.7.0';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -705,15 +705,37 @@
     for (const s of ws.subs.values()) s.id = null;
   }
 
+  // Отписаться по идентификатору, не заглядывая в карту. Нужно и для чужих
+  // подписок — тех, что вернулись ответом уже после замены.
+  function wsUnsubById(subId) {
+    if (!subId || !ws.open) return;
+    try {
+      ws.sock.send(JSON.stringify({ jsonrpc: '2.0', id: 'un', 
+                                    method: 'eth_unsubscribe', params: [subId] }));
+    } catch (e) { }
+  }
+
   function wsSend(key) {
     const s = ws.subs.get(key);
     if (!s || !ws.open) return;
-    // Номер запроса = ключ подписки: по ответу сразу видно, чей он.
-    ws.sock.send(JSON.stringify({ jsonrpc: '2.0', id: 'sub:' + key,
+    // В номер запроса кладём и ПОКОЛЕНИЕ подписки.
+    //
+    // Без него так: сменили пул, старая подписка ещё не получила ответ, новая
+    // уже заказана. Ответ на СТАРУЮ приходит и достаётся новой — и в цену
+    // начинают приходить обмены прошлого пула. state.slot0 берёт чужую цену,
+    // значок пишет «цена живая (подписка)», а recalc планирует диапазон входа
+    // по ней. Заодно старая подписка остаётся жить на узле навсегда: снять её
+    // было нечем, идентификатор ушёл не туда.
+    ws.sock.send(JSON.stringify({ jsonrpc: '2.0', id: `sub:${key}:${s.gen}`,
                                   method: 'eth_subscribe', params: s.params }));
   }
 
   function wsOpen() {
+    // Гасим отложенное переподключение. Без этого так: соединение оборвалось,
+    // назначен возврат через паузу; человек в это время загрузил пул, и
+    // wsSubscribe открыл сокет сам. Потом срабатывал таймер и открывал ВТОРОЙ.
+    // Первый оставался без подписок и без владельца — закрыть его было некому.
+    if (ws.timer) { clearTimeout(ws.timer); ws.timer = null; }
     const url = wsUrlFor(state.rpcUrl);
     if (!url || typeof WebSocket === 'undefined') return;
     let sock;
@@ -729,8 +751,16 @@
     sock.onmessage = (ev) => {
       let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
       if (typeof m.id === 'string' && m.id.startsWith('sub:')) {
-        const s = ws.subs.get(m.id.slice(4));
-        if (s) s.id = m.result || null;
+        const at = m.id.lastIndexOf(':');
+        const key = m.id.slice(4, at), gen = Number(m.id.slice(at + 1));
+        const s = ws.subs.get(key);
+        if (s && s.gen === gen) { s.id = m.result || null; }
+        else if (m.result) {
+          // Ответ на подписку, которую уже сменили. Присвоить его нынешней
+          // нельзя — это чужой поток. Снимаем сразу, иначе он будет идти в
+          // никуда до конца соединения.
+          wsUnsubById(m.result);
+        }
         return;
       }
       const p = m.params;
@@ -755,12 +785,8 @@
 
   // Отписаться на стороне узла. Без этого подписка живёт и шлёт события,
   // которых уже никто не ждёт.
-  function wsDrop(sub, key) {
-    if (!sub || !sub.id || !ws.open) return;
-    try {
-      ws.sock.send(JSON.stringify({ jsonrpc: '2.0', id: 'un:' + key,
-                                    method: 'eth_unsubscribe', params: [sub.id] }));
-    } catch (e) { }
+  function wsDrop(sub) {
+    if (sub) wsUnsubById(sub.id);
   }
 
   // Оформить подписку. Возвращает отписку.
@@ -769,14 +795,15 @@
   // узле оставалась бы ещё одна живая подписка на обмены прошлого пула: в
   // карте её затирает новая, и события приходят в никуда, но узел их всё
   // равно шлёт. За вечер переключений это десятки мёртвых потоков.
+  let wsGen = 0;
   function wsSubscribe(key, params, handler) {
-    wsDrop(ws.subs.get(key), key);
-    ws.subs.set(key, { params, handler, id: null });
+    wsDrop(ws.subs.get(key));
+    ws.subs.set(key, { params, handler, id: null, gen: ++wsGen });
     if (!ws.sock) wsOpen(); else wsSend(key);
     return () => {
       const s = ws.subs.get(key);
       ws.subs.delete(key);
-      wsDrop(s, key);
+      wsDrop(s);
       if (!ws.subs.size) wsStop();
     };
   }
@@ -793,10 +820,20 @@
   // Сама квитанция всё равно нужна — в ней статус и газ, — но запрашивается
   // она ОДИН раз и ровно тогда, когда уже точно есть.
   const txWaiters = new Map();            // хэш -> [resolve]
-  let unwatchTransfers = null;
+  let unwatchTransfers = null, watchedAccount = null;
 
   function watchMyTransfers() {
-    if (unwatchTransfers || !state.account) return;
+    if (!state.account) return;
+    // ПЕРЕОФОРМЛЯЕМ ПРИ СМЕНЕ КОШЕЛЬКА.
+    //
+    // Раньше условие было «уже подписаны — выходим», и подписка навсегда
+    // оставалась на ПЕРВОМ адресе. Сменил кошелёк в Rabby, нажал «Подключить» —
+    // и закрытия нового адреса подписка уже не видит: ожидание квитанции молча
+    // возвращается к полному циклу пауз, то есть выход становится медленнее,
+    // чем был до появления подписки, и понять это по экрану нельзя.
+    if (unwatchTransfers && watchedAccount === state.account.toLowerCase()) return;
+    if (unwatchTransfers) { try { unwatchTransfers(); } catch (e) { } unwatchTransfers = null; }
+    watchedAccount = state.account.toLowerCase();
     const me = '0x' + state.account.toLowerCase().replace(/^0x/, '').padStart(64, '0');
     unwatchTransfers = wsSubscribe('mytransfers',
       ['logs', { topics: [TRANSFER_TOPIC, null, me] }],
@@ -1427,7 +1464,16 @@
     const need = amountRaw();
     const now = Math.floor(Date.now() / 1000);
     const plan = await C.planApprovals(state.rpc, token, state.account, need, 1800, now);
-    if (!plan.steps.length) { log('разрешений уже хватает, можно входить', 'ok'); return; }
+    if (!plan.steps.length) {
+      log('разрешений для входа уже хватает', 'ok');
+      // А вот разрешение на ПРОДАЖУ может быть не выдано: оно своё у каждой
+      // монеты, а разрешения входа живут полчаса и покрывают любой пул с тем
+      // же стейблом. Раньше отсюда просто выходили — и на второй монете подряд
+      // окно всё равно выскакивало посреди выхода, ровно то, что эта правка
+      // должна была убрать.
+      await armAutosell();
+      return;
+    }
     for (const s of plan.steps) {
       log('прошу подпись: ' + s.what + ' на ' + state.amount);
       try {
@@ -1452,15 +1498,27 @@
   // стоит. Если автопродажа выключена — не просим вовсе.
   async function armAutosell() {
     if (!AS.settings.on || !C.RH.kyberRouter || !state.pool) return;
-    const st = stableSide();
-    if (st === null) return;                    // без стейбла продавать нечего
-    const coin = st === 0 ? state.pool.currency1 : state.pool.currency0;
+
+    // Пул фиксируем СЕЙЧАС и дальше пользуемся снимком: между этой строкой и
+    // подписью стоит окно кошелька, и пул за это время могут сменить. Иначе
+    // разрешение уйдёт на монету другого пула, а тот, что ARMили, останется
+    // без него.
+    const pool = state.pool;
+
+    // Сторону выбираем ТЕМ ЖЕ правилом, что и продажа (coinSide), а не
+    // stableSide. Разница видна на паре, где стейблы обе: stableSide вернёт
+    // первую попавшуюся и назовёт монетой вторую, а продажа такую пару
+    // отвергает вовсе. Получалось безлимитное разрешение на токен, который
+    // терминал никогда не собирался тратить, плюс необъяснимое окно кошелька.
+    const side = AS.coinSide(pool.sym0, pool.sym1);
+    if (side === null) return;
+    const coin = side === 0 ? pool.currency0 : pool.currency1;
     if (isNative(coin)) return;                 // у нативной монеты нет approve
     try {
       const have = await C.readErc20Allowance(state.rpc, coin, state.account,
                                               C.RH.kyberRouter);
       if (have > 0n) return;                    // уже выдано, молчим
-      const sym = st === 0 ? state.pool.sym1 : state.pool.sym0;
+      const sym = side === 0 ? pool.sym0 : pool.sym1;
       log(`прошу подпись: разрешение на продажу ${sym} (один раз, чтобы выход ` +
           `потом шёл без окна)`);
       const ap = C.buildApproveTo(coin, C.RH.kyberRouter, (1n << 256n) - 1n);
@@ -2059,12 +2117,21 @@
           C.readSlot0(state.rpc, e.poolId).catch(() => null),
           C.readFees(state.rpc, e.poolId, id, e.t.tickLower, e.t.tickUpper,
                      window.keccak256).catch(() => null),
-          tokenDecimals(e.info.key.currency0).catch(() => 18),
-          tokenDecimals(e.info.key.currency1).catch(() => 18),
+          // РАЗРЯДНОСТЬ НЕ УГАДЫВАЕМ — правило из tokenDecimals, и здесь оно
+          // тем более в силе. Подставленная «восемнадцать» у USDG с её шестью
+          // знаками уводит цену в 10^12 раз, и на экране появляется вполне
+          // правдоподобная цифра стоимости позиции — та самая, по которой
+          // решают, выходить ли. Не знаем — говорим «не знаю».
+          tokenDecimals(e.info.key.currency0).catch(() => null),
+          tokenDecimals(e.info.key.currency1).catch(() => null),
           tokenSymbol(e.info.key.currency0),
           tokenSymbol(e.info.key.currency1),
         ]);
-        Object.assign(e, { s0, fees, d0, d1, sym0, sym1 });
+        // Без разрядности считать нечего. Гасим цену — ниже по коду это уже
+        // обработанный случай: состав и стоимость покажутся прочерком, а
+        // границы, пара и кнопки останутся на месте.
+        Object.assign(e, { s0: (d0 == null || d1 == null) ? null : s0,
+                           fees, d0, d1, sym0, sym1 });
       }));
       if (stale()) return;
     }

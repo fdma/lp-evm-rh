@@ -1153,6 +1153,28 @@ function makeRpc(url, fetchImpl) {
     'eth_getCode', 'eth_estimateGas',
   ]);
 
+  // СРОК ОЖИДАНИЯ. Без него зависшее соединение оставляет обещание
+  // неразрешённым навсегда: с пачкой это вешает не один вызов, а всю волну, а
+  // фоновое обновление позиций после такого не оживает до конца сессии — его
+  // защёлка posBusy остаётся поднятой.
+  //
+  // Двадцать секунд: eth_getLogs на глубоком окне бывает долгим, и обрубать
+  // его раньше значит ломать загрузку позиций там, где она просто медленная.
+  const TIMEOUT_MS = 20000;
+  const timeoutSignal = () => {
+    try {
+      if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
+        return AbortSignal.timeout(TIMEOUT_MS);
+      }
+      if (typeof AbortController !== 'undefined') {
+        const a = new AbortController();
+        setTimeout(() => a.abort(), TIMEOUT_MS);
+        return a.signal;
+      }
+    } catch (e) { /* среда без отмены — живём как жили */ }
+    return undefined;
+  };
+
   // Один вызов — один запрос. Прежнее поведение целиком, со всеми повторами.
   async function sendOne(method, params) {
     const tries = RETRYABLE.has(method) ? 3 : 1;
@@ -1163,6 +1185,7 @@ function makeRpc(url, fetchImpl) {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }),
+          signal: timeoutSignal(),
         });
         const d = await res.json();
         if (d.error) throw new Error(`${method}: ${d.error.message || 'ошибка узла'}`);
@@ -1217,27 +1240,76 @@ function makeRpc(url, fetchImpl) {
     sendBatch(batch);
   }
 
+  // Разослать по одному. Сюда уходит всё, чему пачка не подошла.
+  const oneByOne = (batch) => {
+    for (const c of batch) sendOne(c.method, c.params).then(c.resolve, c.reject);
+  };
+
   async function sendBatch(batch) {
-    const body = batch.map((c, i) => ({ jsonrpc: '2.0', id: i, method: c.method, params: c.params }));
+    // НОМЕРА УНИКАЛЬНЫ И СВЕРЯЮТСЯ, А НЕ БЕРУТСЯ НА ВЕРУ.
+    //
+    // Раньше номерами служили 0..n-1, а ответ раскладывался по ним без единой
+    // проверки. Узел или прокси вправе перенумеровать их — балансировщики,
+    // объединяющие пачки, так и делают, — и тогда один вызов МОЛЧА получает
+    // результат другого. В списке позиций это строка с чужим пулом, чужими
+    // границами и кнопкой «Закрыть», привязанной не к той позиции.
+    //
+    // Поэтому: номер у каждого вызова свой на весь срок жизни rpc, а ответ
+    // принимается, только если он пришёл ровно один раз и ровно на наш номер.
+    // Любое расхождение — пачке больше не верим, шлём по одному.
+    const pending = new Map();
+    const body = batch.map((c) => {
+      const n = ++id;
+      pending.set(n, c);
+      return { jsonrpc: '2.0', id: n, method: c.method, params: c.params };
+    });
+
     let arr = null;
     try {
       const res = await f(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
+        signal: timeoutSignal(),
       });
       const d = await res.json();
-      if (!Array.isArray(d)) throw new Error('узел ответил на пачку не массивом');
+      if (!Array.isArray(d)) {
+        // Узел пачек не понимает. Это свойство узла, а не случайность —
+        // больше не пробуем.
+        batchBroken = true;
+        oneByOne(batch);
+        return;
+      }
       arr = d;
     } catch (e) {
-      batchBroken = true;
-      for (const c of batch) sendOne(c.method, c.params).then(c.resolve, c.reject);
+      // Обрыв, таймаут, 429. Это случайность, а не отсутствие возможности:
+      // пачку НЕ отключаем, иначе один сетевой сбой убивал бы её до конца
+      // сессии и каждый следующий проход стоил бы вдвое дороже.
+      oneByOne(batch);
       return;
     }
-    const byId = new Map(arr.map(x => [x && x.id, x]));
-    for (let i = 0; i < batch.length; i++) {
-      const c = batch[i], r = byId.get(i);
-      if (!r) { sendOne(c.method, c.params).then(c.resolve, c.reject); continue; }
+
+    // Сверка: столько же ответов, каждый на свой номер, каждый ровно раз.
+    // Номер приводим к числу — узлы возвращают его и строкой.
+    const seen = new Set();
+    let bad = arr.length !== batch.length;
+    if (!bad) {
+      for (const r of arr) {
+        const n = r == null ? NaN : Number(r.id);
+        if (!Number.isFinite(n) || !pending.has(n) || seen.has(n)) { bad = true; break; }
+        seen.add(n);
+      }
+    }
+    if (bad) {
+      // Разложить такой ответ нельзя: мы не знаем, чей он. Отдать наугад —
+      // это молча подсунуть одному вызову результат другого.
+      batchBroken = true;
+      oneByOne(batch);
+      return;
+    }
+
+    for (const r of arr) {
+      const c = pending.get(Number(r.id));
       if (r.error) {
         const msg = `${c.method}: ${r.error.message || 'ошибка узла'}`;
         // Ошибка на отдельном вызове лечится так же, как раньше — повтором.
