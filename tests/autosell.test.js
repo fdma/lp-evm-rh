@@ -181,3 +181,55 @@ test('решение помечает, можно ли мерить порог �
   assert.strictEqual(bnb.sell, true);
   assert.strictEqual(bnb.usdQuote, false, 'выход в BNB — порог в долларах не применим');
 });
+
+// ── СВЕРКА АДРЕСА РОУТЕРА ───────────────────────────────────────────────────
+//
+// Транзакция уходит на router, и ему же выдано безлимитное разрешение на
+// монету. Раньше адрес брался прямо из ответа агрегатора — то есть чужой
+// сервер назначал получателя наших денег. Скомпрометированный или подменённый
+// по дороге сервис назвал бы свой адрес, кошелёк подписал бы ему безлимит, и
+// монету вывели бы когда угодно позже, уже без участия страницы.
+//
+// Теперь адрес закреплён в описании сети, а ответ с ним сверяется.
+test('чужой адрес роутера в ответе останавливает сделку', async () => {
+  const было = global.fetch;
+  const ЧУЖОЙ = '0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+  const НАШ   = '0x6131b5fae19ea4f9d964eac0408e4408b66337b5';
+  global.fetch = async () => ({
+    ok: true, status: 200,
+    text: async () => JSON.stringify({
+      code: 0,
+      data: { routeSummary: { amountOut: '1', amountInUsd: '1', amountOutUsd: '1', route: [] },
+              routerAddress: ЧУЖОЙ, data: '0xdeadbeef', amountOut: '1' },
+    }),
+  });
+  try {
+    await assert.rejects(
+      () => A.plan({ chain: 'robinhood', tokenIn: '0x1', tokenOut: '0x2',
+                     amountIn: 1n, sender: '0x3', slippageBps: 500,
+                     expectRouter: НАШ }),
+      /чужой роутер/,
+      'сделка обязана быть отвергнута');
+  } finally { global.fetch = было; }
+});
+
+test('свой адрес роутера проходит сверку', async () => {
+  const было = global.fetch;
+  const НАШ = '0x6131b5fae19ea4f9d964eac0408e4408b66337b5';
+  global.fetch = async () => ({
+    ok: true, status: 200,
+    text: async () => JSON.stringify({
+      code: 0,
+      data: { routeSummary: { amountOut: '7', amountInUsd: '1', amountOutUsd: '1', route: [] },
+              // Регистр у агрегатора свой — сверка не должна на нём спотыкаться.
+              routerAddress: НАШ.toUpperCase().replace('0X', '0x'),
+              data: '0xbeef', amountOut: '7' },
+    }),
+  });
+  try {
+    const p = await A.plan({ chain: 'robinhood', tokenIn: '0x1', tokenOut: '0x2',
+                             amountIn: 1n, sender: '0x3', slippageBps: 500,
+                             expectRouter: НАШ });
+    assert.strictEqual(p.amountOut, 7n);
+  } finally { global.fetch = было; }
+});

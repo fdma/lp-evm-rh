@@ -10,6 +10,10 @@
      проверка стоит одного запроса. -->
 <meta http-equiv="Cache-Control" content="no-cache, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
+<!-- Рукопожатие с агрегатором заводится заранее. Первый запрос маршрута
+     иначе платит за DNS, TCP и TLS — это 100-300 мс ровно в тот момент,
+     когда монета уже в кошельке и цена уходит. -->
+<link rel="preconnect" href="https://aggregator-api.kyberswap.com" crossorigin>
 <title>LP — Uniswap V4</title>
 <style>
   /* ЦВЕТА ВЗЯТЫ ИЗ СПРАВОЧНИКА, КОТОРЫЙ ПРИСЛАЛ АВТОР.
@@ -272,10 +276,10 @@
      страницу со старым кодом и справедливо писал, что ничего не изменилось.
      Меняется номер — меняется адрес, и браузер обязан скачать заново.
      ПРИ КАЖДОЙ ПРАВКЕ js ЭТОТ НОМЕР И VERSION В ui.js МЕНЯЮТСЯ ВМЕСТЕ. -->
-<script src="src/keccak.js?v=6.1.1"></script>
-<script src="src/core.js?v=6.1.1"></script>
-<script src="src/wallet.js?v=6.1.1"></script>
-<script src="src/autosell.js?v=6.1.1"></script>
-<script src="src/ui.js?v=6.1.1"></script>
+<script src="src/keccak.js?v=6.2.0"></script>
+<script src="src/core.js?v=6.2.0"></script>
+<script src="src/wallet.js?v=6.2.0"></script>
+<script src="src/autosell.js?v=6.2.0"></script>
+<script src="src/ui.js?v=6.2.0"></script>
 </body>
 </html>

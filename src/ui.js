@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '6.1.1';
+  const VERSION = '6.2.0';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -638,16 +638,23 @@
     return d;
   }
 
+  // Кэш символов — как у разрядности выше, и по той же причине. Без него
+  // только на пути автопродажи уходило три лишних запроса к узлу (600 мс), а
+  // фоновое обновление позиций каждые 20 секунд спрашивало то же самое заново.
+  const symCache = new Map();
   async function tokenSymbol(a) {
     // Нулевой адрес — это нативная монета сети, у неё нет контракта и
     // спрашивать symbol() не у кого. Без этого в списке пулов стоял «?».
     if (isNative(a)) return C.RH.nativeSymbol;
+    if (symCache.has(a)) return symCache.get(a);
     try {
       const r = await C.ethCall(state.rpc, a, C.SEL.symbol);
       const b = r.slice(2);
       const len = parseInt(b.slice(64, 128), 16);
       let s = '';
       for (let i = 0; i < len; i++) s += String.fromCharCode(parseInt(b.substr(128 + i * 2, 2), 16));
+      // «?» не запоминаем: это признак неудачи, а не имя монеты.
+      if (s) symCache.set(a, s);
       return s || '?';
     } catch (e) { return '?'; }
   }
@@ -671,7 +678,11 @@
       }
     };
     tick();
-    pump = setInterval(tick, 250);
+    // Пока идёт отправка, насос молчит. Четыре запроса цены в секунду на том же
+    // узле, где в этот момент считается котировка, — это конкуренция за лимит
+    // узла, а отказ по лимиту стоит 700–1400 мс на пути, где устаревание цены
+    // и есть причина отказов сделки.
+    pump = setInterval(() => { if (!state.busy) tick(); }, 250);
   }
 
   // Сырая цена пула: сколько currency1 за один currency0.
@@ -2073,7 +2084,10 @@
       // ожиданиям: читаем квитанцию самой транзакции.
       if (mode === 'all') settleClose(h, tokenId, rec, symQuote, key, nativeBefore);
       else settleTake(h, tokenId, symQuote, key, m.verb, nativeBefore, mode);
-      setTimeout(loadPositions, 5000);
+      // Список позиций читается семью запросами на позицию. Если он стартует
+      // посреди автопродажи, то отбирает у неё узел ровно тогда, когда она
+      // считает цену. Автопродажа обновит список сама, когда закончит.
+      setTimeout(() => { if (!state.busy) loadPositions(); }, 5000);
     } catch (e) {
       log('кошелёк отказал: ' + e.message, 'bad');
     } finally { state.busy = false; }
@@ -2101,7 +2115,13 @@
 
   async function receiptBack(hash, key, nativeBefore) {
     for (let i = 0; i < 20; i++) {
-      await new Promise(r => setTimeout(r, 2500));
+      // СПРАШИВАЕМ СРАЗУ, ПАУЗА ПОТОМ.
+      //
+      // Раньше цикл начинался со сна в 2500 мс, и квитанция, уже лежащая в
+      // сети, ждала своей очереди две с половиной секунды. Блок здесь около
+      // 0.1 с — чаще всего транзакция включена к моменту первого же вопроса.
+      // Пауза нарастает, чтобы не долбить узел, если включение задерживается.
+      if (i) await new Promise(r => setTimeout(r, Math.min(2000, 250 * i)));
       let rc = null;
       try { rc = await state.rpc('eth_getTransactionReceipt', [hash]); }
       catch (e) { continue; }
@@ -2199,8 +2219,12 @@
       if (r.nativeUnknown)
         log('закрытие: нативную сторону посчитать не смог, в итоге только токен', 'warn');
       let price = 0;                              // сырая: currency1 за currency0
+      // Тик запоминаем: автопродаже он нужен для строки «во сколько обошёлся
+      // выход», и читать тот же пул второй раз через секунду незачем.
+      let homeTick = null;
       try {
         const s0 = await C.readSlot0(state.rpc, poolIdOf(key));
+        homeTick = s0.tick;
         const d0 = await tokenDecimals(key.currency0);
         const d1 = await tokenDecimals(key.currency1);
         price = Math.pow(1.0001, s0.tick) * Math.pow(10, d0 - d1);
@@ -2236,7 +2260,7 @@
         line += ' | вход не записан, итог посчитать не с чем';
       }
       log(line, rec && rec.amountIn != null && got >= rec.amountIn ? 'ok' : 'warn');
-      await autoSellAfter(r, key, 'all', { tokenId, rec });
+      await autoSellAfter(r, key, 'all', { tokenId, rec, homeTick });
       return;
     }
   }
@@ -2752,54 +2776,60 @@
       'Накопленные комиссии продавать отдельно терминал не умеет и не будет: ' +
       'пул отдаёт их вместе с телом позиции, и уходят они тем же одним свапом.' +
       '<br><br>' +
-      '<b>Порог убытка</b> — главная защита прибыли. Пулы этих пар дорогие на ' +
-      'выход: замер на живой паре дал 7% потери даже на сделке в доллар и 16% ' +
-      'на $150. Выше порога терминал не продаёт, а оставляет монету в кошельке.';
+      '<b>Продаёт по любой цене.</b> Порога убытка нет: вышел — продал. ' +
+      'Пулы этих пар дорогие на выход, замер на живой паре дал 7% потери даже ' +
+      'на сделке в доллар и 25% на тонком пуле. Цена выхода пишется в журнал ' +
+      'отдельной строкой, но сделку не останавливает.';
   }
 
   // Ждём, пока сеть примет транзакцию. Нужен отдельно от receiptBack: тому
   // важно, ЧТО вернулось, а здесь важно только «прошло или нет» — разрешение
   // ничего не возвращает.
-  async function waitMined(hash, tries = 30) {
+  // Возвращает и состояние, и саму квитанцию: газ из неё нужен для итога, а
+  // повторный запрос за тем же самым — лишний круг к узлу на горячем пути.
+  async function waitMined(hash, tries = 40) {
     for (let i = 0; i < tries; i++) {
-      await new Promise(r => setTimeout(r, 2000));
+      if (i) await new Promise(r => setTimeout(r, Math.min(2000, 250 * i)));
       let rc = null;
       try { rc = await state.rpc('eth_getTransactionReceipt', [hash]); }
       catch (e) { continue; }
       if (!rc) continue;
-      return rc.status != null && BigInt(rc.status) === 0n ? 'failed' : 'ok';
+      const status = rc.status != null && BigInt(rc.status) === 0n ? 'failed' : 'ok';
+      return { status, receipt: rc };
     }
-    return 'timeout';
+    return { status: 'timeout', receipt: null };
   }
+  const gasOf = (rc) => (rc ? BigInt(rc.gasUsed || 0) *
+                              BigInt(rc.effectiveGasPrice || rc.gasPrice || 0) : 0n);
 
-  // Сколько монеты пришло НАМ в этой транзакции. Читаем по квитанции, а не по
-  // обещанию маршрута: обещание — это до исполнения, а итог считают по факту.
-  async function receivedIn(hash, token) {
-    try {
-      const rc = await state.rpc('eth_getTransactionReceipt', [hash]);
-      if (!rc) return null;
-      const me = state.account.toLowerCase().replace(/^0x/, '').padStart(64, '0');
-      let sum = 0n;
-      for (const l of (rc.logs || [])) {
-        if ((l.address || '').toLowerCase() !== token.toLowerCase()) continue;
-        if ((l.topics || [])[0] !== TRANSFER_TOPIC) continue;
-        if (((l.topics || [])[2] || '').toLowerCase().slice(-64) !== me) continue;
-        sum += BigInt(l.data || '0x0');
-      }
-      const gas = BigInt(rc.gasUsed || 0) * BigInt(rc.effectiveGasPrice || rc.gasPrice || 0);
-      return { amount: sum, gasWei: gas };
-    } catch (e) { return null; }
+  // Сколько монеты пришло НАМ в этой транзакции — по готовой квитанции.
+  // Считается на месте, без похода в сеть: квитанцию уже принёс waitMined.
+  function receivedFrom(rc, token) {
+    if (!rc) return 0n;
+    const me = state.account.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+    let sum = 0n;
+    for (const l of (rc.logs || [])) {
+      if ((l.address || '').toLowerCase() !== token.toLowerCase()) continue;
+      if ((l.topics || [])[0] !== TRANSFER_TOPIC) continue;
+      if (((l.topics || [])[2] || '').toLowerCase().slice(-64) !== me) continue;
+      sum += BigInt(l.data || '0x0');
+    }
+    return sum;
   }
 
   // ЦЕНА НАТИВНОЙ МОНЕТЫ В СТЕЙБЛЕ — чтобы газ можно было назвать в деньгах.
   //
   // Берём из пула нативная/стейбл. Журналом такой пул не найти (у стейбла их
-  // слишком много), поэтому ключ вычисляется и пул спрашивается напрямую — то
-  // же, чем пользуется свой маршрутизатор.
+  // слишком много), поэтому ключ вычисляется и пул спрашивается напрямую.
+  //
+  // Кэш со сроком: вкладка живёт часами, а курс за это время уходит на
+  // проценты. Вечный кэш назвал бы газ в деньгах по устаревшей цене, и молча.
   const nativePriceCache = new Map();
+  const NATIVE_PRICE_TTL = 5 * 60 * 1000;
   async function nativePriceIn(stable, decStable) {
     const k = (stable || '').toLowerCase();
-    if (nativePriceCache.has(k)) return nativePriceCache.get(k);
+    const hit = nativePriceCache.get(k);
+    if (hit && Date.now() - hit.at < NATIVE_PRICE_TTL) return hit.price;
     let price = null;
     try {
       const NATIVE = '0x' + '0'.repeat(40);
@@ -2811,7 +2841,8 @@
         price = Math.pow(1.0001, s0.tick) * Math.pow(10, 18 - decStable);
       }
     } catch (e) { price = null; }
-    if (price) nativePriceCache.set(k, price);
+    if (price) nativePriceCache.set(k, { price, at: Date.now() });
+    else if (hit) return hit.price;        // не смогли обновить — лучше старое, чем ничего
     return price;
   }
 
@@ -2821,26 +2852,51 @@
   // монета не продана, она стоит столько, за сколько её возьмут, а не столько,
   // сколько показывает тик. Разница на мелком пуле доходила до 8.5%.
   //
-  // Здесь же складывается то, что произошло на самом деле:
+  // Здесь складывается то, что произошло на самом деле:
   //   стейбл, вернувшийся из позиции
   // + стейбл, вырученный за монету (по квитанции продажи)
-  // − газ всех трёх шагов (закрытие, разрешение, продажа)
+  // − газ всех шагов (закрытие, разрешение, продажа)
   // − то, что вносили
-  async function reportPnl({ d, ctx, saleHash, gasWei }) {
+  async function reportPnl({ d, ctx, saleReceipt, gasWei, nativeBefore }) {
+    // ТОЛЬКО ПОЛНОЕ ЗАКРЫТИЕ.
+    //
+    // При «Половине» в пуле остаётся вторая половина тела, а rec.amountIn —
+    // это весь вход. Вычесть одно из другого значит показать выдуманный минус
+    // ровно на оставшуюся половину. И записать такой «итог» в журнал сделок
+    // нельзя тем более: поля got и pnl означают «позиция закрыта», а она жива.
+    if (ctx.mode !== 'all') return;
+
     const rec = ctx.rec;
     const decStable = d.intoDec;
     if (!rec || rec.amountIn == null || decStable == null) return;
 
-    const sale = await receivedIn(saleHash, d.into);
-    if (!sale) { log('автопродажа: квитанцию продажи прочитать не смог, итог не считаю', 'dim'); return; }
+    // Выручка продажи. У нативной монеты событий Transfer не бывает — её
+    // считаем по изменению баланса за вычетом газа, как это делает разбор
+    // закрытия. Без этого выход в BNB давал ноль и ложный минус на всю сумму.
+    let saleRaw;
+    if (isNative(d.into)) {
+      if (nativeBefore == null) {
+        log('автопродажа: баланс до продажи снять не успел, итог не считаю', 'dim');
+        return;
+      }
+      try {
+        const after = BigInt(await state.rpc('eth_getBalance', [state.account, 'latest']));
+        const delta = after - BigInt(nativeBefore) + gasOf(saleReceipt);
+        saleRaw = delta > 0n ? delta : 0n;
+      } catch (e) {
+        log('автопродажа: баланс после продажи прочитать не смог, итог не считаю', 'dim');
+        return;
+      }
+    } else {
+      saleRaw = receivedFrom(saleReceipt, d.into);
+    }
 
     const stableRawFromClose = (d.side === 0) ? ctx.raw1 : ctx.raw0;
     const fromClose = Number(stableRawFromClose || 0n) / Math.pow(10, decStable);
-    const fromSale = Number(sale.amount) / Math.pow(10, decStable);
-    const totalGasWei = BigInt(gasWei || 0n) + BigInt(sale.gasWei || 0n);
+    const fromSale = Number(saleRaw) / Math.pow(10, decStable);
 
     const px = await nativePriceIn(d.into, decStable);
-    const gasCost = px ? (Number(totalGasWei) / 1e18) * px : null;
+    const gasCost = px ? (Number(gasWei) / 1e18) * px : null;
 
     const got = fromClose + fromSale;
     const net = gasCost == null ? got : got - gasCost;
@@ -2889,8 +2945,12 @@
       // добавиться разрешение и сама продажа. Без этого «итог» — полуправда.
       let gasWei = BigInt(ctx.closeGasWei || 0n);
 
-      // Адрес роутера узнаём ДО котировки — разрешение выдаём первым.
-      const router = await AS.routerFor(chain, d.addr, d.into, d.raw);
+      // Адрес роутера ЗАКРЕПЛЁН в описании сети, а не спрашивается у сервиса.
+      // Это и безопасность (ему выдаётся разрешение на монету), и скорость:
+      // прежний routerFor делал полный запрос маршрута и выбрасывал его, а
+      // следом plan() повторял тот же запрос байт в байт.
+      const router = C.RH.kyberRouter;
+      if (!router) { log('автопродажа: адрес роутера для этой сети не задан', 'bad'); return; }
 
       if (!isNative(d.addr)) {
         const have = await C.readErc20Allowance(state.rpc, d.addr, state.account, router);
@@ -2902,13 +2962,9 @@
           const ap = C.buildApproveTo(d.addr, router, MAX);
           const ah = await W.send({ from: state.account, to: ap.to, data: ap.data });
           const st = await waitMined(ah);
-          try {
-            const arc = await state.rpc('eth_getTransactionReceipt', [ah]);
-            if (arc) gasWei += BigInt(arc.gasUsed || 0) *
-                               BigInt(arc.effectiveGasPrice || arc.gasPrice || 0);
-          } catch (e) { /* без газа разрешения итог чуть оптимистичнее */ }
-          if (st !== 'ok') {
-            log(`автопродажа: разрешение ${st === 'failed' ? 'отклонено сетью' :
+          gasWei += gasOf(st.receipt);          // квитанция уже на руках
+          if (st.status !== 'ok') {
+            log(`автопродажа: разрешение ${st.status === 'failed' ? 'отклонено сетью' :
                  'не подтвердилось вовремя'} — продажу не отправляю`, 'bad');
             return;
           }
@@ -2919,11 +2975,15 @@
       // выход». Цена пула, в который продаём, для этого не годится: у мусорного
       // пула она своя, и перекос по ней не виден.
       let homePrice = null;
-      if (d.dec != null && d.intoDec != null && ctx.homePool) {
-        try {
-          const s0 = await C.readSlot0(state.rpc, ctx.homePool);
-          homePrice = Math.pow(1.0001, s0.tick) * Math.pow(10, d.dec - d.intoDec);
-        } catch (e) { homePrice = null; }
+      if (d.dec != null && d.intoDec != null) {
+        // Тик уже прочитан при разборе закрытия — берём готовый. Свой запрос
+        // остаётся запасным: у частичного закрытия этого тика нет.
+        let tick = ctx.homeTick;
+        if (tick == null && ctx.homePool) {
+          try { tick = (await C.readSlot0(state.rpc, ctx.homePool)).tick; }
+          catch (e) { tick = null; }
+        }
+        if (tick != null) homePrice = Math.pow(1.0001, tick) * Math.pow(10, d.dec - d.intoDec);
       }
 
       // ПОПЫТКИ. Отказ по цене — не повод звать человека руками: позиция уже
@@ -2935,6 +2995,9 @@
         const plan = await AS.plan({
           chain, tokenIn: d.addr, tokenOut: d.into, amountIn: d.raw,
           sender: state.account, slippageBps: bps,
+          // Сверка: транзакция обязана уйти на тот же адрес, которому мы
+          // выдали разрешение, а не на любой, какой назовёт сервис.
+          expectRouter: router,
         });
 
         const outHuman = (d.intoDec == null)
@@ -2957,6 +3020,17 @@
           }
         }
 
+        // Баланс нативной монеты ДО продажи. Нужен, только когда выходим
+        // именно в неё: её приход не виден ни в одном событии, и посчитать его
+        // можно лишь разницей балансов. Читается здесь, в последний момент
+        // перед подписью, чтобы не попасть на чужую транзакцию между делом.
+        let nativeBefore = null;
+        if (isNative(d.into)) {
+          try { nativeBefore = BigInt(await state.rpc('eth_getBalance',
+                                                      [state.account, 'latest'])); }
+          catch (e) { nativeBefore = null; }
+        }
+
         let hash;
         try {
           hash = await W.send({
@@ -2972,14 +3046,15 @@
         log('автопродажа: продажа отправлена ' + hash, 'ok');
 
         const r = await waitMined(hash);
-        if (r === 'ok') {
+        if (r.status === 'ok') {
           log(`АВТОПРОДАЖА ПРОШЛА: ${d.sym} → ${d.intoSym}`, 'ok');
           // Итог считаем ПО ФАКТУ: строка при закрытии оценивала монету по
           // цене пула, а теперь известно, за сколько её реально взяли.
-          await reportPnl({ d, ctx, saleHash: hash, gasWei });
+          await reportPnl({ d, ctx, saleReceipt: r.receipt,
+                            gasWei: gasWei + gasOf(r.receipt), nativeBefore });
           return;
         }
-        if (r === 'timeout') {
+        if (r.status === 'timeout') {
           log('автопродажа: подтверждения не дождался, проверь кошелёк', 'warn');
           return;
         }
@@ -3015,7 +3090,7 @@
         raw0: r.raw0, raw1: r.raw1, dec0: r.dec0, dec1: r.dec1,
         // Для честного итога: что внесли, что уже вернулось стейблом и
         // сколько стоило само закрытие.
-        tokenId: extra.tokenId, rec: extra.rec,
+        tokenId: extra.tokenId, rec: extra.rec, homeTick: extra.homeTick,
         closeGasWei: r.gasWei || 0n,
         // Пул, из которого вышли. Он и есть точка отсчёта для предохранителя:
         // по его цене терминал показывал стоимость позиции.

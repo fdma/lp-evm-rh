@@ -230,10 +230,19 @@ const RHAutoSell = (() => {
 
   // Всё вместе: от «сколько монеты» до готовой к подписи сделки.
   // Роутер отдаётся отдельно — ему нужно разрешение до отправки.
-  async function plan({ chain, tokenIn, tokenOut, amountIn, sender, slippageBps: bps }) {
+  async function plan({ chain, tokenIn, tokenOut, amountIn, sender, slippageBps: bps,
+                        expectRouter }) {
     const r = await route(chain, tokenIn, tokenOut, amountIn);
     const b = await build(chain, r.routeSummary, sender, bps);
     const router = b.routerAddress || r.routerAddress;
+
+    // СВЕРКА АДРЕСА. Транзакция уходит на router, и ему же выдано разрешение
+    // на монету. Принять сюда что угодно из ответа — значит позволить чужому
+    // серверу назначить получателя наших денег.
+    if (expectRouter && (router || '').toLowerCase() !== expectRouter.toLowerCase()) {
+      throw new Error(`агрегатор назвал чужой роутер ${router} вместо ` +
+                      `${expectRouter} — сделку не отправляю`);
+    }
     return {
       to: router, router, data: b.data,
       amountOut: BigInt(b.amountOut || r.routeSummary.amountOut || 0),
@@ -246,16 +255,8 @@ const RHAutoSell = (() => {
     };
   }
 
-  // Узнать адрес роутера, ничего не собирая. Нужен ДО котировки: разрешение
-  // выдаём первым, чтобы между расчётом цены и подписью не было пауз.
-  async function routerFor(chain, tokenIn, tokenOut, amountIn) {
-    const r = await route(chain, tokenIn, tokenOut, amountIn);
-    if (!r.routerAddress) throw new Error('агрегатор не назвал адрес роутера');
-    return r.routerAddress;
-  }
-
   return { load, save, settings: S, decide, slippageBps,
-           route, build, plan, routerFor, forApi, NATIVE_PSEUDO, API,
+           route, build, plan, forApi, NATIVE_PSEUDO, API,
            coinSide, isUsdStable, STABLE, USD_STABLE };
 })();
 
