@@ -15,7 +15,7 @@
 'use strict';
 
 (() => {
-  const C = window.RHCore, W = window.RHWallet;
+  const C = window.RHCore, W = window.RHWallet, AS = window.RHAutoSell;
   const $ = (id) => document.getElementById(id);
   // ВЫБОР СЕТИ. Сохраняется отдельно от всех прочих настроек и читается
   // ПЕРВЫМ: от него зависят и адреса контрактов, и ключи памяти.
@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '5.2.1';
+  const VERSION = '6.0.0';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -2072,7 +2072,7 @@
       // ЧЕСТНЫЙ ИТОГ. Считаем по тому, что реально вернулось, а не по
       // ожиданиям: читаем квитанцию самой транзакции.
       if (mode === 'all') settleClose(h, tokenId, rec, symQuote, key, nativeBefore);
-      else settleTake(h, tokenId, symQuote, key, m.verb, nativeBefore);
+      else settleTake(h, tokenId, symQuote, key, m.verb, nativeBefore, mode);
       setTimeout(loadPositions, 5000);
     } catch (e) {
       log('кошелёк отказал: ' + e.message, 'bad');
@@ -2110,6 +2110,15 @@
 
       const me = state.account.toLowerCase().replace(/^0x/, '').padStart(64, '0');
       const back = { 0: 0, 1: 0 };
+      // ТЕ ЖЕ СУММЫ, НО В БАЗОВЫХ ЕДИНИЦАХ.
+      //
+      // back выше — для показа человеку, и деления на 10^dec ему достаточно.
+      // Автопродаже — нет: ЭТО ЧИСЛО уходит агрегатору как сумма продажи, и
+      // округление превратилось бы в попытку продать чуть больше, чем есть,
+      // то есть в отказ сделки на ровном месте. Поэтому рядом держим точное
+      // целое, каким его вернула сеть.
+      const raw = { 0: 0n, 1: 0n };
+      const decs = { 0: 18, 1: 18 };
       let nativeUnknown = false;
       for (const idx of [0, 1]) {
         const cur = idx === 0 ? key.currency0 : key.currency1;
@@ -2122,24 +2131,32 @@
                         BigInt(rc.effectiveGasPrice || rc.gasPrice || 0);
             const delta = after - BigInt(nativeBefore) + gas;
             back[idx] = delta > 0n ? Number(delta) / 1e18 : 0;
+            raw[idx] = delta > 0n ? delta : 0n;
           } catch (e) { nativeUnknown = true; }
           continue;
         }
-        let dec = 18;
-        try { dec = await tokenDecimals(cur); } catch (e) { }
+        // dec = 18 остаётся запасным ТОЛЬКО для показа (back ниже). В денежный
+        // путь такая догадка попадать не должна: tokenDecimals бросает намеренно,
+        // и подмена восемнадцатью у монеты с шестью знаками уводила цену в
+        // 10^12 раз. Поэтому рядом честное «не знаю».
+        let dec = 18, known = true;
+        try { dec = await tokenDecimals(cur); } catch (e) { known = false; }
+        decs[idx] = known ? dec : null;
         for (const l of (rc.logs || [])) {
           if ((l.address || '').toLowerCase() !== cur.toLowerCase()) continue;
           if ((l.topics || [])[0] !== TRANSFER_TOPIC) continue;
           if (((l.topics || [])[2] || '').toLowerCase().slice(-64) !== me) continue;
           back[idx] += Number(BigInt(l.data || '0x0')) / Math.pow(10, dec);
+          raw[idx] += BigInt(l.data || '0x0');
         }
       }
-      return { back0: back[0], back1: back[1], nativeUnknown };
+      return { back0: back[0], back1: back[1], nativeUnknown,
+               raw0: raw[0], raw1: raw[1], dec0: decs[0], dec1: decs[1] };
     }
     return { timeout: true };
   }
 
-  async function settleTake(hash, tokenId, symQuote, key, verb, nativeBefore) {
+  async function settleTake(hash, tokenId, symQuote, key, verb, nativeBefore, mode) {
     {
       const r = await receiptBack(hash, key, nativeBefore);
       if (r.failed) { log(`${verb} НЕ прошло: сеть отклонила транзакцию`, 'bad'); return; }
@@ -2164,6 +2181,7 @@
           `${back1.toFixed(4)} = ${got.toFixed(4)} ${symQuote}. ` +
           `Всего вынуто из позиции: ${takenOut.toFixed(4)} ${symQuote} — ` +
           `итог считаю с учётом этого.`, 'ok');
+      await autoSellAfter(r, key, mode);
       return;
     }
   }
@@ -2214,6 +2232,7 @@
         line += ' | вход не записан, итог посчитать не с чем';
       }
       log(line, rec && rec.amountIn != null && got >= rec.amountIn ? 'ok' : 'warn');
+      await autoSellAfter(r, key, 'all');
       return;
     }
   }
@@ -2644,6 +2663,289 @@
   // список позиций. Подменять всё это на живой странице — верный способ
   // оставить где-нибудь хвост от прошлой сети и посчитать по нему деньги.
   // Перезагрузка занимает мгновение и не оставляет хвостов вовсе.
+  // ── АВТОПРОДАЖА ──────────────────────────────────────────────────────────
+  //
+  // Единственное место терминала, где деньги уходят без нажатия «продать».
+  // Поэтому здесь всё нарочито громко: каждый шаг пишется в журнал, каждый
+  // отказ называет причину, а суммы показываются до отправки, а не после.
+
+  // Свой ряд кнопок. Общий chips() не подходит: он дёргает recalc() и save()
+  // формы входа, к автопродаже отношения не имеющие.
+  function asChips(host, values, suffix, get, set) {
+    if (!host) return;
+    host.innerHTML = '';
+    for (const v of values) {
+      const b = document.createElement('button');
+      b.textContent = v + suffix;
+      if (get() === v) b.classList.add('on');
+      b.onclick = () => { set(v); AS.save(); drawAutosell(); };
+      host.appendChild(b);
+    }
+    const own = document.createElement('input');
+    own.type = 'text'; own.className = 'own'; own.placeholder = 'своё';
+    if (!values.includes(get())) own.value = String(get());
+    const apply = () => {
+      const v = parseFloat(String(own.value).replace(',', '.'));
+      if (!isFinite(v) || v < 0) { own.style.borderColor = 'var(--bad)'; return; }
+      own.style.borderColor = '';
+      set(v); AS.save(); drawAutosell();
+    };
+    own.onchange = apply;
+    own.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); apply(); } };
+    host.appendChild(own);
+  }
+
+  function drawAutosell() {
+    const S = AS.settings;
+    const on = $('as-on'), body = $('as-body');
+    if (!on) return;
+
+    on.textContent = S.on ? 'ВКЛЮЧЕНА' : 'выключена';
+    on.className = S.on ? 'on' : '';
+    on.onclick = () => {
+      // Включение — это согласие на трату без спроса. Спрашиваем один раз,
+      // прямо, и не спрашиваем при выключении: остановить всегда можно молча.
+      if (!S.on && !confirm(
+        'Включить автопродажу?\n\n' +
+        'После выхода из позиции терминал САМ предложит кошельку продать ' +
+        'монету за стейбл через агрегатор. Подтверждать в Rabby всё равно ' +
+        'придётся, но сделку соберёт он, а не ты.')) return;
+      S.on = !S.on; AS.save(); drawAutosell();
+    };
+    body.style.display = S.on ? '' : 'none';
+
+    // Сеть без Quoter или роутера — это не «сломалось», это «здесь так
+    // нельзя». Разница важна: в первом случае человек чинит, во втором ждёт.
+    const ready = Boolean(C.RH.quoter && C.RH.universalRouter);
+    const d = $('d-as'), s = $('s-as');
+    if (!ready) {
+      d.className = 'dot bad';
+      s.textContent = `${C.RH.label}: нет Quoter или роутера Uniswap`;
+    } else if (S.on) {
+      d.className = 'dot on';
+      s.textContent = 'готова, считаем сами';
+    } else {
+      d.className = 'dot';
+      s.textContent = 'выключена';
+    }
+
+    if (!S.on) return;
+
+    asChips($('as-slip'), [1, 3, 5, 10], ' %', () => S.slippage, v => S.slippage = v);
+
+    const modes = $('as-modes');
+    modes.innerHTML = '';
+    // «Комиссии» здесь НЕТ намеренно: их автопродажа не трогает ни при каких
+    // настройках, они уходят только вместе с выходом одним свапом.
+    for (const [k, t] of [['all', 'Закрыть'], ['half', 'Половина']]) {
+      const b = document.createElement('button');
+      b.textContent = t;
+      if (S.modes[k]) b.classList.add('on');
+      b.onclick = () => { S.modes[k] = !S.modes[k]; AS.save(); drawAutosell(); };
+      modes.appendChild(b);
+    }
+    $('as-note').innerHTML =
+      'Накопленные комиссии продавать отдельно терминал не умеет и не будет: ' +
+      'пул отдаёт их вместе с телом позиции, и уходят они тем же одним свапом.' +
+      '<br><br>' +
+      '<b>Порог убытка</b> — главная защита прибыли. Пулы этих пар дорогие на ' +
+      'выход: замер на живой паре дал 7% потери даже на сделке в доллар и 16% ' +
+      'на $150. Выше порога терминал не продаёт, а оставляет монету в кошельке.';
+  }
+
+  // Ждём, пока сеть примет транзакцию. Нужен отдельно от receiptBack: тому
+  // важно, ЧТО вернулось, а здесь важно только «прошло или нет» — разрешение
+  // ничего не возвращает.
+  async function waitMined(hash, tries = 30) {
+    for (let i = 0; i < tries; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      let rc = null;
+      try { rc = await state.rpc('eth_getTransactionReceipt', [hash]); }
+      catch (e) { continue; }
+      if (!rc) continue;
+      return rc.status != null && BigInt(rc.status) === 0n ? 'failed' : 'ok';
+    }
+    return 'timeout';
+  }
+
+  // ИСПОЛНЕНИЕ.
+  //
+  // Порядок шагов не случаен:
+  //   решение -> пулы монеты -> котировка каждого -> предохранители ->
+  //   разрешения -> свап.
+  //
+  // Предохранители стоят ПОСЛЕ котировки и ДО кошелька. Раньше нельзя: пока
+  // не спросили пулы, неизвестно ни сколько дадут, ни во что это обойдётся.
+  // Позже нельзя: тогда за отказ уже заплачен газ.
+
+  // Пулы монеты меняются редко, а читаются журналом — самой дорогой операцией
+  // в терминале. Держим при себе на время вкладки.
+  const poolCache = new Map();
+  async function poolsFor(token) {
+    const k = token.toLowerCase();
+    if (poolCache.has(k)) return poolCache.get(k);
+    const latest = Number(BigInt(await state.rpc('eth_blockNumber', [])));
+    let pools = [];
+    try { pools = await C.poolsOfToken(logsRpc(), token, latest); }
+    catch (e) { pools = []; }
+    if (!pools.length) {
+      // Журнал мог отказать, а не быть пустым. Пробуем своим узлом — вдруг
+      // тариф другой; пустой ответ обоих кэшировать не станем.
+      try { pools = await C.poolsOfToken(state.rpc, token, latest); } catch (e) { }
+    }
+    if (pools.length) poolCache.set(k, pools);
+    return pools;
+  }
+
+  // УЗЛОВЫЕ ПУЛЫ «НАТИВНАЯ МОНЕТА ↔ СТЕЙБЛ».
+  //
+  // Журналом их не найти: у стейбла пулов столько, что узел отдаёт пустой
+  // ответ — проверено на USDG. Поэтому ядро вычисляет ключ и спрашивает пул
+  // напрямую. Результат один на всю сеть и от монеты не зависит, так что
+  // держим его при себе на время вкладки.
+  const hubCache = new Map();
+  async function hubFor(stable) {
+    const k = (stable || '').toLowerCase();
+    if (hubCache.has(k)) return hubCache.get(k);
+    let hub = [];
+    try {
+      hub = await C.findPoolsByKey(state.rpc, '0x' + '0'.repeat(40), stable,
+                                   window.keccak256);
+    } catch (e) { hub = []; }
+    if (hub.length) hubCache.set(k, hub);
+    return hub;
+  }
+
+  async function autoSell(ctx) {
+    const d = AS.decide(ctx);
+    if (!d.sell) { log('автопродажа: ' + d.why, 'dim'); return; }
+    if (state.busy) { log('автопродажа: кошелёк занят, пропускаю', 'warn'); return; }
+
+    state.busy = true;
+    try {
+      log('автопродажа: ' + d.why);
+
+      const pools = await poolsFor(d.addr);
+      if (!pools.length) {
+        log(`автопродажа: не удалось прочитать пулы ${d.sym} — узел не отдал журнал`, 'bad');
+        return;
+      }
+
+      // Маршрут выбирает ядро: сравнивает прямой пул с путём через нативную
+      // монету и берёт лучший. Отбирать пулы здесь не надо — оно само.
+      const plan = await C.planSwap(state.rpc, {
+        pools, coin: d.addr, stable: d.into, amountIn: d.raw,
+        slippageBps: AS.slippageBps(),
+        deadline: Math.floor(Date.now() / 1000) + 300,
+        keccak256: window.keccak256,
+        hubPools: await hubFor(d.into),
+      });
+
+      // Человеческие числа для журнала и для предохранителя.
+      const decIn = d.dec, decOut = d.intoDec;
+      const outHuman = (decOut == null) ? null : Number(plan.amountOut) / Math.pow(10, decOut);
+      const inHuman = d.amount;
+
+      const where = plan.hops === 2
+        ? `маршрут через нативную монету` +
+          (plan.betterThanDirect
+            ? ` — в ${plan.betterThanDirect.toFixed(1)} раза выгоднее прямого пула`
+            : '')
+        : `прямой пул ${plan.pool.slice(0, 10)}… комиссия ` +
+          `${(plan.fee / 10000).toFixed(3)}% (из ${plan.live} живых, проверено ${plan.tried})`;
+      log(`автопродажа: ${where}. Дадут ` +
+          `${outHuman == null ? plan.amountOut + ' (в базовых единицах)' : outHuman.toFixed(6)} ` +
+          `${d.intoSym}`, 'ok');
+
+      // ЦЕНА ВЫХОДА — В ЖУРНАЛ, НО НЕ В ЗАПРЕТ.
+      //
+      // Автопродажа не останавливается никогда: вышел — продал. Но посчитать,
+      // во сколько обошёлся выход, и сказать об этом мы обязаны.
+      //
+      // Считаем от цены пула, ИЗ КОТОРОГО ВЫШЛИ, а не того, в который продаём.
+      // Замер на живой монете: у CHUMP вся ликвидность идёт через посредника,
+      // прямой пул со стейблом мусорный и отдаёт 0.83 вместо 15 долларов. По
+      // его собственной кривой цене сделка выглядит безупречной — перекос в
+      // восемнадцать раз стал бы невидим. Пул позиции — та самая цена, которую
+      // терминал показывал на экране.
+      //
+      // Слипаж такое не ловит: он сравнивает с котировкой, а не с ценой. Если
+      // котировка уже мусорная, слипаж её пропустит.
+      if (decIn != null && decOut != null && inHuman != null && outHuman != null
+          && ctx.homePool) {
+        try {
+          const s0 = await C.readSlot0(state.rpc, ctx.homePool);
+          const price = Math.pow(1.0001, s0.tick) * Math.pow(10, decIn - decOut);
+          const worth = (d.side === 0) ? inHuman * price : (price ? inHuman / price : 0);
+          if (worth > 0) {
+            const lossPct = (1 - outHuman / worth) * 100;
+            const line = `автопродажа: по цене пула позиции это ` +
+                         `${worth.toFixed(6)} ${d.intoSym}, выход стоит ` +
+                         `${lossPct.toFixed(1)}%`;
+            // Десять процентов — не запрет, а граница, за которой человек
+            // должен увидеть строку жёлтой, а не серой.
+            log(line, lossPct > 10 ? 'warn' : 'dim');
+          }
+        } catch (e) { log('автопродажа: цену выхода посчитать не смог', 'dim'); }
+      }
+
+      // РАЗРЕШЕНИЯ. Роутер берёт монету через Permit2 — тот же путь, что у
+      // входа в позицию, и те же два шага.
+      const now = Math.floor(Date.now() / 1000);
+      const steps = await C.planSwapApprovals(state.rpc, d.addr, state.account, d.raw, now);
+      for (const st of steps) {
+        log('автопродажа: ' + st.what);
+        const h = await W.send({ from: state.account, to: st.tx.to, data: st.tx.data });
+        const r = await waitMined(h);
+        if (r !== 'ok') {
+          log(`автопродажа: разрешение ${r === 'failed' ? 'отклонено сетью' :
+               'не подтвердилось вовремя'} — продажу не отправляю`, 'bad');
+          return;
+        }
+      }
+
+      const hash = await W.send({
+        from: state.account, to: plan.to, data: plan.data,
+        value: isNative(d.addr) ? '0x' + BigInt(d.raw).toString(16) : '0x0',
+      });
+      log('автопродажа: продажа отправлена ' + hash, 'ok');
+
+      const r = await waitMined(hash);
+      if (r === 'ok') log(`АВТОПРОДАЖА ПРОШЛА: ${d.sym} → ${d.intoSym}`, 'ok');
+      else if (r === 'failed') log('автопродажа: сеть отклонила продажу — ' +
+        'скорее всего цена ушла за проскальзывание, подними его и продай вручную', 'bad');
+      else log('автопродажа: подтверждения не дождался, проверь кошелёк', 'warn');
+    } catch (e) {
+      log('автопродажа не вышла: ' + e.message, 'bad');
+    } finally {
+      state.busy = false;
+      setTimeout(loadPositions, 4000);
+    }
+  }
+
+  // Собрать то, что нужно решению, из уже прочитанной квитанции.
+  //
+  // Цену пула здесь НЕ считаем: она нужна только предохранителю по убытку, а
+  // он берёт её от ТОГО пула, через который пойдёт сделка. Какой это пул, до
+  // перебора неизвестно.
+  async function autoSellAfter(r, key, mode) {
+    if (!AS.settings.on) return;
+    try {
+      const sym0 = await tokenSymbol(key.currency0);
+      const sym1 = await tokenSymbol(key.currency1);
+      await autoSell({
+        mode, sym0, sym1,
+        addr0: key.currency0, addr1: key.currency1,
+        raw0: r.raw0, raw1: r.raw1, dec0: r.dec0, dec1: r.dec1,
+        // Пул, из которого вышли. Он и есть точка отсчёта для предохранителя:
+        // по его цене терминал показывал стоимость позиции.
+        homePool: poolIdOf(key),
+      });
+    } catch (e) {
+      log('автопродажа: не смог собрать данные — ' + e.message, 'bad');
+    }
+  }
+
   function drawChains() {
     const host = $('chains');
     if (!host) return;
@@ -2662,6 +2964,8 @@
     }
   }
   drawChains();
+  AS.load();
+  drawAutosell();
 
   // Если сайт уже разрешён в кошельке, подхватываем адрес молча — без окна
   // и без нажатий. Иначе после каждого обновления страницы панель позиций

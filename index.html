@@ -172,6 +172,30 @@
       <button class="wide go" id="b-open" style="margin-top:7px">ВОЙТИ</button>
       <div class="hint">Enter — вход, R — обновить позиции. Подписывает всегда Rabby.</div>
     </div>
+
+    <!-- АВТОПРОДАЖА. Стоит последней и по умолчанию выключена: это
+         единственное место, где терминал сам решает потратить деньги, и
+         включать его человек должен осознанно. -->
+    <div class="card" style="margin-top:12px">
+      <h2>автопродажа после выхода</h2>
+      <div class="row" style="align-items:center;gap:8px">
+        <button id="as-on">выключена</button>
+        <span class="pill"><span class="dot" id="d-as"></span><span id="s-as">маршрут не проверен</span></span>
+      </div>
+      <div id="as-body" style="display:none">
+        <label>проскальзывание %</label>
+        <div class="row" id="as-slip"></div>
+        <label>после чего продавать</label>
+        <div class="row" id="as-modes"></div>
+        <div class="hint" id="as-note" style="margin-top:8px"></div>
+      </div>
+      <div class="hint" style="margin-top:7px">
+        Продаётся только монета — стейбл остаётся. Маршрут ищет агрегатор
+        KyberSwap по всем площадкам сети, комиссии сверх сети он не берёт.
+        Подписывает по-прежнему Rabby: одно разрешение роутеру и одно окно
+        на саму продажу.
+      </div>
+    </div>
   </div>
 
   <!-- ПРАВАЯ КОЛОНКА: состояние -->
@@ -248,9 +272,10 @@
      страницу со старым кодом и справедливо писал, что ничего не изменилось.
      Меняется номер — меняется адрес, и браузер обязан скачать заново.
      ПРИ КАЖДОЙ ПРАВКЕ js ЭТОТ НОМЕР И VERSION В ui.js МЕНЯЮТСЯ ВМЕСТЕ. -->
-<script src="src/keccak.js?v=5.2.1"></script>
-<script src="src/core.js?v=5.2.1"></script>
-<script src="src/wallet.js?v=5.2.1"></script>
-<script src="src/ui.js?v=5.2.1"></script>
+<script src="src/keccak.js?v=6.0.0"></script>
+<script src="src/core.js?v=6.0.0"></script>
+<script src="src/wallet.js?v=6.0.0"></script>
+<script src="src/autosell.js?v=6.0.0"></script>
+<script src="src/ui.js?v=6.0.0"></script>
 </body>
 </html>

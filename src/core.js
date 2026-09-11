@@ -49,6 +49,18 @@ const CHAINS = {
     // в журнале входов лежат суммы, по которым считается итог позиции.
     storeKey: 'lp-evm-rh',
     ledgerKey: 'lp-evm-rh-ledger',
+    // СВОЙ МАРШРУТ ВМЕСТО ЧУЖОЙ СЛУЖБЫ.
+    //
+    // Quoter считает выход свапа сам, на цепочке: своей математики по тикам
+    // писать не надо, и ошибиться в ней негде. UniversalRouter исполняет —
+    // без него никак, свап в V4 идёт через unlock() у PoolManager, а это
+    // требует контракта: с обычного кошелька такую транзакцию не отправить.
+    //
+    // Оба проверены на цепочке: код на месте, и quoter.poolManager()
+    // возвращает тот же адрес, что выше. Это та же сверка, которой ядро
+    // проверяет PositionManager и StateView.
+    quoter: '0x8dc178efb8111bb0973dd9d722ebeff267c98f94',
+    universalRouter: '0x8876789976decbfcbbbe364623c63652db8c0904',
   },
   bsc: {
     key: 'bsc',
@@ -93,6 +105,8 @@ const CHAINS = {
     // CTM/BNB: с value проходит, без value — откат, то есть работает именно
     // значение, а не случайность. Живыми деньгами ещё не проверялось.
     nativeEntryBlocked: false,
+    quoter: '0x9f75dd27d6664c475b90e105573e550ff69437b0',
+    universalRouter: '0x1906c1d672b88cd1b9ac7593301ca990f94eae07',
   },
 };
 
@@ -128,6 +142,14 @@ const SEL = {
   allowance: '0xdd62ed3e',
   approve: '0x095ea7b3',
   p2approve: '0x87517c45',                // Permit2.approve(address,address,uint160,uint48)
+  // V4Quoter.quoteExactInputSingle(((address,address,uint24,int24,address),bool,uint128,bytes))
+  // Селектор посчитан из подписи и проверен живым вызовом: пул с комиссией
+  // 90% вернул за ~$15 ровно 0.51 USDG — то есть контракт понял запрос.
+  quoteExactInSingle: '0xaa9d21cb',
+  // V4Quoter.quoteExactInput((address,(address,uint24,int24,address,bytes)[],uint128))
+  quoteExactIn: '0xca253dc9',
+  // UniversalRouter.execute(bytes,bytes[],uint256)
+  urExecute: '0x3593564c',
   p2allowance: '0x927da105',              // Permit2.allowance(address,address,address)
 };
 
@@ -138,6 +160,13 @@ const SEL = {
 // вход  — 0x02 0x0d (MINT_POSITION, SETTLE_PAIR)
 // выход — 0x01 0x11 (DECREASE_LIQUIDITY, TAKE_PAIR)
 const ACTION = {
+  // Действия свапа из того же перечисления Actions.sol. Ими распоряжается не
+  // PositionManager, а роутер: попытка скормить их PositionManager кончится
+  // отказом «неизвестное действие».
+  SWAP_EXACT_IN_SINGLE: 0x06,
+  SWAP_EXACT_IN: 0x07,                  // тот же свап, но по пути из нескольких пулов
+  SETTLE_ALL: 0x0c,
+  TAKE_ALL: 0x0f,
   DECREASE_LIQUIDITY: 0x01,
   MINT_POSITION: 0x02,
   SETTLE_PAIR: 0x0d,
@@ -1451,6 +1480,344 @@ function buildMintCalldata({ key, tickLower, tickUpper, liquidity,
   return data;
 }
 
+// ── СВАП: КОТИРОВКА И СБОРКА ─────────────────────────────────────────────
+//
+// Зачем это здесь, если есть агрегаторы. Агрегатор — чужая служба в интернете:
+// он может лечь, закрыть доступ браузеру или перестать знать нашу сеть. Всё,
+// что он делал, считается на цепочке: Quoter отвечает, сколько дадут, а пулы
+// монеты терминал и так перебирает. Остаётся исполнение — и вот его без
+// посредника не сделать: свап в V4 идёт через unlock() у PoolManager, а это
+// требует контракта. Им служит UniversalRouter, тот же Uniswap.
+//
+// Что мы при этом теряем честно: маршруты в несколько шагов и дробление
+// сделки между пулами. Мы продаём монету в стейбл, с которым она в паре, —
+// путь прямой. Если прямого пула нет, так и скажем, а не пойдём вслепую.
+
+const padWords = (h) => h.padEnd(Math.ceil(h.length / 64) * 64, '0');
+// bytes: длина словом, следом данные, добитые до целого слова.
+const encBytes = (h) => { const b = stripHex(h); return w(b.length / 2) + (b ? padWords(b) : ''); };
+
+// PoolKey — пять статических слов, ровно как её принимают контракты.
+// tickSpacing знаковый: отрицательного шага не бывает, но приводим честно,
+// чтобы правило не пришлось вспоминать, если однажды появится.
+function encodePoolKey(key) {
+  return addrWord(key.currency0) + addrWord(key.currency1) + w(key.fee) +
+         w(BigInt.asUintN(256, BigInt(key.tickSpacing))) +
+         addrWord(key.hooks || '0x' + '0'.repeat(40));
+}
+
+// ExactInputSingleParams. Структура ДИНАМИЧЕСКАЯ — внутри bytes hookData, —
+// поэтому впереди смещение 0x20, а hookData лежит после девяти слов головы.
+// Роутер читает именно так: первым словом берёт смещение.
+function encodeExactInSingle({ key, zeroForOne, amountIn, amountOutMin, hookData = '0x' }) {
+  return w(0x20) + encodePoolKey(key) + w(zeroForOne ? 1 : 0) +
+         w(amountIn) + w(amountOutMin) + w(0x120) + encBytes(hookData);
+}
+
+// SETTLE_ALL и TAKE_ALL берут (валюта, сумма) — два статических слова,
+// смещения здесь не нужно.
+const encodeCurrencyAmount = (cur, amt) => addrWord(cur) + w(amt);
+
+// Массив bytes[]: длина, затем смещения каждого элемента, затем сами элементы.
+function encBytesArray(items) {
+  const enc = items.map(encBytes);
+  let off = items.length * 32, heads = '', body = '';
+  for (const e of enc) { heads += w(off); off += e.length / 2; body += e; }
+  return w(items.length) + heads + body;
+}
+
+// Вход команды V4_SWAP: abi.encode(bytes actions, bytes[] params).
+function encodeV4Swap(actionsHex, params) {
+  const a = encBytes(actionsHex), arr = encBytesArray(params);
+  return w(0x40) + w(0x40 + a.length / 2) + a + arr;
+}
+
+// UniversalRouter.execute(bytes commands, bytes[] inputs, uint256 deadline)
+const CMD_V4_SWAP = '10';
+
+function buildSwapCalldata({ key, zeroForOne, amountIn, amountOutMin, deadline }) {
+  const currencyIn  = zeroForOne ? key.currency0 : key.currency1;
+  const currencyOut = zeroForOne ? key.currency1 : key.currency0;
+  const actions = [ACTION.SWAP_EXACT_IN_SINGLE, ACTION.SETTLE_ALL, ACTION.TAKE_ALL]
+    .map(a => a.toString(16).padStart(2, '0')).join('');
+  const input = encodeV4Swap(actions, [
+    '0x' + encodeExactInSingle({ key, zeroForOne, amountIn, amountOutMin }),
+    // Платим ровно amountIn и ни монетой больше.
+    '0x' + encodeCurrencyAmount(currencyIn, amountIn),
+    // Забираем не меньше amountOutMin — это и есть защита от проскальзывания.
+    '0x' + encodeCurrencyAmount(currencyOut, amountOutMin),
+  ]);
+  const cmds = encBytes('0x' + CMD_V4_SWAP);
+  const inputs = encBytesArray(['0x' + input]);
+  return SEL.urExecute + w(0x60) + w(0x60 + cmds.length / 2) + w(deadline) + cmds + inputs;
+}
+
+// СКОЛЬКО ДАДУТ. Считает контракт, не мы.
+//
+// quoteExactInputSingle помечен как изменяющий состояние, но предназначен для
+// eth_call: внутри он делает настоящий свап и откатывает его, возвращая
+// результат. Поэтому «execution reverted» здесь — это не поломка сборки, а
+// честный ответ «в этом пуле столько не налить».
+async function quoteSwapSingle(rpc, key, zeroForOne, amountIn) {
+  const data = SEL.quoteExactInSingle + w(0x20) + encodePoolKey(key) +
+               w(zeroForOne ? 1 : 0) + w(amountIn) + w(0x100) + w(0);
+  const raw = await rpc('eth_call', [{ to: RH.quoter, data }, 'latest']);
+  const x = words(raw);
+  if (!x.length) throw new Error('Quoter промолчал');
+  return { amountOut: BigInt('0x' + x[0]), gas: x.length > 1 ? BigInt('0x' + x[1]) : 0n };
+}
+
+// ── ПУТЬ ИЗ НЕСКОЛЬКИХ ПУЛОВ ─────────────────────────────────────────────
+//
+// Зачем, если прямой пул почти всегда есть. Потому что «есть» и «работает» —
+// разное. Замер на живой монете CHUMP: тринадцать прямых пулов с USDG, и все
+// дешёвые ПУСТЫЕ. Деньги лежат только в пулах с комиссией 20%, 89% и 95%, и
+// прямая продажа отдавала 0.83 доллара вместо пятнадцати. А с нативной монетой
+// у той же CHUMP двадцать пять пулов, и в первом же настоящая глубина.
+//
+// То есть путь монета -> нативная -> стейбл бывает вдесятеро выгоднее прямого,
+// и без него свой маршрут проигрывал бы агрегатору именно там, где это дороже
+// всего стоит.
+//
+// PathKey описывает ОДИН шаг: во что меняем и через какой пул. Структура
+// динамическая — внутри bytes hookData, — поэтому в массиве лежит по смещению.
+function encodePathKey({ currency, fee, tickSpacing, hooks }) {
+  return addrWord(currency) + w(fee) +
+         w(BigInt.asUintN(256, BigInt(tickSpacing))) +
+         addrWord(hooks || '0x' + '0'.repeat(40)) +
+         w(0xa0) + w(0);                 // hookData: сразу после пяти слов, пуст
+}
+
+// Массив PathKey[]: длина, затем смещения, затем сами шаги. Каждый шаг ровно
+// шесть слов, поэтому смещения считаются без сюрпризов.
+function encodePath(path) {
+  const each = path.map(encodePathKey);
+  const stride = 6 * 32;
+  let heads = '', body = '';
+  path.forEach((_, i) => { heads += w(path.length * 32 + i * stride); });
+  for (const e of each) body += e;
+  return w(path.length) + heads + body;
+}
+
+// ExactInputParams: currencyIn, path, amountIn, amountOutMinimum.
+// Голова четыре слова, значит путь начинается на 0x80.
+function encodeExactInPath({ currencyIn, path, amountIn, amountOutMin }) {
+  return w(0x20) + addrWord(currencyIn) + w(0x80) + w(amountIn) + w(amountOutMin) +
+         encodePath(path);
+}
+
+// Сборка многошаговой продажи. Отличается от одношаговой ровно двумя вещами:
+// действие SWAP_EXACT_IN вместо SWAP_EXACT_IN_SINGLE и путь вместо ключа пула.
+// Платим первой монетой пути, забираем последней — промежуточные роутер держит
+// у себя и наружу они не выходят.
+function buildSwapPathCalldata({ currencyIn, path, amountIn, amountOutMin, deadline }) {
+  const currencyOut = path[path.length - 1].currency;
+  const actions = [ACTION.SWAP_EXACT_IN, ACTION.SETTLE_ALL, ACTION.TAKE_ALL]
+    .map(a => a.toString(16).padStart(2, '0')).join('');
+  const input = encodeV4Swap(actions, [
+    '0x' + encodeExactInPath({ currencyIn, path, amountIn, amountOutMin }),
+    '0x' + encodeCurrencyAmount(currencyIn, amountIn),
+    '0x' + encodeCurrencyAmount(currencyOut, amountOutMin),
+  ]);
+  const cmds = encBytes('0x' + CMD_V4_SWAP);
+  const inputs = encBytesArray(['0x' + input]);
+  return SEL.urExecute + w(0x60) + w(0x60 + cmds.length / 2) + w(deadline) + cmds + inputs;
+}
+
+// QuoteExactParams: exactCurrency, path, exactAmount. Голова три слова.
+async function quoteSwapPath(rpc, currencyIn, path, amountIn) {
+  const data = SEL.quoteExactIn + w(0x20) + addrWord(currencyIn) + w(0x60) +
+               w(amountIn) + encodePath(path);
+  const raw = await rpc('eth_call', [{ to: RH.quoter, data }, 'latest']);
+  const x = words(raw);
+  if (!x.length) throw new Error('Quoter промолчал');
+  return { amountOut: BigInt('0x' + x[0]), gas: x.length > 1 ? BigInt('0x' + x[1]) : 0n };
+}
+
+// ── ПОИСК ПУЛА БЕЗ ЖУРНАЛА ───────────────────────────────────────────────
+//
+// У стейбла пулов столько, что журнал их не отдаёт вовсе — проверено на USDG,
+// ответ пустой. Но перечислять и не нужно: PoolId это keccak от ключа, значит
+// пул можно ВЫЧИСЛИТЬ и спросить, живой ли он.
+//
+// Перебираем известные ступени комиссии. Незаданный пул отвечает нулевой
+// ценой — по ней его и отличаем от настоящего.
+const FEE_TIERS = [
+  [100, 1], [500, 10], [1000, 20], [2500, 50], [3000, 60], [5000, 100],
+  [10000, 200], [10020, 200], [20000, 400], [30000, 600], [40000, 800],
+  [100000, 2000],
+];
+
+function computePoolId(c0, c1, fee, tickSpacing, hooks, keccak256) {
+  const [a, b] = c0.toLowerCase() < c1.toLowerCase() ? [c0, c1] : [c1, c0];
+  return keccak256('0x' + addrWord(a) + addrWord(b) + w(fee) +
+                   w(BigInt.asUintN(256, BigInt(tickSpacing))) +
+                   addrWord(hooks || '0x' + '0'.repeat(40)));
+}
+
+// Живые пулы пары, найденные вычислением ключа. Хуки здесь всегда нулевые:
+// пул с хуком так не угадать, его адрес произволен. Для узлового пути
+// (нативная монета со стейблом) этого достаточно — такие пулы стандартные.
+async function findPoolsByKey(rpc, c0, c1, keccak256) {
+  const [a, b] = c0.toLowerCase() < c1.toLowerCase() ? [c0, c1] : [c1, c0];
+  const out = [];
+  for (const [fee, tickSpacing] of FEE_TIERS) {
+    const poolId = computePoolId(a, b, fee, tickSpacing, null, keccak256);
+    try {
+      const s0 = await ethCall(rpc, RH.stateView, SEL.getSlot0 + stripHex(poolId));
+      const sqrt = BigInt('0x' + words(s0)[0]);
+      if (sqrt === 0n) continue;                       // такого пула нет
+      const liq = BigInt(await ethCall(rpc, RH.stateView,
+                                       SEL.getLiquidity + stripHex(poolId)));
+      if (liq === 0n) continue;                        // есть, но пустой
+      out.push({ poolId, currency0: a, currency1: b, fee, tickSpacing,
+                 hooks: '0x' + '0'.repeat(40), liquidity: liq });
+    } catch (e) { /* узел молчит — считаем, что пула нет */ }
+  }
+  out.sort((x, y) => (y.liquidity > x.liquidity ? 1 : y.liquidity < x.liquidity ? -1 : 0));
+  return out;
+}
+
+// ВЫБОР ПУЛА ДЛЯ ПРОДАЖИ.
+//
+// Своя замена агрегатору. Перебираем прямые пулы монета↔стейбл, спрашиваем у
+// Quoter, сколько дадут в каждом, и берём лучший. Это ровно то, что делал
+// агрегатор, только без чужой службы.
+//
+// Замерено на живой паре с 27 прямыми пулами: лучший свой пул дал 14.3334
+// USDG, агрегатор — 14.3336. Разница в две стотысячных доллара, то есть
+// перебором мы находим тот же оптимум.
+//
+// Пулы без ликвидности отвечают отказом, и это НЕ ошибка: Quoter внутри
+// делает настоящий свап и откатывает его. «Здесь столько не налить» — такой
+// же честный ответ, как число.
+async function pickBestSwap(rpc, pools, coin, amountIn) {
+  const c = coin.toLowerCase();
+  const quotes = [];
+  let dry = 0;
+  for (const p of pools) {
+    const a = (p.currency0 || '').toLowerCase(), b = (p.currency1 || '').toLowerCase();
+    if (a !== c && b !== c) continue;
+    const zeroForOne = a === c;
+    try {
+      const q = await quoteSwapSingle(rpc, p, zeroForOne, amountIn);
+      if (q.amountOut > 0n) quotes.push({ pool: p, zeroForOne, out: q.amountOut });
+      else dry++;
+    } catch (e) { dry++; }
+  }
+  quotes.sort((x, y) => (y.out > x.out ? 1 : y.out < x.out ? -1 : 0));
+  return { best: quotes[0] || null, tried: quotes.length + dry, live: quotes.length };
+}
+
+// ОТ «СКОЛЬКО МОНЕТЫ» ДО ГОТОВОЙ К ПОДПИСИ ТРАНЗАКЦИИ.
+//
+// Сравниваем два маршрута и берём лучший:
+//   прямой        монета -> стейбл
+//   через нативную монета -> ETH/BNB -> стейбл
+//
+// Второй нужен не для полноты. Замер на живой CHUMP: прямой давал 0.83
+// доллара, через нативную — 15.20, разница в восемнадцать раз. Все дешёвые
+// прямые пулы там пустые, а деньги лежат в паре с нативной монетой.
+//
+// amountOutMin считаем от НАЙДЕННОГО выхода, а не от цены пула: котировка уже
+// учла и комиссию, и проседание, а спот поставил бы недостижимую планку.
+async function planSwap(rpc, { pools, coin, stable, amountIn, slippageBps,
+                               deadline, keccak256, hubPools, maxLegs = 3 }) {
+  const NATIVE = '0x' + '0'.repeat(40);
+  const c = coin.toLowerCase(), st = (stable || '').toLowerCase();
+  const has = (p, x) => [p.currency0, p.currency1].map(v => v.toLowerCase()).includes(x);
+
+  // ── прямой
+  const directPools = pools.filter(p => has(p, c) && (!st || has(p, st)));
+  const direct = await pickBestSwap(rpc, directPools, coin, amountIn);
+
+  // ── через нативную монету
+  //
+  // Нативная сама монетой быть не может — тогда первый шаг вырождается.
+  let via = null, viaPath = null;
+  if (st && c !== NATIVE && st !== NATIVE) {
+    // Кандидаты первого шага: пулы монеты с нативной. Отбираем по глубине —
+    // пустых у таких монет большинство, и гонять по ним котировки впустую
+    // значит упереться в ограничение узла.
+    const legs = [];
+    for (const p of pools.filter(p => has(p, c) && has(p, NATIVE))) {
+      try {
+        const liq = BigInt(await ethCall(rpc, RH.stateView,
+                                         SEL.getLiquidity + stripHex(p.poolId)));
+        if (liq > 0n) legs.push({ p, liq });
+      } catch (e) { /* узел молчит — пропускаем */ }
+    }
+    legs.sort((x, y) => (y.liq > x.liq ? 1 : y.liq < x.liq ? -1 : 0));
+
+    // Узловые пулы нативная/стейбл журналом не найти — у стейбла их слишком
+    // много. Вычисляем ключ и спрашиваем напрямую; результат можно передать
+    // снаружи, он не меняется от монеты к монете.
+    const hubAll = hubPools || (keccak256
+      ? await findPoolsByKey(rpc, NATIVE, stable, keccak256)
+      : []);
+
+    // УЗЛОВЫЕ ПУЛЫ ОТБИРАЕМ ПО КОМИССИИ, А НЕ ПО ГЛУБИНЕ.
+    //
+    // Это не придирка: на Robinhood самый глубокий пул ETH/USDG берёт 10%, а
+    // рядом есть такой же живой с 0.010%. Отбор по глубине выбирал первый, и
+    // маршрут выходил на 13.47 вместо 15.19 — полтора доллара с пятнадцати
+    // терялись на ровном месте. Через узловой пул проходит вся сумма, и
+    // комиссия здесь весит больше, чем запас глубины: сделки у нас мелкие.
+    const hub = hubAll.slice().sort((x, y) => x.fee - y.fee);
+
+    for (const l of legs.slice(0, maxLegs)) {
+      for (const h of hub.slice(0, 3)) {
+        const path = [
+          { currency: NATIVE, fee: l.p.fee, tickSpacing: l.p.tickSpacing, hooks: l.p.hooks },
+          { currency: stable, fee: h.fee, tickSpacing: h.tickSpacing, hooks: h.hooks },
+        ];
+        try {
+          const q = await quoteSwapPath(rpc, coin, path, amountIn);
+          if (q.amountOut > 0n && (!via || q.amountOut > via)) { via = q.amountOut; viaPath = path; }
+        } catch (e) { /* этот путь не берёт — пробуем следующий */ }
+      }
+    }
+  }
+
+  const bestDirect = direct.best ? direct.best.out : 0n;
+  const bestVia = via || 0n;
+  if (bestDirect === 0n && bestVia === 0n) {
+    throw new Error(`ни прямой пул, ни путь через нативную монету не берут эту сумму ` +
+                    `(проверено прямых: ${direct.tried})`);
+  }
+
+  const bps = BigInt(Math.min(5000, Math.max(1, Math.round(slippageBps))));
+  const useVia = bestVia > bestDirect;
+  const amountOut = useVia ? bestVia : bestDirect;
+  const minOut = amountOut * (10000n - bps) / 10000n;
+
+  if (useVia) {
+    return {
+      to: RH.universalRouter,
+      data: buildSwapPathCalldata({ currencyIn: coin, path: viaPath,
+                                    amountIn, amountOutMin: minOut, deadline }),
+      route: 'через нативную монету', hops: 2,
+      amountOut, minOut,
+      tried: direct.tried, live: direct.live,
+      // Насколько это оказалось выгоднее прямого — полезно видеть в журнале.
+      betterThanDirect: bestDirect > 0n ? Number(bestVia) / Number(bestDirect) : null,
+      currencyOut: stable,
+    };
+  }
+  const b = direct.best, key = b.pool;
+  return {
+    to: RH.universalRouter,
+    data: buildSwapCalldata({ key, zeroForOne: b.zeroForOne,
+                              amountIn, amountOutMin: minOut, deadline }),
+    route: 'прямой', hops: 1,
+    pool: key.poolId, fee: key.fee, zeroForOne: b.zeroForOne,
+    amountOut, minOut, tried: direct.tried, live: direct.live,
+    betterThanDirect: null,
+    currencyIn: b.zeroForOne ? key.currency0 : key.currency1,
+    currencyOut: b.zeroForOne ? key.currency1 : key.currency0,
+  };
+}
+
 // ── разрешения ───────────────────────────────────────────────────────────
 //
 // Путь оплаты в V4: токен → Permit2 → PositionManager. Нужны ДВА разрешения.
@@ -1479,6 +1846,80 @@ async function readAllowances(rpc, token, owner) {
 
 function buildErc20Approve(token, amount) {
   return { to: token, data: SEL.approve + addrWord(RH.permit2) + w(amount) };
+}
+
+// ТЕ ЖЕ ДВЕ ОПЕРАЦИИ, НО С ЛЮБЫМ ПОЛУЧАТЕЛЕМ РАЗРЕШЕНИЯ.
+//
+// Пара выше намертво привязана к Permit2 и PositionManager — и правильно:
+// путь входа в позицию всегда один и тот же, и возможность указать туда
+// произвольный адрес была бы не гибкостью, а дырой.
+//
+// Автопродаже нужен другой получатель: роутер агрегатора. Поэтому отдельная
+// пара, где адрес приходит снаружи. Тот же принцип, что и у Permit2: даём
+// РОВНО ту сумму, которую продаём, и ни монетой больше. Бессрочное разрешение
+// на весь баланс — это подарок первому же фишингу, а сумма здесь известна
+// точно, так что экономить на этом нечего.
+async function readErc20Allowance(rpc, token, owner, spender) {
+  const raw = await ethCall(rpc, token,
+    SEL.allowance + addrWord(owner) + addrWord(spender));
+  // Узел на пустой ответ отдаёт '0x', а не '0x0', и BigInt('0x') не ноль —
+  // это исключение. Здесь оно означало бы «не смог прочитать разрешение» и
+  // сорвало бы продажу; правильный ответ на пустоту — ноль, то есть
+  // «разрешения нет, выдай его».
+  return /^0x[0-9a-fA-F]+$/.test(raw || '') ? BigInt(raw) : 0n;
+}
+
+function buildApproveTo(token, spender, amount) {
+  return { to: token, data: SEL.approve + addrWord(spender) + w(amount) };
+}
+
+// ТЕ ЖЕ ДВА ШАГА PERMIT2, НО ДЛЯ ЛЮБОГО ПОЛУЧАТЕЛЯ.
+//
+// UniversalRouter забирает монету не сам, а через Permit2 — точно как
+// PositionManager на входе в позицию. Значит и разрешений нужно два: монета
+// разрешает Permit2, Permit2 разрешает роутеру. Пара выше намертво привязана
+// к PositionManager, и это правильно; здесь получатель приходит снаружи.
+//
+// Сумма — ровно та, что продаётся. Срок короткий: разрешение переживает
+// сделку на считаные минуты и дальше не висит.
+async function readPermit2Allowance(rpc, token, owner, spender) {
+  const raw = await ethCall(rpc, RH.permit2,
+    SEL.p2allowance + addrWord(owner) + addrWord(token) + addrWord(spender));
+  const pw = words(raw);
+  return {
+    amount: pw.length ? BigInt('0x' + pw[0].slice(24)) : 0n,       // uint160
+    expiration: pw.length > 1 ? Number(BigInt('0x' + pw[1])) : 0,
+  };
+}
+
+function buildPermit2ApproveTo(token, spender, amount, expirationUnix) {
+  const MAX160 = (1n << 160n) - 1n;
+  const MAX48 = (1n << 48n) - 1n;
+  if (BigInt(amount) > MAX160) throw new Error('сумма не влезает в uint160');
+  if (BigInt(expirationUnix) > MAX48) throw new Error('срок не влезает в uint48');
+  return {
+    to: RH.permit2,
+    data: SEL.p2approve + addrWord(token) + addrWord(spender) +
+          w(amount) + w(expirationUnix),
+  };
+}
+
+// Что нужно сделать до свапа. Пусто — значит всё уже разрешено.
+async function planSwapApprovals(rpc, token, owner, amount, nowUnix, ttl = 1800) {
+  const steps = [];
+  if (isNativeCurrency(token)) return steps;      // у нативной монеты нет approve
+  const toPermit2 = await readErc20Allowance(rpc, token, owner, RH.permit2);
+  if (toPermit2 < BigInt(amount)) {
+    steps.push({ what: 'разрешить Permit2 тратить монету',
+                 tx: buildErc20Approve(token, amount) });
+  }
+  const p2 = await readPermit2Allowance(rpc, token, owner, RH.universalRouter);
+  if (p2.amount < BigInt(amount) || p2.expiration <= nowUnix + 60) {
+    steps.push({ what: 'разрешить роутеру взять монету через Permit2',
+                 tx: buildPermit2ApproveTo(token, RH.universalRouter,
+                                           amount, nowUnix + ttl) });
+  }
+  return steps;
 }
 
 function buildPermit2Approve(token, amount, expirationUnix) {
@@ -1539,6 +1980,11 @@ const API = {
   assertChain, assertContracts, words, toSigned, stripHex, addrWord, hex,
   buildMintCalldata, encodeMintParams, encodeSettlePair, encodeUnlockData,
   readAllowances, buildErc20Approve, buildPermit2Approve, planApprovals, simulate,
+  readErc20Allowance, buildApproveTo,
+  quoteSwapSingle, buildSwapCalldata, encodePoolKey, encodeExactInSingle,
+  pickBestSwap, planSwap, quoteSwapPath, buildSwapPathCalldata,
+  encodePathKey, encodePath, encodeExactInPath, findPoolsByKey, computePoolId, FEE_TIERS, readPermit2Allowance, buildPermit2ApproveTo, planSwapApprovals,
+  encBytes, encBytesArray, encodeV4Swap, encodeCurrencyAmount,
   buildCloseCalldata, encodeDecreaseParams, encodeTakePair, encodeSweep, isNativeCurrency,
   readPositionLiquidity, readPositionPool, MSG_SENDER, unpackTicks, readFees, poolDepth,
   CHAINS, useChain,
