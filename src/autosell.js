@@ -6,28 +6,35 @@
 // видно целиком и они проверяются тестом. Это единственное место терминала,
 // где деньги уходят без нажатия «продать», и цена ошибки здесь выше обычной.
 //
-// ПОЧЕМУ БЕЗ ВНЕШНИХ СЛУЖБ.
+// ЧЕМ ИСПОЛНЯЕТСЯ ПРОДАЖА И ПОЧЕМУ ИМЕННО ТАК.
 //
-// Сначала здесь был агрегатор KyberSwap: он искал маршрут и отдавал готовую
-// сделку. Работало, но это чужая служба в интернете — она может лечь, закрыть
-// доступ браузеру или перестать знать нашу сеть. Всё, что она делала,
-// считается на цепочке:
+// Исполняет агрегатор KyberSwap: он ищет маршрут и отдаёт готовую к подписи
+// сделку вместе с адресом своего роутера. Его роутер берёт монету обычным
+// approve, без Permit2 — значит одно разрешение один раз, а не два.
 //
-//   * пулы монеты терминал и так перебирает — poolsOfToken;
-//   * сколько дадут в каждом, считает Quoter самого Uniswap, через eth_call;
-//   * исполняет UniversalRouter — без посредника тут никак, свап в V4 идёт
-//     через unlock() у PoolManager, а это требует контракта.
+// Свой путь — перебор пулов, котировка через V4Quoter, сборка для
+// UniversalRouter — собран, лежит в ядре и покрыт тестами. Считает он верно:
+// на монете с 27 прямыми пулами дал 14.3334 USDG против 14.3336 у агрегатора,
+// а на CHUMP нашёл путь через нативную монету в шестнадцать раз выгоднее
+// прямого. Но в бою он НЕ РАБОТАЕТ на парах ERC-20: свап откатывается без
+// данных об ошибке.
 //
-// Quoter и UniversalRouter — контракты Uniswap из той же связки, что
-// PoolManager и PositionManager, которыми терминал пользуется с первого дня.
-// Внешних служб не осталось ни одной: страница говорит только с узлом сети.
+// Что проверено и исключено (замеры на живой сети, блок 60261034):
+//   кодирование верно — тем же кодировщиком свап НАТИВНОЙ монеты проходит;
+//   ключи пулов верны — пересчёт из ключа совпал с PoolId из событий;
+//   пул живой — sqrtPrice ненулевой, ликвидность есть;
+//   монета на кошельке была, разрешения были, Permit2.transferFrom проходит;
+//   роутер тот самый — poolManager() совпадает с нашим;
+//   не проскальзывание, не сумма, не газ, не направление.
+// Если оставить одно действие «только свап», нативный пул отвечает внятным
+// CurrencyNotSettled (то есть свап ИСПОЛНИЛСЯ), а ERC-20 — пустым откатом.
+// Причина не найдена; трассировка на доступном тарифе узла закрыта.
 //
-// Замерено при переходе, пара с 27 прямыми пулами: свой перебор дал 14.3334
-// USDG, агрегатор — 14.3336. Тот же оптимум.
-//
-// ЧТО ПОТЕРЯНО ЧЕСТНО: маршруты в несколько шагов и дробление сделки между
-// пулами. Мы продаём монету в стейбл, с которым она в паре, — путь прямой.
-// Если прямого пула нет, терминал скажет об этом, а не пойдёт вслепую.
+// Урок на будущее: структурные тесты этого не поймали, потому что разбирают
+// собранное той же логикой, какой собирают, — общее заблуждение проходит
+// насквозь. Сверяться надо с НАСТОЯЩЕЙ успешной транзакцией, как сделано для
+// входа и выхода. Как только такая найдётся — свой путь можно включать и
+// внешняя служба уйдёт совсем.
 //
 // ПРО КОМИССИИ. Отдельно они не продаются никогда. Пул отдаёт накопленное
 // вместе с телом позиции одним движением, и уходит оно тем же одним свапом.
@@ -170,7 +177,85 @@ const RHAutoSell = (() => {
     return Math.min(5000, Math.max(1, Math.round(Number(S.slippage) * 100)));
   }
 
+  // ── АГРЕГАТОР ─────────────────────────────────────────────────────────────
+  //
+  // Два обращения, и оба обязательны. Первое ищет маршрут, второе превращает
+  // найденный маршрут в готовую сделку. Разделено это не нами: маршрут живёт
+  // недолго, и собирать от несвежего нельзя — ровно на этом живая продажа уже
+  // отваливалась, когда между расчётом и подписью проходило двадцать секунд.
+  //
+  // Ходит прямо из браузера: агрегатор отвечает `access-control-allow-origin`
+  // с нашим адресом, посредник на своей машине не нужен.
+  const API = 'https://aggregator-api.kyberswap.com';
+
+  // Нативная монета у агрегатора обозначается псевдоадресом, а не нулями,
+  // которыми её пишет Uniswap V4. Перепутать — получить маршрут в
+  // несуществующий токен.
+  const NATIVE_PSEUDO = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+  const forApi = (a) => (/^0x0{40}$/i.test(a || '') ? NATIVE_PSEUDO : a);
+
+  async function ask(url, init) {
+    const r = await fetch(url, init);
+    const text = await r.text();
+    let j = null;
+    try { j = JSON.parse(text); } catch (e) { /* Cloudflare отвечает html */ }
+    if (!r.ok || !j) {
+      throw new Error(`агрегатор ответил ${r.status}: ` +
+                      ((j && j.message) || text.slice(0, 120)));
+    }
+    // Свой код поверх HTTP: 200 с code!=0 это отказ.
+    if (j.code !== 0) throw new Error(`агрегатор: ${j.message || 'код ' + j.code}`);
+    return j.data;
+  }
+
+  async function route(chain, tokenIn, tokenOut, amountIn) {
+    const q = new URLSearchParams({
+      tokenIn: forApi(tokenIn), tokenOut: forApi(tokenOut), amountIn: String(amountIn),
+    });
+    return ask(`${API}/${chain}/api/v1/routes?${q}`, { headers: { 'x-client-id': 'lp-evm-rh' } });
+  }
+
+  async function build(chain, routeSummary, sender, slippageBpsValue) {
+    return ask(`${API}/${chain}/api/v1/route/build`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-client-id': 'lp-evm-rh' },
+      body: JSON.stringify({
+        routeSummary,
+        sender, recipient: sender,      // продаём себе же, посредников нет
+        slippageTolerance: slippageBpsValue,
+        source: 'lp-evm-rh',
+      }),
+    });
+  }
+
+  // Всё вместе: от «сколько монеты» до готовой к подписи сделки.
+  // Роутер отдаётся отдельно — ему нужно разрешение до отправки.
+  async function plan({ chain, tokenIn, tokenOut, amountIn, sender, slippageBps: bps }) {
+    const r = await route(chain, tokenIn, tokenOut, amountIn);
+    const b = await build(chain, r.routeSummary, sender, bps);
+    const router = b.routerAddress || r.routerAddress;
+    return {
+      to: router, router, data: b.data,
+      amountOut: BigInt(b.amountOut || r.routeSummary.amountOut || 0),
+      amountInUsd: Number(r.routeSummary.amountInUsd || 0),
+      amountOutUsd: Number(r.routeSummary.amountOutUsd || 0),
+      gasUsd: Number(r.routeSummary.gasUsd || 0),
+      // Сколько площадок в маршруте: одна означает, что дробить было не по
+      // чему, и проскальзывание будет как в том пуле.
+      hops: (r.routeSummary.route || []).reduce((n, leg) => n + leg.length, 0),
+    };
+  }
+
+  // Узнать адрес роутера, ничего не собирая. Нужен ДО котировки: разрешение
+  // выдаём первым, чтобы между расчётом цены и подписью не было пауз.
+  async function routerFor(chain, tokenIn, tokenOut, amountIn) {
+    const r = await route(chain, tokenIn, tokenOut, amountIn);
+    if (!r.routerAddress) throw new Error('агрегатор не назвал адрес роутера');
+    return r.routerAddress;
+  }
+
   return { load, save, settings: S, decide, slippageBps,
+           route, build, plan, routerFor, forApi, NATIVE_PSEUDO, API,
            coinSide, isUsdStable, STABLE, USD_STABLE };
 })();
 
