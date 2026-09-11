@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '6.3.0';
+  const VERSION = '6.3.1';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -1637,8 +1637,11 @@
   function amtRow() {
     const sell = state.intent === 'sell';
     const sym = depBal ? depBal.sym : (sell ? 'монета' : quoteSym());
+    // «вносим МОНЕТУ» остаётся в подписи всегда: сторона не меняется, и
+    // единица поля не должна читаться как выбор того, что вносить.
     $('l-amt').textContent = sell
-      ? `сколько вносим, ${state.amtUnit === 'quote' ? quoteSym() : sym}`
+      ? `сколько монеты вносим (${state.amtUnit === 'quote'
+          ? 'набираем в ' + quoteSym() : 'набираем в штуках'})`
       : `сумма, ${sym}`;
     if (!sell) {
       // Суммы под реальную работу: прежние 1/2/5/10 остались от проверок на
@@ -1691,21 +1694,8 @@
     // деньги переводятся в них здесь же. Весь расчёт ниже не знает об этом
     // вовсе — и правится ровно одно место, а не пять.
     const price = state.slot0 ? priceOf(state.slot0.tick) : 0;
-    const units = document.createElement('span');
-    units.className = 'chains';
-    for (const [k, t] of [['coin', sym], ['quote', quoteSym()]]) {
-      const b = document.createElement('button');
-      b.textContent = t;
-      if (state.amtUnit === k) b.className = 'on';
-      // Без цены пула перевести деньги в монеты нечем — и врать, что можно,
-      // нельзя: человек введёт 30 и получит 30 штук вместо тридцати долларов.
-      b.disabled = (k === 'quote' && !price);
-      b.onclick = () => { state.amtUnit = k; amtRow(); save(); };
-      units.appendChild(b);
-    }
-    host.appendChild(units);
-
     const inQuote = state.amtUnit === 'quote' && price > 0;
+
     const own = document.createElement('input');
     own.type = 'text'; own.className = 'own';
     own.placeholder = inQuote ? 'своё, ' + quoteSym() : 'своё';
@@ -1722,6 +1712,33 @@
       amtRow(); recalc(); save();
     };
     host.appendChild(own);
+
+    // ЭТО ЕДИНИЦЫ ПОЛЯ, А НЕ ВЫБОР СТОРОНЫ.
+    //
+    // Первая версия подписывала эти кнопки символами монет — FLYBRAIN и USDG —
+    // и ставила их ПЕРЕД полем, рядом с долями баланса. Читалось это как
+    // второй выбор стороны, противоречащий ряду «ПРОДАТЬ монету за стейбл»
+    // выше: будто можно внести стейбл. Вносится всегда монета, меняется только
+    // то, в чём набирается число.
+    //
+    // Поэтому подписи говорят про единицы, а не про монеты, и стоят они ПОСЛЕ
+    // поля, к которому относятся.
+    const units = document.createElement('span');
+    units.className = 'chains';
+    for (const [k, t] of [['coin', 'в штуках'], ['quote', 'в ' + quoteSym()]]) {
+      const b = document.createElement('button');
+      b.textContent = t;
+      if (state.amtUnit === k) b.className = 'on';
+      // Без цены пула перевести деньги в монеты нечем — и врать, что можно,
+      // нельзя: человек введёт 30 и получит 30 штук вместо тридцати долларов.
+      b.disabled = (k === 'quote' && !price);
+      b.title = k === 'coin'
+        ? 'число в поле — штуки монеты'
+        : `число в поле — ${quoteSym()}, пересчитается в монету по цене пула`;
+      b.onclick = () => { state.amtUnit = k; amtRow(); save(); };
+      units.appendChild(b);
+    }
+    host.appendChild(units);
 
     // Что это в другой единице — чтобы не считать в уме и не промахнуться
     // на порядок.
