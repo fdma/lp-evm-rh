@@ -2831,66 +2831,15 @@
         return;
       }
 
-      // Маршрут выбирает ядро: сравнивает прямой пул с путём через нативную
-      // монету и берёт лучший. Отбирать пулы здесь не надо — оно само.
-      const plan = await C.planSwap(state.rpc, {
-        pools, coin: d.addr, stable: d.into, amountIn: d.raw,
-        slippageBps: AS.slippageBps(),
-        deadline: Math.floor(Date.now() / 1000) + 300,
-        keccak256: window.keccak256,
-        hubPools: await hubFor(d.into),
-      });
-
-      // Человеческие числа для журнала и для предохранителя.
-      const decIn = d.dec, decOut = d.intoDec;
-      const outHuman = (decOut == null) ? null : Number(plan.amountOut) / Math.pow(10, decOut);
-      const inHuman = d.amount;
-
-      const where = plan.hops === 2
-        ? `маршрут через нативную монету` +
-          (plan.betterThanDirect
-            ? ` — в ${plan.betterThanDirect.toFixed(1)} раза выгоднее прямого пула`
-            : '')
-        : `прямой пул ${plan.pool.slice(0, 10)}… комиссия ` +
-          `${(plan.fee / 10000).toFixed(3)}% (из ${plan.live} живых, проверено ${plan.tried})`;
-      log(`автопродажа: ${where}. Дадут ` +
-          `${outHuman == null ? plan.amountOut + ' (в базовых единицах)' : outHuman.toFixed(6)} ` +
-          `${d.intoSym}`, 'ok');
-
-      // ЦЕНА ВЫХОДА — В ЖУРНАЛ, НО НЕ В ЗАПРЕТ.
+      // РАЗРЕШЕНИЯ ВЫДАЁМ ДО КОТИРОВКИ, А НЕ ПОСЛЕ.
       //
-      // Автопродажа не останавливается никогда: вышел — продал. Но посчитать,
-      // во сколько обошёлся выход, и сказать об этом мы обязаны.
+      // Это не косметика. Раньше было наоборот: посчитали цену, потом два окна
+      // кошелька, двадцать секунд — и свап уходил по котировке двадцатиоднасе-
+      // кундной давности. Сеть его отклоняла: цена ушла за проскальзывание.
+      // Сначала разрешения, потом свежая цена, сразу за ней отправка.
       //
-      // Считаем от цены пула, ИЗ КОТОРОГО ВЫШЛИ, а не того, в который продаём.
-      // Замер на живой монете: у CHUMP вся ликвидность идёт через посредника,
-      // прямой пул со стейблом мусорный и отдаёт 0.83 вместо 15 долларов. По
-      // его собственной кривой цене сделка выглядит безупречной — перекос в
-      // восемнадцать раз стал бы невидим. Пул позиции — та самая цена, которую
-      // терминал показывал на экране.
-      //
-      // Слипаж такое не ловит: он сравнивает с котировкой, а не с ценой. Если
-      // котировка уже мусорная, слипаж её пропустит.
-      if (decIn != null && decOut != null && inHuman != null && outHuman != null
-          && ctx.homePool) {
-        try {
-          const s0 = await C.readSlot0(state.rpc, ctx.homePool);
-          const price = Math.pow(1.0001, s0.tick) * Math.pow(10, decIn - decOut);
-          const worth = (d.side === 0) ? inHuman * price : (price ? inHuman / price : 0);
-          if (worth > 0) {
-            const lossPct = (1 - outHuman / worth) * 100;
-            const line = `автопродажа: по цене пула позиции это ` +
-                         `${worth.toFixed(6)} ${d.intoSym}, выход стоит ` +
-                         `${lossPct.toFixed(1)}%`;
-            // Десять процентов — не запрет, а граница, за которой человек
-            // должен увидеть строку жёлтой, а не серой.
-            log(line, lossPct > 10 ? 'warn' : 'dim');
-          }
-        } catch (e) { log('автопродажа: цену выхода посчитать не смог', 'dim'); }
-      }
-
-      // РАЗРЕШЕНИЯ. Роутер берёт монету через Permit2 — тот же путь, что у
-      // входа в позицию, и те же два шага.
+      // Сами разрешения теперь бессрочные и на месяц, так что в устоявшемся
+      // состоянии этот блок молчит и окон не будет вовсе.
       const now = Math.floor(Date.now() / 1000);
       const steps = await C.planSwapApprovals(state.rpc, d.addr, state.account, d.raw, now);
       for (const st of steps) {
@@ -2904,17 +2853,89 @@
         }
       }
 
-      const hash = await W.send({
-        from: state.account, to: plan.to, data: plan.data,
-        value: isNative(d.addr) ? '0x' + BigInt(d.raw).toString(16) : '0x0',
-      });
-      log('автопродажа: продажа отправлена ' + hash, 'ok');
+      // ПОПЫТКИ. Отказ по цене — не повод звать человека руками.
+      //
+      // Выбора всё равно нет: позиция уже закрыта, монета уже в кошельке, и
+      // держать её никто не собирался. Поэтому пересчитываем заново и идём
+      // снова, расширяя допуск. Каждая попытка называет свои числа, чтобы
+      // потом было видно, чем кончилось и почему.
+      const base = AS.slippageBps();
+      const decIn = d.dec, decOut = d.intoDec;
+      const inHuman = d.amount;
+      let homePrice = null;
+      if (decIn != null && decOut != null && ctx.homePool) {
+        try {
+          const s0 = await C.readSlot0(state.rpc, ctx.homePool);
+          homePrice = Math.pow(1.0001, s0.tick) * Math.pow(10, decIn - decOut);
+        } catch (e) { homePrice = null; }
+      }
 
-      const r = await waitMined(hash);
-      if (r === 'ok') log(`АВТОПРОДАЖА ПРОШЛА: ${d.sym} → ${d.intoSym}`, 'ok');
-      else if (r === 'failed') log('автопродажа: сеть отклонила продажу — ' +
-        'скорее всего цена ушла за проскальзывание, подними его и продай вручную', 'bad');
-      else log('автопродажа: подтверждения не дождался, проверь кошелёк', 'warn');
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        // Допуск расширяем вдвое на каждой попытке, но не дальше половины:
+        // дальше это уже не защита, а согласие отдать монету за бесценок.
+        const bps = Math.min(5000, base * Math.pow(2, attempt - 1));
+
+        const plan = await C.planSwap(state.rpc, {
+          pools, coin: d.addr, stable: d.into, amountIn: d.raw,
+          slippageBps: bps,
+          deadline: Math.floor(Date.now() / 1000) + 120,
+          keccak256: window.keccak256,
+          hubPools: await hubFor(d.into),
+        });
+
+        const outHuman = (decOut == null)
+          ? null : Number(plan.amountOut) / Math.pow(10, decOut);
+        const where = plan.hops === 2
+          ? 'через нативную монету' +
+            (plan.betterThanDirect ? ` (в ${plan.betterThanDirect.toFixed(1)}x выгоднее прямого)` : '')
+          : `прямой пул, комиссия ${(plan.fee / 10000).toFixed(3)}%`;
+        const tail = attempt > 1 ? `, попытка ${attempt}, допуск ${(bps / 100).toFixed(1)}%` : '';
+        log(`автопродажа: ${where}${tail}. Дадут ` +
+            `${outHuman == null ? plan.amountOut + ' (в базовых единицах)' : outHuman.toFixed(6)} ` +
+            `${d.intoSym}`, 'ok');
+
+        // Во сколько обошёлся выход — по цене пула, ИЗ КОТОРОГО вышли.
+        if (homePrice && inHuman != null && outHuman != null) {
+          const worth = (d.side === 0) ? inHuman * homePrice : inHuman / homePrice;
+          if (worth > 0) {
+            const lossPct = (1 - outHuman / worth) * 100;
+            log(`автопродажа: по цене пула позиции это ${worth.toFixed(6)} ` +
+                `${d.intoSym}, выход стоит ${lossPct.toFixed(1)}%`,
+                lossPct > 10 ? 'warn' : 'dim');
+          }
+        }
+
+        let hash;
+        try {
+          hash = await W.send({
+            from: state.account, to: plan.to, data: plan.data,
+            value: isNative(d.addr) ? '0x' + BigInt(d.raw).toString(16) : '0x0',
+          });
+        } catch (e) {
+          // Отказ пришёл из кошелька, а не из сети: человек нажал «отклонить».
+          // Повторять нечего — это его решение.
+          log('автопродажа: кошелёк отказал — ' + e.message, 'bad');
+          return;
+        }
+        log('автопродажа: продажа отправлена ' + hash, 'ok');
+
+        const r = await waitMined(hash);
+        if (r === 'ok') {
+          log(`АВТОПРОДАЖА ПРОШЛА: ${d.sym} → ${d.intoSym}`, 'ok');
+          return;
+        }
+        if (r === 'timeout') {
+          log('автопродажа: подтверждения не дождался, проверь кошелёк', 'warn');
+          return;
+        }
+        if (attempt === 3) {
+          log('автопродажа: сеть отклонила три раза подряд — цена уходит быстрее, ' +
+              'чем мы успеваем. Монета в кошельке, продай вручную.', 'bad');
+          return;
+        }
+        log(`автопродажа: сеть отклонила — цена ушла. Пересчитываю и пробую снова ` +
+            `с допуском ${(Math.min(5000, base * Math.pow(2, attempt)) / 100).toFixed(1)}%`, 'warn');
+      }
     } catch (e) {
       log('автопродажа не вышла: ' + e.message, 'bad');
     } finally {

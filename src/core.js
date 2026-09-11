@@ -1660,20 +1660,20 @@ function computePoolId(c0, c1, fee, tickSpacing, hooks, keccak256) {
 // (нативная монета со стейблом) этого достаточно — такие пулы стандартные.
 async function findPoolsByKey(rpc, c0, c1, keccak256) {
   const [a, b] = c0.toLowerCase() < c1.toLowerCase() ? [c0, c1] : [c1, c0];
-  const out = [];
-  for (const [fee, tickSpacing] of FEE_TIERS) {
+  // Пробы независимы — спрашиваем разом. По очереди это около пяти секунд на
+  // первой же продаже, а они целиком уходят в устаревание котировки.
+  const out = (await Promise.all(FEE_TIERS.map(async ([fee, tickSpacing]) => {
     const poolId = computePoolId(a, b, fee, tickSpacing, null, keccak256);
     try {
       const s0 = await ethCall(rpc, RH.stateView, SEL.getSlot0 + stripHex(poolId));
-      const sqrt = BigInt('0x' + words(s0)[0]);
-      if (sqrt === 0n) continue;                       // такого пула нет
+      if (BigInt('0x' + words(s0)[0]) === 0n) return null;   // такого пула нет
       const liq = BigInt(await ethCall(rpc, RH.stateView,
                                        SEL.getLiquidity + stripHex(poolId)));
-      if (liq === 0n) continue;                        // есть, но пустой
-      out.push({ poolId, currency0: a, currency1: b, fee, tickSpacing,
-                 hooks: '0x' + '0'.repeat(40), liquidity: liq });
-    } catch (e) { /* узел молчит — считаем, что пула нет */ }
-  }
+      if (liq === 0n) return null;                           // есть, но пустой
+      return { poolId, currency0: a, currency1: b, fee, tickSpacing,
+               hooks: '0x' + '0'.repeat(40), liquidity: liq };
+    } catch (e) { return null; }                             // узел молчит
+  }))).filter(Boolean);
   out.sort((x, y) => (y.liquidity > x.liquidity ? 1 : y.liquidity < x.liquidity ? -1 : 0));
   return out;
 }
@@ -1714,14 +1714,27 @@ const feeRank = (p) => ((p.fee & DYNAMIC_FEE) ? 50000 : p.fee);
 // подряд уже нет, поэтому limit остаётся маленьким.
 async function liveCandidates(rpc, pools, probe = 40, limit = 8) {
   const sorted = pools.slice().sort((a, b) => feeRank(a) - feeRank(b));
+  const take = sorted.slice(0, probe);
+
+  // ПРОБЫ ИДУТ ПАЧКАМИ, А НЕ ПО ОЧЕРЕДИ.
+  //
+  // Сорок вызовов подряд — это около двадцати пяти секунд, и всё это время
+  // цена живёт своей жизнью. На живой продаже FLYBRAIN между «продаю» и
+  // котировкой прошло 24 секунды именно здесь. Запросы независимы, ждать их
+  // по очереди незачем; пачка по восемь узел держит спокойно, а времени
+  // уходит в разы меньше.
   const live = [];
-  for (const p of sorted.slice(0, probe)) {
-    if (live.length >= limit) break;
-    try {
-      const L = BigInt(await ethCall(rpc, RH.stateView,
-                                     SEL.getLiquidity + stripHex(p.poolId)));
-      if (L > 0n) live.push({ pool: p, liquidity: L });
-    } catch (e) { /* узел молчит — считаем пул непригодным */ }
+  const CHUNK = 8;
+  for (let i = 0; i < take.length && live.length < limit; i += CHUNK) {
+    const part = take.slice(i, i + CHUNK);
+    const got = await Promise.all(part.map(async (p) => {
+      try {
+        const L = BigInt(await ethCall(rpc, RH.stateView,
+                                       SEL.getLiquidity + stripHex(p.poolId)));
+        return L > 0n ? { pool: p, liquidity: L } : null;
+      } catch (e) { return null; }
+    }));
+    for (const g of got) if (g && live.length < limit) live.push(g);
   }
   return live;
 }
@@ -1736,16 +1749,17 @@ async function pickBestSwap(rpc, pools, coin, amountIn, opts = {}) {
     return a === c || b === c;
   });
   const live = await liveCandidates(rpc, mine, opts.probe, opts.limit);
-  const quotes = [];
-  let dry = 0;
-  for (const { pool } of live) {
+  // Котировки тоже пачкой и по той же причине: они независимы, а каждая
+  // секунда ожидания — это секунда, на которую котировка устареет.
+  const got = await Promise.all(live.map(async ({ pool }) => {
     const zeroForOne = (pool.currency0 || '').toLowerCase() === c;
     try {
       const q = await quoteSwapSingle(rpc, pool, zeroForOne, amountIn);
-      if (q.amountOut > 0n) quotes.push({ pool, zeroForOne, out: q.amountOut });
-      else dry++;
-    } catch (e) { dry++; }
-  }
+      return q.amountOut > 0n ? { pool, zeroForOne, out: q.amountOut } : null;
+    } catch (e) { return null; }
+  }));
+  const quotes = got.filter(Boolean);
+  const dry = got.length - quotes.length;
   quotes.sort((x, y) => (y.out > x.out ? 1 : y.out < x.out ? -1 : 0));
   return { best: quotes[0] || null, tried: mine.length, probed: live.length,
            live: quotes.length };
@@ -1942,19 +1956,40 @@ function buildPermit2ApproveTo(token, spender, amount, expirationUnix) {
 }
 
 // Что нужно сделать до свапа. Пусто — значит всё уже разрешено.
-async function planSwapApprovals(rpc, token, owner, amount, nowUnix, ttl = 1800) {
+// РАЗРЕШЕНИЯ ВЫДАЮТСЯ ОДИН РАЗ И НАДОЛГО.
+//
+// Раньше здесь стояла ровно продаваемая сумма и полчаса жизни — по той же
+// логике, что у входа в позицию. На автопродаже это оказалось неверно: сумма
+// каждый раз другая, срок каждый раз истёк, и человек жал ДВА окна кошелька
+// перед КАЖДОЙ продажей. На живой продаже это стоило двадцати секунд, за
+// которые котировка успела протухнуть и сеть отклонила сделку.
+//
+// Поэтому так, как и задуман Permit2: монета разрешает Permit2 без предела —
+// он и есть слой безопасности, — а Permit2 выдаёт роутеру ограниченное по
+// сроку разрешение. Срок берём длинный, но не вечный: месяц.
+//
+// В установившемся состоянии окон кошелька остаётся ровно одно — сама продажа.
+const MAX_UINT256 = (1n << 256n) - 1n;
+const MAX_UINT160 = (1n << 160n) - 1n;
+const APPROVAL_TTL = 30 * 24 * 3600;
+
+async function planSwapApprovals(rpc, token, owner, amount, nowUnix, ttl = APPROVAL_TTL) {
   const steps = [];
   if (isNativeCurrency(token)) return steps;      // у нативной монеты нет approve
+  const need = BigInt(amount);
+
   const toPermit2 = await readErc20Allowance(rpc, token, owner, RH.permit2);
-  if (toPermit2 < BigInt(amount)) {
-    steps.push({ what: 'разрешить Permit2 тратить монету',
-                 tx: buildErc20Approve(token, amount) });
+  // Перевыдаём заранее, а не впритык: разрешение «ровно на остаток» означало бы
+  // новое окно на следующей же продаже.
+  if (toPermit2 < need) {
+    steps.push({ what: 'разрешить Permit2 тратить эту монету (один раз)',
+                 tx: buildErc20Approve(token, MAX_UINT256) });
   }
   const p2 = await readPermit2Allowance(rpc, token, owner, RH.universalRouter);
-  if (p2.amount < BigInt(amount) || p2.expiration <= nowUnix + 60) {
-    steps.push({ what: 'разрешить роутеру взять монету через Permit2',
+  if (p2.amount < need || p2.expiration <= nowUnix + 3600) {
+    steps.push({ what: 'разрешить роутеру брать монету через Permit2 (на месяц)',
                  tx: buildPermit2ApproveTo(token, RH.universalRouter,
-                                           amount, nowUnix + ttl) });
+                                           MAX_UINT160, nowUnix + ttl) });
   }
   return steps;
 }
