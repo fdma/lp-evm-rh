@@ -1680,33 +1680,75 @@ async function findPoolsByKey(rpc, c0, c1, keccak256) {
 
 // ВЫБОР ПУЛА ДЛЯ ПРОДАЖИ.
 //
-// Своя замена агрегатору. Перебираем прямые пулы монета↔стейбл, спрашиваем у
-// Quoter, сколько дадут в каждом, и берём лучший. Это ровно то, что делал
-// агрегатор, только без чужой службы.
+// Своя замена агрегатору: перебрать пулы, спросить у Quoter, сколько дадут, и
+// взять лучший. Замерено на паре с 27 прямыми пулами: свой выбор дал 14.3334
+// USDG, агрегатор — 14.3336. Тот же оптимум.
 //
-// Замерено на живой паре с 27 прямыми пулами: лучший свой пул дал 14.3334
-// USDG, агрегатор — 14.3336. Разница в две стотысячных доллара, то есть
-// перебором мы находим тот же оптимум.
+// ПОЧЕМУ ПЕРЕБОР ОГРАНИЧЕН, А НЕ СПЛОШНОЙ.
 //
+// Потому что сплошной не работает. У NVDA на этой сети 12 993 пула, из них 255
+// прямых с USDG. Котировка — это eth_call на каждый пул; четыреста запросов
+// подряд узел не отдаёт, и маршрут «не находился» вовсе — не потому, что его
+// нет, а потому, что мы не дождались ответа. На монете с двумя пулами этого
+// было не видно.
+//
+// Поэтому два сита. Сначала по комиссии: через пул её платят всю, и дешёвый
+// почти всегда лучше дорогого. Потом по глубине: у таких монет большинство
+// пулов пустые, и котировать их — впустую жечь запросы. Котируем только то,
+// что прошло оба.
+const DYNAMIC_FEE = 0x800000;
+
+// Динамическую комиссию задаёт хук, и заранее она неизвестна. Ставим такие
+// пулы после статических дешёвых, но впереди откровенно дорогих: среди них
+// попадаются и хорошие, просто гадать по числу нельзя.
+const feeRank = (p) => ((p.fee & DYNAMIC_FEE) ? 50000 : p.fee);
+
+// Живые пулы пары, отобранные и упорядоченные. probe — сколько проверить на
+// глубину, limit — сколько отдать на котировку.
+//
+// probe нельзя жадничать. У CHUMP нужный пул с нативной монетой имеет комиссию
+// 1.002%, а перед ним в порядке комиссии стоят два десятка ПУСТЫХ с 1.000% и
+// 1.001%. При probe=20 не находилось ни одного живого плеча, и монета уходила
+// прямым маршрутом за 0.83 доллара вместо тринадцати. Проверка глубины — один
+// дешёвый вызов, и сорок таких узел переживает спокойно; а вот котировок сорок
+// подряд уже нет, поэтому limit остаётся маленьким.
+async function liveCandidates(rpc, pools, probe = 40, limit = 8) {
+  const sorted = pools.slice().sort((a, b) => feeRank(a) - feeRank(b));
+  const live = [];
+  for (const p of sorted.slice(0, probe)) {
+    if (live.length >= limit) break;
+    try {
+      const L = BigInt(await ethCall(rpc, RH.stateView,
+                                     SEL.getLiquidity + stripHex(p.poolId)));
+      if (L > 0n) live.push({ pool: p, liquidity: L });
+    } catch (e) { /* узел молчит — считаем пул непригодным */ }
+  }
+  return live;
+}
+
 // Пулы без ликвидности отвечают отказом, и это НЕ ошибка: Quoter внутри
 // делает настоящий свап и откатывает его. «Здесь столько не налить» — такой
 // же честный ответ, как число.
-async function pickBestSwap(rpc, pools, coin, amountIn) {
+async function pickBestSwap(rpc, pools, coin, amountIn, opts = {}) {
   const c = coin.toLowerCase();
+  const mine = pools.filter(p => {
+    const a = (p.currency0 || '').toLowerCase(), b = (p.currency1 || '').toLowerCase();
+    return a === c || b === c;
+  });
+  const live = await liveCandidates(rpc, mine, opts.probe, opts.limit);
   const quotes = [];
   let dry = 0;
-  for (const p of pools) {
-    const a = (p.currency0 || '').toLowerCase(), b = (p.currency1 || '').toLowerCase();
-    if (a !== c && b !== c) continue;
-    const zeroForOne = a === c;
+  for (const { pool } of live) {
+    const zeroForOne = (pool.currency0 || '').toLowerCase() === c;
     try {
-      const q = await quoteSwapSingle(rpc, p, zeroForOne, amountIn);
-      if (q.amountOut > 0n) quotes.push({ pool: p, zeroForOne, out: q.amountOut });
+      const q = await quoteSwapSingle(rpc, pool, zeroForOne, amountIn);
+      if (q.amountOut > 0n) quotes.push({ pool, zeroForOne, out: q.amountOut });
       else dry++;
     } catch (e) { dry++; }
   }
   quotes.sort((x, y) => (y.out > x.out ? 1 : y.out < x.out ? -1 : 0));
-  return { best: quotes[0] || null, tried: quotes.length + dry, live: quotes.length };
+  return { best: quotes[0] || null, tried: mine.length, probed: live.length,
+           live: quotes.length };
 }
 
 // ОТ «СКОЛЬКО МОНЕТЫ» ДО ГОТОВОЙ К ПОДПИСИ ТРАНЗАКЦИИ.
@@ -1739,15 +1781,10 @@ async function planSwap(rpc, { pools, coin, stable, amountIn, slippageBps,
     // Кандидаты первого шага: пулы монеты с нативной. Отбираем по глубине —
     // пустых у таких монет большинство, и гонять по ним котировки впустую
     // значит упереться в ограничение узла.
-    const legs = [];
-    for (const p of pools.filter(p => has(p, c) && has(p, NATIVE))) {
-      try {
-        const liq = BigInt(await ethCall(rpc, RH.stateView,
-                                         SEL.getLiquidity + stripHex(p.poolId)));
-        if (liq > 0n) legs.push({ p, liq });
-      } catch (e) { /* узел молчит — пропускаем */ }
-    }
-    legs.sort((x, y) => (y.liq > x.liq ? 1 : y.liq < x.liq ? -1 : 0));
+    // Тем же ситом, что и прямые: у NVDA одних только пулов с нативной 112.
+    const legsLive = await liveCandidates(rpc, pools.filter(p => has(p, c) && has(p, NATIVE)),
+                                          40, maxLegs);
+    const legs = legsLive.map(x => ({ p: x.pool, liq: x.liquidity }));
 
     // Узловые пулы нативная/стейбл журналом не найти — у стейбла их слишком
     // много. Вычисляем ключ и спрашиваем напрямую; результат можно передать
@@ -1982,7 +2019,7 @@ const API = {
   readAllowances, buildErc20Approve, buildPermit2Approve, planApprovals, simulate,
   readErc20Allowance, buildApproveTo,
   quoteSwapSingle, buildSwapCalldata, encodePoolKey, encodeExactInSingle,
-  pickBestSwap, planSwap, quoteSwapPath, buildSwapPathCalldata,
+  pickBestSwap, planSwap, liveCandidates, DYNAMIC_FEE, quoteSwapPath, buildSwapPathCalldata,
   encodePathKey, encodePath, encodeExactInPath, findPoolsByKey, computePoolId, FEE_TIERS, readPermit2Allowance, buildPermit2ApproveTo, planSwapApprovals,
   encBytes, encBytesArray, encodeV4Swap, encodeCurrencyAmount,
   buildCloseCalldata, encodeDecreaseParams, encodeTakePair, encodeSweep, isNativeCurrency,
