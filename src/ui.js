@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '6.4.0';
+  const VERSION = '6.5.0';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -1414,6 +1414,41 @@
         log('отправлено: ' + h, 'ok');
       } catch (e) { log('отказ: ' + e.message, 'bad'); return; }
     }
+    await armAutosell();
+  }
+
+  // РАЗРЕШЕНИЕ НА ПРОДАЖУ ВЫДАЁМ ЗАРАНЕЕ, ЗДЕСЬ.
+  //
+  // Роутеру агрегатора нужно разрешение на МОНЕТУ — ту сторону пары, которая
+  // вернётся при выходе. Владеть ею для этого не нужно: approve не проверяет
+  // баланс, и выдать его можно ещё до входа в позицию.
+  //
+  // Раньше оно выдавалось при ПЕРВОЙ продаже каждой новой монеты — то есть
+  // ровно в тот момент, когда монета уже в кошельке, цена уходит, а человек
+  // ждёт окна кошелька. ARM никуда не спешит, и место ему здесь.
+  //
+  // Окон в сумме столько же, просто одно переезжает туда, где оно ничего не
+  // стоит. Если автопродажа выключена — не просим вовсе.
+  async function armAutosell() {
+    if (!AS.settings.on || !C.RH.kyberRouter || !state.pool) return;
+    const st = stableSide();
+    if (st === null) return;                    // без стейбла продавать нечего
+    const coin = st === 0 ? state.pool.currency1 : state.pool.currency0;
+    if (isNative(coin)) return;                 // у нативной монеты нет approve
+    try {
+      const have = await C.readErc20Allowance(state.rpc, coin, state.account,
+                                              C.RH.kyberRouter);
+      if (have > 0n) return;                    // уже выдано, молчим
+      const sym = st === 0 ? state.pool.sym1 : state.pool.sym0;
+      log(`прошу подпись: разрешение на продажу ${sym} (один раз, чтобы выход ` +
+          `потом шёл без окна)`);
+      const ap = C.buildApproveTo(coin, C.RH.kyberRouter, (1n << 256n) - 1n);
+      const h = await W.send({ from: state.account, to: ap.to, data: ap.data });
+      log('отправлено: ' + h, 'ok');
+    } catch (e) {
+      // Отказ здесь не мешает войти: разрешение переспросится при продаже.
+      log('разрешение на продажу не выдано — попрошу при выходе: ' + e.message, 'warn');
+    }
   }
 
   async function open() {
@@ -1961,25 +1996,55 @@
     // Заголовок «читаю…» держим до первой строки: пустая таблица читается как
     // «позиций нет», а это не то же самое, что «ещё считаю».
     tb.innerHTML = '';
-    for (const { id, liq } of live) {
-      let info = null;
-      try {
-        info = await C.readPositionPool(state.rpc, id);
-      } catch (e) { continue; }
+
+    // ── ВСЁ ЧТЕНИЕ ДЕЛАЕТСЯ ДО ЦИКЛА И РАЗОМ ────────────────────────────────
+    //
+    // Раньше цикл читал узел по одной позиции: ключ пула, цена, комиссии — и
+    // всё это последовательно, внутри каждой позиции и между ними. При
+    // задержке узла около 170 мс и пяти позициях набегало порядка трёх с
+    // половиной секунд, и это крутилось в фоне каждые двадцать секунд.
+    //
+    // Запросы между собой независимы. Теперь они уходят двумя волнами
+    // (сначала ключи пулов, потом цена и комиссии — вторая волна зависит от
+    // первой), а makeRpc складывает каждую волну в ОДНУ пачку. Вместо N×4
+    // обращений получается два.
+    //
+    // Тело цикла ниже не изменилось: оно берёт готовое из pre вместо await.
+    const pre = new Map();
+    {
+      const keys = await Promise.all(live.map(async ({ id }) => {
+        try { return [id, await C.readPositionPool(state.rpc, id)]; }
+        catch (e) { return [id, null]; }
+      }));
       if (stale()) return;
+      for (const [id, info] of keys) pre.set(id, { info });
+
+      await Promise.all(live.map(async ({ id }) => {
+        const e = pre.get(id);
+        if (!e || !e.info) return;
+        e.t = C.unpackTicks(e.info.info);
+        e.poolId = poolIdOf(e.info.key);
+        const [s0, fees, d0, d1, sym0, sym1] = await Promise.all([
+          C.readSlot0(state.rpc, e.poolId).catch(() => null),
+          C.readFees(state.rpc, e.poolId, id, e.t.tickLower, e.t.tickUpper,
+                     window.keccak256).catch(() => null),
+          tokenDecimals(e.info.key.currency0).catch(() => 18),
+          tokenDecimals(e.info.key.currency1).catch(() => 18),
+          tokenSymbol(e.info.key.currency0),
+          tokenSymbol(e.info.key.currency1),
+        ]);
+        Object.assign(e, { s0, fees, d0, d1, sym0, sym1 });
+      }));
+      if (stale()) return;
+    }
+
+    for (const { id, liq } of live) {
+      const P = pre.get(id);
+      if (!P || !P.info) continue;
       shown++;
-      const t = C.unpackTicks(info.info);
-      const poolId = poolIdOf(info.key);
-      let s0 = null, fees = null;
-      try { s0 = await C.readSlot0(state.rpc, poolId); } catch (e) { /* нет цены */ }
-      try {
-        fees = await C.readFees(state.rpc, poolId, id, t.tickLower, t.tickUpper,
-                                window.keccak256);
-      } catch (e) { /* комиссии не критичны */ }
-      const d0 = await tokenDecimals(info.key.currency0);
-      const d1 = await tokenDecimals(info.key.currency1);
-      const sym0 = await tokenSymbol(info.key.currency0);
-      const sym1 = await tokenSymbol(info.key.currency1);
+      const info = P.info, t = P.t, poolId = P.poolId;
+      const s0 = P.s0, fees = P.fees;
+      const d0 = P.d0, d1 = P.d1, sym0 = P.sym0, sym1 = P.sym1;
 
       // СОСТАВ: сколько чего лежит сейчас и сколько это в стейбле.
       let comp = '—', valueStr = '—', total = null, stableSym = sym1, feesValue = 0;
