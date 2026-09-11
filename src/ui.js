@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '6.5.0';
+  const VERSION = '6.5.1';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -826,14 +826,26 @@
   let pump = null;
   function startPricePump() {
     if (pump) clearInterval(pump);
-    let feedAt = 0;                       // когда подписка в последний раз ожила
+    // ЖИВА ЛИ ПОДПИСКА — ЭТО «ОФОРМЛЕНА ЛИ ОНА», А НЕ «ДАВНО ЛИ ПРИХОДИЛИ
+    // СОБЫТИЯ».
+    //
+    // Сначала я мерил по времени последнего события — и это неверно. В тихом
+    // пуле обменов может не быть часами, подписка при этом совершенно здорова,
+    // а терминал решал бы, что она отвалилась, и возвращался к опросу четыре
+    // раза в секунду. То есть чем спокойнее пул, тем сильнее мы долбили бы узел.
+    //
+    // Признак оформленности — идентификатор, который узел вернул на
+    // eth_subscribe. Он обнуляется при обрыве и появляется снова при
+    // переподключении, то есть отражает ровно то, что нужно.
+    const feedLive = () => {
+      const s = ws.subs.get('price');
+      return Boolean(s && s.id);
+    };
 
     const apply = (s, fromFeed) => {
       state.slot0 = s; state.slot0At = Date.now();
-      if (fromFeed) feedAt = Date.now();
-      const live = Date.now() - feedAt < 30000;
       $('d-price').className = 'dot on';
-      $('s-price').textContent = live ? 'цена живая (подписка)' : 'цена живая';
+      $('s-price').textContent = feedLive() ? 'цена живая (подписка)' : 'цена живая';
       showPrice();
       recalc();
     };
@@ -881,8 +893,11 @@
     let last = 0;
     pump = setInterval(() => {
       if (state.busy) return;
-      const live = Date.now() - feedAt < 30000;
-      const every = live ? 3000 : 250;
+      // С живой подпиской опрос нужен лишь как страховка: он ловит обрыв,
+      // отставание узла и пулы, где обменов давно не было. Раз в пять секунд
+      // для этого более чем достаточно; без подписки возвращаемся к прежним
+      // четырём разам в секунду.
+      const every = feedLive() ? 5000 : 250;
       if (Date.now() - last < every) return;
       last = Date.now();
       tick();
@@ -1723,18 +1738,23 @@
     const host = $('walletbal');
     if (!host) return;
     if (!state.account || !state.rpc) { host.textContent = ''; return; }
-    const parts = [];
-    try {
-      const nat = BigInt(await state.rpc('eth_getBalance', [state.account, 'latest']));
-      parts.push(`${(Number(nat) / 1e18).toFixed(4)} ${C.RH.nativeSymbol}`);
-    } catch (e) { parts.push(`${C.RH.nativeSymbol} не прочитался`); }
-    for (const t of (C.RH.wallet || [])) {
-      try {
-        const raw = BigInt(await C.ethCall(state.rpc, t.addr,
-          C.SEL.balanceOf + C.addrWord(state.account)));
-        parts.push(`${(Number(raw) / Math.pow(10, t.dec)).toFixed(2)} ${t.sym}`);
-      } catch (e) { parts.push(`${t.sym} не прочитался`); }
-    }
+    // Балансы друг от друга не зависят — спрашиваем их РАЗОМ, и makeRpc
+    // складывает всё в одну пачку. По очереди это было столько обращений,
+    // сколько монет в списке, и повторялось каждые двадцать секунд в фоне.
+    //
+    // Порядок в строке сохраняем прежний: сначала нативная, потом стейблы как
+    // они перечислены в описании сети.
+    const wallet = C.RH.wallet || [];
+    const [nat, ...rest] = await Promise.all([
+      state.rpc('eth_getBalance', [state.account, 'latest'])
+        .then(v => `${(Number(BigInt(v)) / 1e18).toFixed(4)} ${C.RH.nativeSymbol}`)
+        .catch(() => `${C.RH.nativeSymbol} не прочитался`),
+      ...wallet.map(t => C.ethCall(state.rpc, t.addr,
+          C.SEL.balanceOf + C.addrWord(state.account))
+        .then(v => `${(Number(BigInt(v)) / Math.pow(10, t.dec)).toFixed(2)} ${t.sym}`)
+        .catch(() => `${t.sym} не прочитался`)),
+    ]);
+    const parts = [nat, ...rest];
     host.innerHTML = 'на кошельке: <b>' + parts.map(esc).join('</b> · <b>') + '</b>';
   }
 
@@ -1872,13 +1892,18 @@
 
     // Что это в другой единице — чтобы не считать в уме и не промахнуться
     // на порядок.
-    if (price > 0 && state.amount) {
+    //
+    // Строку баланса дописываем ТОЛЬКО когда баланс прочитан. Без этой
+    // оговорки предупреждение «баланс не прочитался», которое ставит
+    // loadBalance, затиралось бы строкой «вносим …» — и человек считал бы,
+    // что всё в порядке, хотя долей от баланса взять уже нельзя.
+    if (price > 0 && state.amount && depBal) {
       const other = inQuote
         ? `${fmtNum(state.amount)} ${sym}`
         : `${fmtNum(state.amount * price)} ${quoteSym()}`;
-      $('bal').innerHTML = (depBal
-        ? `на кошельке <b class="num">${fmtNum(depBal.human)}</b> ${esc(sym)} · `
-        : '') + `вносим <b class="num">${esc(other)}</b>`;
+      $('bal').innerHTML =
+        `на кошельке <b class="num">${fmtNum(depBal.human)}</b> ${esc(sym)} · ` +
+        `вносим <b class="num">${esc(other)}</b>`;
     }
   }
 
