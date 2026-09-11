@@ -12,7 +12,10 @@ const OWNER = process.env.RH_TEST_OWNER ||
   '0x0000000000000000000000000000000000000001';   // заведомо пустой адрес
 const USDG  = '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168';
 (async () => {
-  const rpc = C.makeRpc(C.RH.publicRpc);
+  // Публичный узел этой сети легко упирается в «Too Many Requests» — тогда
+  // тест падал не из-за кода, а из-за чужой нагрузки. Свой узел, если задан,
+  // берём первым.
+  const rpc = C.makeRpc(process.env.RH_RPC || C.RH.publicRpc);
   const a = await C.readAllowances(rpc, USDG, OWNER);
   const MAX = (1n << 256n) - 1n;
   console.log(`  ERC20 → Permit2: ${a.erc20ToPermit2 === MAX ? 'БЕССРОЧНО НА ВСЁ' : a.erc20ToPermit2}`);
