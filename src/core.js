@@ -147,11 +147,14 @@ useChain('robinhood');
 const SEL = {
   poolKeys: '0x86b6be7d',                 // poolKeys(bytes25)
   getSlot0: '0xc815641c',                 // getSlot0(bytes32)
-  getPoolAndPositionInfo: '0x7b1b1b1b',   // заполняется при инициализации
   modifyLiquidities: '0xdd46508f',        // modifyLiquidities(bytes,uint256)
   poolManager: '0xdc4c90d3',
   getPositionLiquidity: '0x1efeed33',
-  getPoolAndPositionInfo: '0x7ba03aad',
+  // Ключ был задан ДВАЖДЫ: выше стояла заглушка 0x7b1b1b1b «заполняется при
+  // инициализации», которую никто не заполнял. Работало лишь потому, что
+  // настоящий селектор идёт ниже и затирает её. Переставь строки местами — и
+  // терминал молча перестал бы читать позиции. Нашёл проверяльщик типов.
+  getPoolAndPositionInfo: '0x7ba03aad',   // getPoolAndPositionInfo(uint256)
   getFeeGrowthInside: '0x53e9c1fb',       // getFeeGrowthInside(bytes32,int24,int24)
   getLiquidity: '0xfa6793d5',             // getLiquidity(bytes32)
   getTickBitmap: '0x1c7ccb4c',            // getTickBitmap(bytes32,int16)
