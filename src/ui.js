@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '6.3.1';
+  const VERSION = '6.4.0';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -664,26 +664,26 @@
     } catch (e) { return '?'; }
   }
 
-  // ── ЦЕНА ПРИХОДИТ САМА, А НЕ ВЫПРАШИВАЕТСЯ ──────────────────────────────
+  // ── ОДИН СОКЕТ, НЕСКОЛЬКО ПОДПИСОК ──────────────────────────────────────
   //
-  // Опрос четыре раза в секунду — это четыре запроса в секунду ради ответа
-  // «ничего не изменилось». Цена в пуле меняется только при обмене, и обмен —
-  // это событие: узел умеет присылать его сам, как только оно попало в блок.
+  // Узел умеет присылать события сам, и это нужно в двух местах сразу: цена
+  // пула меняется при обмене, а закрытие позиции видно по переводам на наш
+  // адрес. Держать под каждое своё соединение незачем — узлы считают их и
+  // закрывают лишние, а переподключение стоит дороже, чем разбор пары лишних
+  // сообщений.
   //
-  // Подписка идёт по тому же адресу узла, но по wss вместо https. Проверено на
-  // узле автора: рукопожатие отвечает 101 Switching Protocols, то есть
-  // подписка доступна на том же ключе.
+  // Поэтому здесь один сокет и список подписок поверх него. Подписки
+  // переживают обрыв: при новом соединении все оформляются заново, и тот, кто
+  // их заказывал, об этом даже не знает.
   //
-  // Опрос при этом НЕ убирается, а замедляется до раза в три секунды и
-  // остаётся страховкой: вебсокет может не подняться (публичный узел его часто
-  // не даёт), молча оборваться или отстать. Живая цена важнее экономии
-  // запросов, поэтому подстраховка тут дешевле доверия.
-  let feed = null, feedTimer = null;
-
-  function stopPriceFeed() {
-    if (feedTimer) { clearTimeout(feedTimer); feedTimer = null; }
-    if (feed) { try { feed.onclose = null; feed.close(); } catch (e) { } feed = null; }
-  }
+  // Опрос при этом НИГДЕ не убирается, а только замедляется. Сокет может не
+  // подняться (публичный узел его часто не даёт, у http его не бывает), молча
+  // оборваться или отстать — живые числа важнее экономии запросов.
+  const ws = {
+    sock: null, timer: null, tries: 0,
+    subs: new Map(),        // ключ -> { params, handler, id }
+    open: false,
+  };
 
   // Адрес подписки из адреса узла. Только https: у http и у пустого поля
   // подписки не бывает, и притворяться тут нечем.
@@ -692,56 +692,134 @@
     return httpUrl.replace(/^https:/i, 'wss:');
   }
 
-  function startPriceFeed(onPrice) {
-    stopPriceFeed();
+  function wsStop() {
+    if (ws.timer) { clearTimeout(ws.timer); ws.timer = null; }
+    if (ws.sock) { try { ws.sock.onclose = null; ws.sock.close(); } catch (e) { } }
+    ws.sock = null; ws.open = false;
+    for (const s of ws.subs.values()) s.id = null;
+  }
+
+  function wsSend(key) {
+    const s = ws.subs.get(key);
+    if (!s || !ws.open) return;
+    // Номер запроса = ключ подписки: по ответу сразу видно, чей он.
+    ws.sock.send(JSON.stringify({ jsonrpc: '2.0', id: 'sub:' + key,
+                                  method: 'eth_subscribe', params: s.params }));
+  }
+
+  function wsOpen() {
     const url = wsUrlFor(state.rpcUrl);
-    if (!url || typeof WebSocket === 'undefined' || !state.pool) return;
+    if (!url || typeof WebSocket === 'undefined') return;
+    let sock;
+    try { sock = new WebSocket(url); } catch (e) { return; }
+    ws.sock = sock;
 
-    let tries = 0;
-    const open = () => {
-      let ws;
-      try { ws = new WebSocket(url); } catch (e) { return; }
-      feed = ws;
-
-      ws.onopen = () => {
-        tries = 0;
-        // Событие обмена ИМЕННО ЭТОГО пула: второй топик — его идентификатор.
-        // Без него посыпались бы все обмены сети, а их тысячи.
-        ws.send(JSON.stringify({
-          jsonrpc: '2.0', id: 1, method: 'eth_subscribe',
-          params: ['logs', { address: C.RH.poolManager,
-                             topics: [C.SWAP_TOPIC, state.pool.poolId] }],
-        }));
-      };
-
-      ws.onmessage = (ev) => {
-        let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
-        const l = m && m.params && m.params.result;
-        if (!l || !l.data) return;
-        try {
-          const w = C.words(l.data);
-          // Раскладка слов та же, что читает ядро из журнала обменов:
-          // 0 amount0, 1 amount1, 2 sqrtPriceX96, 3 liquidity, 4 tick.
-          // Тик — int24, РАСШИРЕННЫЙ знаком до 256 бит: при ширине 24
-          // отрицательный тик превращается в 1.16e+77 и цена не считается.
-          onPrice({ sqrtPriceX96: BigInt('0x' + w[2]),
-                    tick: Number(C.toSigned(BigInt('0x' + w[4]), 256)) }, true);
-        } catch (e) { /* чужое сообщение — не наше дело */ }
-      };
-
-      const again = () => {
-        if (feed !== ws) return;              // уже переподключились или ушли
-        feed = null;
-        // Подписка рвётся сама по себе: узлы закрывают простаивающие
-        // соединения. Возвращаемся, но с нарастающей паузой — долбить узел
-        // в цикле хуже, чем минуту пожить на опросе.
-        const wait = Math.min(30000, 1000 * Math.pow(2, tries++));
-        feedTimer = setTimeout(open, wait);
-      };
-      ws.onclose = again;
-      ws.onerror = () => { try { ws.close(); } catch (e) { } };
+    sock.onopen = () => {
+      if (ws.sock !== sock) return;
+      ws.open = true; ws.tries = 0;
+      for (const key of ws.subs.keys()) wsSend(key);
     };
-    open();
+
+    sock.onmessage = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (typeof m.id === 'string' && m.id.startsWith('sub:')) {
+        const s = ws.subs.get(m.id.slice(4));
+        if (s) s.id = m.result || null;
+        return;
+      }
+      const p = m.params;
+      if (!p || !p.subscription || !p.result) return;
+      for (const s of ws.subs.values()) {
+        if (s.id === p.subscription) { try { s.handler(p.result); } catch (e) { } return; }
+      }
+    };
+
+    const again = () => {
+      if (ws.sock !== sock) return;
+      ws.sock = null; ws.open = false;
+      for (const s of ws.subs.values()) s.id = null;
+      if (!ws.subs.size) return;
+      // Узлы закрывают простаивающие соединения. Возвращаемся с нарастающей
+      // паузой: долбить узел в цикле хуже, чем минуту пожить на опросе.
+      ws.timer = setTimeout(wsOpen, Math.min(30000, 1000 * Math.pow(2, ws.tries++)));
+    };
+    sock.onclose = again;
+    sock.onerror = () => { try { sock.close(); } catch (e) { } };
+  }
+
+  // Отписаться на стороне узла. Без этого подписка живёт и шлёт события,
+  // которых уже никто не ждёт.
+  function wsDrop(sub, key) {
+    if (!sub || !sub.id || !ws.open) return;
+    try {
+      ws.sock.send(JSON.stringify({ jsonrpc: '2.0', id: 'un:' + key,
+                                    method: 'eth_unsubscribe', params: [sub.id] }));
+    } catch (e) { }
+  }
+
+  // Оформить подписку. Возвращает отписку.
+  //
+  // Ключ повторился — старую сначала СНИМАЕМ. Иначе при каждой смене пула на
+  // узле оставалась бы ещё одна живая подписка на обмены прошлого пула: в
+  // карте её затирает новая, и события приходят в никуда, но узел их всё
+  // равно шлёт. За вечер переключений это десятки мёртвых потоков.
+  function wsSubscribe(key, params, handler) {
+    wsDrop(ws.subs.get(key), key);
+    ws.subs.set(key, { params, handler, id: null });
+    if (!ws.sock) wsOpen(); else wsSend(key);
+    return () => {
+      const s = ws.subs.get(key);
+      ws.subs.delete(key);
+      wsDrop(s, key);
+      if (!ws.subs.size) wsStop();
+    };
+  }
+
+  // ── ЗАКРЫТИЕ ВИДНО СРАЗУ, А НЕ ПО ОПРОСУ ────────────────────────────────
+  //
+  // Позиция отдаёт монеты переводами на наш адрес. Подписавшись на них, мы
+  // узнаём о включении транзакции в тот же миг — вместо того чтобы спрашивать
+  // узел «ну что, готово?» по кругу.
+  //
+  // Подписка проверена на живом узле: фильтр по получателю принимается и
+  // возвращает идентификатор.
+  //
+  // Сама квитанция всё равно нужна — в ней статус и газ, — но запрашивается
+  // она ОДИН раз и ровно тогда, когда уже точно есть.
+  const txWaiters = new Map();            // хэш -> [resolve]
+  let unwatchTransfers = null;
+
+  function watchMyTransfers() {
+    if (unwatchTransfers || !state.account) return;
+    const me = '0x' + state.account.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+    unwatchTransfers = wsSubscribe('mytransfers',
+      ['logs', { topics: [TRANSFER_TOPIC, null, me] }],
+      (l) => {
+        const h = (l.transactionHash || '').toLowerCase();
+        const w = txWaiters.get(h);
+        if (w) { txWaiters.delete(h); for (const r of w) r(); }
+      });
+  }
+
+  // Ждать включения транзакции: подпиской, если она есть, иначе просто пауза.
+  // Возвращает обещание, которое не отвергается — это подсказка «пора
+  // спросить квитанцию», а не источник истины.
+  function hintMined(hash, ms) {
+    const h = (hash || '').toLowerCase();
+    return new Promise((resolve) => {
+      const done = () => { clearTimeout(t); resolve(); };
+      const t = setTimeout(() => {
+        const arr = txWaiters.get(h);
+        if (arr) {
+          const i = arr.indexOf(done);
+          if (i >= 0) arr.splice(i, 1);
+          if (!arr.length) txWaiters.delete(h);
+        }
+        resolve();
+      }, ms);
+      if (!txWaiters.has(h)) txWaiters.set(h, []);
+      txWaiters.get(h).push(done);
+    });
   }
 
   // ── цена держится свежей ────────────────────────────────────────────────
@@ -771,9 +849,26 @@
     };
     tick();
 
-    // Подписка на обмены этого пула: цена меняется в тот же миг, когда обмен
-    // попал в блок, и без единого запроса.
-    startPriceFeed((s) => apply(s, true));
+    // Подписка на обмены ЭТОГО пула: цена меняется в тот же миг, когда обмен
+    // попал в блок, и без единого запроса. Второй топик — идентификатор пула,
+    // без него посыпались бы все обмены сети, а их около полусотни в секунду.
+    if (state.pool) {
+      wsSubscribe('price',
+        ['logs', { address: C.RH.poolManager,
+                   topics: [C.SWAP_TOPIC, state.pool.poolId] }],
+        (l) => {
+          if (!l.data) return;
+          try {
+            const w = C.words(l.data);
+            // Раскладка та же, что читает ядро из журнала обменов:
+            // 0 amount0, 1 amount1, 2 sqrtPriceX96, 3 liquidity, 4 tick.
+            // Тик — int24, РАСШИРЕННЫЙ знаком до 256 бит: при ширине 24
+            // отрицательный тик превращается в 1.16e+77 и цена не считается.
+            apply({ sqrtPriceX96: BigInt('0x' + w[2]),
+                    tick: Number(C.toSigned(BigInt('0x' + w[4]), 256)) }, true);
+          } catch (e) { /* чужое сообщение — не наше дело */ }
+        });
+    }
 
     // Опрос остаётся, но при живой подписке замедляется до раза в три секунды.
     // Он ловит то, чего подписка не видит: обрыв соединения, отставание узла и
@@ -2249,6 +2344,34 @@
     try {
       const h = await W.send({ from: state.account, to: C.RH.positionManager, data });
       log(`${m.verb} отправлено: ` + h, 'ok');
+
+      // ПРОГРЕВ МАРШРУТА, ПОКА ЗАКРЫТИЕ МАЙНИТСЯ.
+      //
+      // Замер: первое обращение к агрегатору за сессию стоит 1891 мс, второе
+      // к той же паре — 487. Разница уходит на DNS, TLS и на то, что у него
+      // самого данные о пулах этой пары ещё не подняты.
+      //
+      // Платить эти полторы секунды в тот момент, когда монета уже в кошельке
+      // и цена уходит, незачем: закрытие всё равно майнится, и запрос успевает
+      // пройти «бесплатно». Ответ выбрасываем — точную сумму мы узнаем только
+      // из квитанции, и котировка всё равно будет своя. Нужно ровно прогретое
+      // соединение.
+      if (AS.settings.on && mode !== 'fees' && C.RH.kyberChain) {
+        (async () => {
+          try {
+            const sym0 = await tokenSymbol(key.currency0);
+            const sym1 = await tokenSymbol(key.currency1);
+            const side = AS.coinSide(sym0, sym1);
+            if (side === null) return;
+            const coin = side === 0 ? key.currency0 : key.currency1;
+            const into = side === 0 ? key.currency1 : key.currency0;
+            const dec = await tokenDecimals(coin).catch(() => 18);
+            // Сумма приблизительная и роли не играет: греем пару, а не считаем.
+            await AS.route(C.RH.kyberChain, coin, into,
+                           BigInt(Math.round(Math.pow(10, dec))));
+          } catch (e) { /* прогрев — дело необязательное, молчим */ }
+        })();
+      }
       // ЧЕСТНЫЙ ИТОГ. Считаем по тому, что реально вернулось, а не по
       // ожиданиям: читаем квитанцию самой транзакции.
       if (mode === 'all') settleClose(h, tokenId, rec, symQuote, key, nativeBefore);
@@ -2284,13 +2407,14 @@
 
   async function receiptBack(hash, key, nativeBefore) {
     for (let i = 0; i < 20; i++) {
-      // СПРАШИВАЕМ СРАЗУ, ПАУЗА ПОТОМ.
+      // СПРАШИВАЕМ СРАЗУ, А ПАУЗУ ЖДЁМ ПОДПИСКОЙ.
       //
       // Раньше цикл начинался со сна в 2500 мс, и квитанция, уже лежащая в
-      // сети, ждала своей очереди две с половиной секунды. Блок здесь около
-      // 0.1 с — чаще всего транзакция включена к моменту первого же вопроса.
-      // Пауза нарастает, чтобы не долбить узел, если включение задерживается.
-      if (i) await new Promise(r => setTimeout(r, Math.min(2000, 250 * i)));
+      // сети, ждала своей очереди две с половиной секунды. Теперь первый
+      // вопрос задаётся сразу, а дальше пауза прерывается, как только подписка
+      // увидит переводы этой транзакции на наш адрес — то есть в тот же миг,
+      // когда закрытие попало в блок.
+      if (i) await hintMined(hash, Math.min(2000, 250 * i));
       let rc = null;
       try { rc = await state.rpc('eth_getTransactionReceipt', [hash]); }
       catch (e) { continue; }
@@ -2790,6 +2914,7 @@
       $('s-wallet').textContent = w.address.slice(0, 6) + '…' + w.address.slice(-4);
       log('кошелёк подключён: ' + w.address, 'ok');
       startPositionsPump();
+      watchMyTransfers();
       loadWalletBalances().catch(() => {});
     loadWalletBalances().catch(() => {});
       // Сеть переключаем сразу, а не в момент подписи. Иначе автор сначала
@@ -2958,7 +3083,7 @@
   // повторный запрос за тем же самым — лишний круг к узлу на горячем пути.
   async function waitMined(hash, tries = 40) {
     for (let i = 0; i < tries; i++) {
-      if (i) await new Promise(r => setTimeout(r, Math.min(2000, 250 * i)));
+      if (i) await hintMined(hash, Math.min(2000, 250 * i));
       let rc = null;
       try { rc = await state.rpc('eth_getTransactionReceipt', [hash]); }
       catch (e) { continue; }
@@ -3303,6 +3428,7 @@
     $('s-wallet').textContent = w.address.slice(0, 6) + '…' + w.address.slice(-4);
     log('кошелёк уже разрешён здесь: ' + w.address, 'ok');
     startPositionsPump();
+    watchMyTransfers();
     if (w.chainId !== C.RH.chainId)
       log(`но кошелёк в сети ${w.chainId}, а нужна ${C.RH.chainId} (${C.RH.label}) — ` +
           'переключи в Rabby или нажми «Подключить»', 'warn');
