@@ -11,7 +11,7 @@ C.useChain('robinhood');   // ядро стало двухсетевым — в�
     const r = await C.testRpc(url);
     if (r.ok) {
       console.log(`  ${name}: ГОДЕН, сеть ${r.chainId}, блок ${r.block}, ` +
-                  `задержка ${r.latencyMs} мс`);
+                  `задержка ${await r.latency} мс`);
     } else {
       console.log(`  ${name}: ОТКАЗ — ${r.why}`);
     }

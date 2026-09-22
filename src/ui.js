@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '6.11.0';
+  const VERSION = '6.12.0';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -177,6 +177,22 @@
   }
 
   // ── узел ────────────────────────────────────────────────────────────────
+  //
+  // НОМЕР БЛОКА ДЛЯ ОКОН ЖУРНАЛА — ИЗ ПАМЯТИ, ЕСЛИ ОН СВЕЖИЙ.
+  //
+  // Замер комиссии смотрит «последние шесть тысяч блоков», и отставание на
+  // пару сотен блоков его не меняет. А отдельный eth_blockNumber стоял на
+  // пути загрузки пула — ещё один круг до узла перед тем, как показать цену.
+  let lastBlock = null;
+  async function latestBlock() {
+    // Не досчитываем вперёд: номер «из будущего» узел отвергнет как блок
+    // за вершиной цепи. Отстать на полминуту окну в десять минут не страшно.
+    if (lastBlock && Date.now() - lastBlock.at < 30000) return lastBlock.n;
+    const n = Number(BigInt(await logsRpc()('eth_blockNumber', [])));
+    lastBlock = { n, at: Date.now() };
+    return n;
+  }
+
   async function checkRpc() {
     const url = $('rpc').value.trim() || C.RH.publicRpc;
     $('s-rpc').textContent = 'проверяю…';
@@ -189,11 +205,18 @@
     }
     state.rpcUrl = url; state.rpc = C.makeRpc(url);
     $('d-rpc').className = 'dot on';
-    $('s-rpc').textContent = `узел ${r.latencyMs} мс`;
+    $('s-rpc').textContent = 'узел годен';
     $('s-block').textContent = 'блок ' + r.block;
-    log(`узел годен: сеть ${r.chainId}, задержка ${r.latencyMs} мс` +
-        (url === C.RH.publicRpc ? ' (публичный — медленный, поставь свой)' : ''),
-        url === C.RH.publicRpc ? 'warn' : 'ok');
+    lastBlock = { n: r.block, at: Date.now() };
+    // Задержка приходит позже и только подписывает узел — ради неё загрузка
+    // пула не ждёт.
+    Promise.resolve(r.latency).then((ms) => {
+      if (state.rpcUrl !== url) return;          // узел уже сменили
+      if (ms != null) $('s-rpc').textContent = `узел ${ms} мс`;
+      log(`узел годен: сеть ${r.chainId}` + (ms != null ? `, задержка ${ms} мс` : '') +
+          (url === C.RH.publicRpc ? ' (публичный — медленный, поставь свой)' : ''),
+          url === C.RH.publicRpc ? 'warn' : 'ok');
+    });
     save();
     return true;
   }
@@ -243,7 +266,7 @@
         log('сводка не помогла, ищу пулы прямо в цепочке…');
         $('poolinfo').innerHTML = '<div class="hint">ищу пулы в цепочке…</div>';
         try {
-          const latest = Number(BigInt(await logsRpc()('eth_blockNumber', [])));
+          const latest = await latestBlock();
           // СНАЧАЛА СВЕЖЕЕ. Блок здесь 0.101 с, то есть сутки — это 852 тысячи
           // блоков. Новую монету вставляют через часы после запуска, поэтому
           // трёх суток хватает почти всегда, а лезть в 55 миллионов блоков на
@@ -298,8 +321,18 @@
       // потерял на таком сто долларов.
       // Через кэш: если пул только что выбран из списка, он уже замерен, и
       // повторный запрос к журналу — это лишние секунды ожидания на ровном месте.
-      const real = await feeRealityCached(poolId,
-        Number(BigInt(await logsRpc()('eth_blockNumber', []))));
+      //
+      // ЗАМЕР И ВСЁ ОСТАЛЬНОЕ — ОДНОВРЕМЕННО. Замер остаётся фильтром: пока он
+      // не ответил, пул текущим не становится. Но разрядность, названия и цену
+      // ему ждать незачем — раньше они шли после него, и цена появлялась
+      // на три круга до узла позже. Теперь это одна пачка рядом с замером.
+      const metaP = Promise.all([
+        tokenDecimals(key.currency0), tokenDecimals(key.currency1),
+        tokenSymbol(key.currency0), tokenSymbol(key.currency1),
+        C.readSlot0(state.rpc, poolId).catch(() => null),
+      ]);
+      metaP.catch(() => {});      // если замер упадёт раньше, отказ не всплывёт
+      const real = await feeRealityCached(poolId, await latestBlock());
       key.real = real;
       if (real.pays === false) {
         log(`ПУЛ ЗАПРЕЩЁН: не платит поставщику ликвидности. ${real.swaps} ` +
@@ -327,12 +360,9 @@
       //
       // Теперь всё читается в локальные переменные (разом — это одна пачка),
       // проверяется, и только потом пул подменяется одним присваиванием.
-      let d0, d1, s0, s1;
+      let d0, d1, s0, s1, first0;
       try {
-        [d0, d1, s0, s1] = await Promise.all([
-          tokenDecimals(key.currency0), tokenDecimals(key.currency1),
-          tokenSymbol(key.currency0), tokenSymbol(key.currency1),
-        ]);
+        [d0, d1, s0, s1, first0] = await metaP;
       } catch (e) {
         log('не прочиталась разрядность токенов — пул не гружу: ' + e.message, 'bad');
         return;
@@ -352,6 +382,9 @@
       // Цена прошлого пула к этому отношения не имеет. Пока не придёт своя,
       // вход откажет по возрасту цены — и это правильно.
       state.slot0 = null; state.slot0At = 0;
+      // Своя цена уже прочитана той же пачкой — ставим её сразу, не дожидаясь
+      // первого опроса: ВОЙТИ доступен в момент появления пула на экране.
+      if (first0) { state.slot0 = first0; state.slot0At = Date.now(); }
       const step = (Math.pow(1.0001, key.tickSpacing) - 1) * 100;
       $('poolinfo').innerHTML =
         `<div class="kv"><span>пара</span><b>${s0} / ${s1}</b></div>` +
@@ -478,7 +511,7 @@
     // подделать нельзя, а вот сводке из интернета доверять на деньгах нельзя.
     // Номер последнего блока нужен всем замерам комиссии — берём один раз.
     let latest = 0;
-    try { latest = Number(BigInt(await logsRpc()('eth_blockNumber', []))); } catch (e) { }
+    try { latest = await latestBlock(); } catch (e) { }
 
     const tRows = performance.now();
     const rows = await Promise.all(top.map(async (p) => {
@@ -2289,10 +2322,12 @@
     // Лечится не возвратом к срезу (из-за него позиция и терялась), а тем,
     // что запросы идут пачками.
     //
-    // Восемь за раз: свой узел это держит спокойно, а очередь из ста
-    // тридцати превращается в полтора десятка кругов.
+    // Сорок за раз — ровно одна пачка makeRpc. Раньше было восемь, когда
+    // пачек ещё не было и каждый вызов был отдельным запросом; теперь волна
+    // — это один HTTP-запрос, и сто тридцать позиций читаются за четыре
+    // круга вместо семнадцати. На узле автора волна 40 прошла без единого 429.
     const live = [];
-    const BATCH = 8;
+    const BATCH = 40;
     for (let i = 0; i < ids.length; i += BATCH) {
       // Пустые оболочки, которые уже видели, второй раз не спрашиваем.
       // Закрытая позиция обратно не наполняется — терминал этого не умеет и
@@ -2310,7 +2345,7 @@
       for (const g of got) if (g) live.push(g);
       if (live.length >= 40) break;               // столько всё равно не бывает
       // Видно, что работа идёт, а не «зависло».
-      if (i % (BATCH * 4) === 0) {
+      if (i + BATCH < ids.length) {
         tb.innerHTML = `<tr><td colspan="7" class="hint">читаю позиции… ` +
           `${Math.min(i + BATCH, ids.length)} из ${ids.length}</td></tr>`;
       }
