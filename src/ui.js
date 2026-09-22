@@ -78,6 +78,10 @@
   // пользуются две функции из разных концов файла.
   let pendingCard = null;
 
+  // Позиции, выход из которых отправлен и ещё не досчитан. Второй выход по
+  // такой позиции не принимается — см. closePosition.
+  const closingIds = new Set();
+
   // ── журнал ──────────────────────────────────────────────────────────────
   function log(msg, kind) {
     const d = document.createElement('div');
@@ -159,7 +163,10 @@
       b.textContent = t;
       if (state.intent === k) b.classList.add('on');
       b.onclick = () => {
-        state.intent = k; sideRow(); amtRow(); recalc(); save();
+        state.intent = k;
+        // Точная доля относилась к балансу другой стороны.
+        state.amountRaw = null; state.amountRawToken = null;
+        sideRow(); amtRow(); recalc(); save();
         loadBalance().catch(() => {});
       };
       host.appendChild(b);
@@ -1465,7 +1472,20 @@
     const t = quoteToken();
     // Если сумма пришла долей баланса, у нас есть точное значение в
     // минимальных единицах — берём его, а не пересчитываем из дробного числа.
+    // ТОЧНАЯ ДОЛЯ ГОДИТСЯ, ТОЛЬКО ЕСЛИ ОНА ПОСЧИТАНА ДЛЯ ТОЙ СУММЫ, ЧТО В ПОЛЕ.
+    //
+    // Раньше хватало совпадения токена. А сбрасывали долю не все пути смены
+    // суммы: кнопка пресета — да, а ввод своего числа и переключение покупка /
+    // продажа — нет. Получалось так: «100%» в продаже → набрал 50 в покупке →
+    // вернулся в продажу. На экране 50, «вносим 50», а в позицию уходил ВЕСЬ
+    // баланс — точная доля от прошлого нажатия.
+    //
+    // Сбрасывать её в каждом месте, где меняется сумма, можно, но завтра
+    // появится новое место и сброс забудут. Поэтому проверка здесь, в
+    // единственной точке, откуда сумма уходит в транзакцию: доля принимается,
+    // только если сумма с тех пор не менялась.
     if (state.amountRaw != null && state.amountRawToken &&
+        state.amountRawFor === state.amount &&
         state.amountRawToken.toLowerCase() === t.toLowerCase()) {
       return state.amountRaw;
     }
@@ -1546,8 +1566,25 @@
     }
   }
 
+  // ВХОД. Флаг «занят» захватывается ПЕРВЫМ ДЕЛОМ, а не перед окном кошелька.
+  //
+  // Раньше он проверялся на входе в функцию, а ставился только перед самой
+  // подписью — а между ними два обращения к узлу: баланс и разрешения. Два
+  // нажатия Enter за четверть секунды оба проходили проверку, оба доходили до
+  // кошелька, и Rabby ставил в очередь ДВЕ заявки: две позиции, двойная
+  // сумма. Ровно тот случай, который комментарий в finally считал закрытым.
+  //
+  // Ранних выходов между проверкой и подписью десять. Расставлять снятие
+  // флага перед каждым — верный способ однажды пропустить один, поэтому флаг
+  // держит обёртка, а снимает её finally, что бы ни случилось внутри.
   async function open() {
-    if (state.busy) return;
+    if (state.busy) { log('уже жду ответа кошелька', 'warn'); return; }
+    state.busy = true;
+    try { await openInner(); }
+    finally { state.busy = false; }
+  }
+
+  async function openInner() {
     const p = recalc();
     if (!p) { log('диапазон не посчитан', 'bad'); return; }
     if (!state.account) { log('кошелёк не подключён', 'bad'); return; }
@@ -1694,7 +1731,16 @@
       return;
     }
     log(`собрал за ${(performance.now() - t0).toFixed(1)} мс, открываю кошелёк`);
-    state.busy = true;
+
+    // СНИМОК ДЛЯ ЗАПИСИ О ВХОДЕ — ДО ОКНА КОШЕЛЬКА.
+    //
+    // Окно Rabby висит десятки секунд, а кнопки суммы и выбор пула в это время
+    // живые. Запись раньше собиралась ПОСЛЕ ответа кошелька из state.amount,
+    // state.pool и state.slot0 — то есть из того, что человек успел нажать,
+    // пока подписывал. Вошёл на 100, ткнул «500» в ожидании — в журнал ляжет
+    // 500, и при выходе итог покажет выдуманные −80%.
+    const entryStIdx = stableSide();
+    const entryPrice = state.slot0 ? priceOf(state.slot0.tick) : 0;
 
     // Симуляция ПАРАЛЛЕЛЬНО: ответ придёт, пока читаешь окно Rabby.
     // В паре с нативной монетой она уходит значением транзакции; сдачу
@@ -1720,24 +1766,26 @@
       // Правило то же, что при чтении из цепочки и у Кристала с Метеорой:
       // внесённое оценивается ПО ЦЕНЕ ВХОДА. Цена монеты в стейбле —
       // это priceOf(); стейбл сам себе равен.
-      const stIdx = stableSide();
+      // Всё ниже — только из снимков, сделанных до окна кошелька: key и
+      // snapAmount сверены с состоянием перед подписью, entry* сняты там же.
+      const stIdx = entryStIdx;
       const stableAddr = stIdx === null ? null
         : (stIdx === 1 ? key.currency1 : key.currency0);
       const depIsStable = stableAddr != null &&
         dep.token.toLowerCase() === stableAddr.toLowerCase();
-      const priceCoin = priceOf(state.slot0.tick);      // стейбла за монету
-      const amountInStable = depIsStable ? state.amount
-                                         : state.amount * (priceCoin || 0);
+      const priceCoin = entryPrice;                     // стейбла за монету
+      const amountInStable = depIsStable ? snapAmount
+                                         : snapAmount * (priceCoin || 0);
       const depSymbol = dep.token.toLowerCase() === (key.currency0 || '').toLowerCase()
-        ? state.pool.sym0 : state.pool.sym1;
+        ? key.sym0 : key.sym1;
       pendingEntry = { amountIn: amountInStable, tEntry: Date.now(),
                        // То, чем реально зашли — для честной подписи в карточке.
-                       amountInToken: state.amount, symIn: depSymbol,
+                       amountInToken: snapAmount, symIn: depSymbol,
                        depIsStable,
                        priceIn: priceCoin, hash: h,
                        token0: key.currency0, token1: key.currency1,
-                       pair: `${state.pool.sym0}/${state.pool.sym1}`,
-                       fee: state.pool.fee };
+                       pair: `${key.sym0}/${key.sym1}`,
+                       fee: key.fee };
       if (!depIsStable && !priceCoin) {
         log('цена входа не прочиталась — итог по этой позиции будет неточным', 'warn');
       }
@@ -1745,14 +1793,11 @@
       setTimeout(loadPositions, 6000);
     } catch (e) {
       log('кошелёк отказал: ' + e.message, 'bad');
-    } finally {
-      // ФЛАГ СНИМАЕТСЯ ОТВЕТОМ КОШЕЛЬКА, А НЕ ТАЙМЕРОМ.
-      //
-      // Раньше здесь стоял setTimeout на 4 секунды, а окно Rabby ждёт
-      // подтверждения десятки секунд. Второй Enter через пять секунд слал
-      // ВТОРУЮ заявку на те же деньги: две позиции, двойная сумма.
-      state.busy = false;
     }
+    // Флаг снимает обёртка open(). Он снимается ответом кошелька, а не
+    // таймером: раньше здесь был setTimeout на 4 секунды, а окно Rabby ждёт
+    // подтверждения десятки секунд, и второй Enter через пять секунд слал
+    // ВТОРУЮ заявку на те же деньги.
   }
 
   // Привязка записи о входе к номеру NFT: номер известен только после того,
@@ -1908,6 +1953,8 @@
         state.amountRaw = depBal.raw * BigInt(pct) / 100n;
         state.amountRawToken = depBal.token;
         state.amount = Number(state.amountRaw) / Math.pow(10, depBal.dec);
+        // Для какой суммы эта точная доля посчитана — см. amountRaw().
+        state.amountRawFor = state.amount;
         amtRow(); recalc(); save();
         log(`взял ${pct}% баланса: ${fmtNum(state.amount)} ${depBal.sym}`);
       };
@@ -2384,9 +2431,9 @@
         `</span></button></td>`;
       {
         const bs = tr.querySelectorAll('button');
-        bs[0].onclick = () => closePosition(id, 0n, info.key, total, stableSym, 'fees');
-        bs[1].onclick = () => closePosition(id, liq / 2n, info.key, total, stableSym, 'half');
-        bs[2].onclick = () => closePosition(id, liq, info.key, total, stableSym, 'all');
+        bs[0].onclick = () => closePosition(id, info.key, total, stableSym, 'fees');
+        bs[1].onclick = () => closePosition(id, info.key, total, stableSym, 'half');
+        bs[2].onclick = () => closePosition(id, info.key, total, stableSym, 'all');
       }
       // Проверяем ВПЛОТНУЮ к записи: между прошлой проверкой и этим местом
       // стоят запросы в сеть, и за это время мог начаться новый проход.
@@ -2568,53 +2615,87 @@
                          `Тело позиции останется в пуле и продолжит работать.` },
   };
 
-  async function closePosition(tokenId, liquidity, key, valueNow, symQuote, mode = 'all') {
+  // Окно цены для минимумов при выходе. Раньше минимумов не было вовсе — выход
+  // уходил с нулями, и сэндвич мог прогнать цену через диапазон перед самым
+  // закрытием. Настоящая транзакция Krystal, с которой сверена сборка выхода,
+  // минимум при этом ставила. Расчёт — C.closeMinAmounts.
+  const CLOSE_TOL = 0.05;
+
+  async function closePosition(tokenId, key, valueNow, symQuote, mode = 'all') {
     const m = MODES[mode] || MODES.all;
+    const idKey = String(tokenId);
     // Пока висит окно кошелька, второй клик слать нельзя: заявка уйдёт
-    // дважды, и подтвердить обе под рукой слишком легко. У закрытия такой
-    // защиты не было вовсе.
+    // дважды, и подтвердить обе под рукой слишком легко.
     if (state.busy) { log('уже жду ответа кошелька', 'warn'); return; }
-    if (!confirm(m.ask(tokenId))) return;
-    // Снимать нечего — не гоняем кошелёк зря.
-    if (mode !== 'fees' && (!liquidity || liquidity <= 0n)) {
-      log('в позиции нет ликвидности — снимать нечего', 'warn');
+
+    // ОДИН ВЫХОД НА ПОЗИЦИЮ ЗА РАЗ.
+    //
+    // «Половина» дважды подряд закрывала ВСЁ. Строка таблицы помнила
+    // ликвидность на момент отрисовки, а перерисовывается она не сразу — и
+    // вторая половина от той же цифры забирала остаток целиком. Свежее чтение
+    // из сети тут не спасает: пока первая транзакция не в блоке, ликвидность в
+    // сети ещё прежняя. Поэтому по позиции, выход из которой уже отправлен,
+    // новый не принимаем, пока тот не досчитан до конца.
+    if (closingIds.has(idKey)) {
+      log(`по позиции ${tokenId} выход уже отправлен — дождись, пока он дойдёт`, 'warn');
       return;
     }
-    const rec = ledger.get(String(tokenId));
-    const data = C.buildCloseCalldata({
-      tokenId, liquidity,
-      currency0: key.currency0, currency1: key.currency1,
-      amount0Min: 0n, amount1Min: 0n,
-      deadline: Math.floor(Date.now() / 1000) + 120,
-    });
-    C.simulate(state.rpc, state.account, C.RH.positionManager, data)
-      .then(r => log(r.ok ? `${m.verb}: симуляция пройдёт`
-                          : `${m.verb.toUpperCase()} НЕ ПРОЙДЁТ: ` + r.why,
-                     r.ok ? 'ok' : 'bad'));
+    if (!confirm(m.ask(tokenId))) return;
+
     state.busy = true;
-    // Баланс нативной монеты ДО отправки. Нужен только когда одна из сторон
-    // пары — сам BNB: его возврат не виден ни в одном событии.
-    let nativeBefore = null;
-    if (isNative(key.currency0) || isNative(key.currency1)) {
-      try { nativeBefore = BigInt(await state.rpc('eth_getBalance',
-                                                  [state.account, 'latest'])); }
-      catch (e) { nativeBefore = null; }
-    }
+    closingIds.add(idKey);
+    let handedOff = false;               // досчёт выхода забрал снятие запрета
     try {
+      // СВЕЖЕЕ ЧТЕНИЕ, ОДНИМ ПАКЕТОМ. Ликвидность — какая есть сейчас, а не в
+      // строке таблицы; позиция и цена — для минимумов. Три вызова независимы
+      // и уходят одним обращением к узлу.
+      const [liqNow, pos, s0] = await Promise.all([
+        C.readPositionLiquidity(state.rpc, tokenId),
+        C.readPositionPool(state.rpc, tokenId),
+        C.readSlot0(state.rpc, poolIdOf(key)).catch(() => null),
+      ]);
+      key = pos.key;                     // ключ из сети, а не из строки таблицы
+      const liquidity = mode === 'all' ? liqNow : mode === 'half' ? liqNow / 2n : 0n;
+      // Снимать нечего — не гоняем кошелёк зря.
+      if (mode !== 'fees' && liquidity <= 0n) {
+        log('в позиции нет ликвидности — снимать нечего', 'warn');
+        return;
+      }
+
+      const mins = mode === 'fees' ? { amount0Min: 0n, amount1Min: 0n }
+                                   : (() => {
+          const t = C.unpackTicks(pos.info);
+          return C.closeMinAmounts(s0 && s0.sqrtPriceX96, t.tickLower, t.tickUpper,
+                                   liquidity, CLOSE_TOL);
+        })();
+      if (mode !== 'fees' && !s0) {
+        log(`${m.verb}: цена пула не прочиталась — ухожу без минимумов`, 'warn');
+      }
+
+      const rec = ledger.get(idKey);
+      const data = C.buildCloseCalldata({
+        tokenId, liquidity,
+        currency0: key.currency0, currency1: key.currency1,
+        amount0Min: mins.amount0Min, amount1Min: mins.amount1Min,
+        deadline: Math.floor(Date.now() / 1000) + 120,
+      });
+      C.simulate(state.rpc, state.account, C.RH.positionManager, data)
+        .then(r => log(r.ok ? `${m.verb}: симуляция пройдёт`
+                            : `${m.verb.toUpperCase()} НЕ ПРОЙДЁТ: ` + r.why,
+                       r.ok ? 'ok' : 'bad'));
+
+      // Баланс нативной монеты ДО отправки. Нужен только когда одна из сторон
+      // пары — сам BNB: его возврат не виден ни в одном событии.
+      let nativeBefore = null;
+      if (isNative(key.currency0) || isNative(key.currency1)) {
+        try { nativeBefore = BigInt(await state.rpc('eth_getBalance',
+                                                    [state.account, 'latest'])); }
+        catch (e) { nativeBefore = null; }
+      }
+
       const h = await W.send({ from: state.account, to: C.RH.positionManager, data });
       log(`${m.verb} отправлено: ` + h, 'ok');
 
-      // ПРОГРЕВ МАРШРУТА, ПОКА ЗАКРЫТИЕ МАЙНИТСЯ.
-      //
-      // Замер: первое обращение к агрегатору за сессию стоит 1891 мс, второе
-      // к той же паре — 487. Разница уходит на DNS, TLS и на то, что у него
-      // самого данные о пулах этой пары ещё не подняты.
-      //
-      // Платить эти полторы секунды в тот момент, когда монета уже в кошельке
-      // и цена уходит, незачем: закрытие всё равно майнится, и запрос успевает
-      // пройти «бесплатно». Ответ выбрасываем — точную сумму мы узнаем только
-      // из квитанции, и котировка всё равно будет своя. Нужно ровно прогретое
-      // соединение.
       if (AS.settings.on && mode !== 'fees' && C.RH.kyberChain) {
         (async () => {
           try {
@@ -2633,15 +2714,20 @@
       }
       // ЧЕСТНЫЙ ИТОГ. Считаем по тому, что реально вернулось, а не по
       // ожиданиям: читаем квитанцию самой транзакции.
-      if (mode === 'all') settleClose(h, tokenId, rec, symQuote, key, nativeBefore);
-      else settleTake(h, tokenId, symQuote, key, m.verb, nativeBefore, mode);
-      // Список позиций читается семью запросами на позицию. Если он стартует
-      // посреди автопродажи, то отбирает у неё узел ровно тогда, когда она
-      // считает цену. Автопродажа обновит список сама, когда закончит.
+      const settle = mode === 'all'
+        ? settleClose(h, tokenId, rec, symQuote, key, nativeBefore)
+        : settleTake(h, tokenId, symQuote, key, m.verb, nativeBefore, mode);
+      // Запрет снимается, когда выход досчитан — включая автопродажу после
+      // него: до этого момента позиция ещё «в пути».
+      handedOff = true;
+      Promise.resolve(settle).catch(() => {}).finally(() => closingIds.delete(idKey));
       setTimeout(() => { if (!state.busy) loadPositions(); }, 5000);
     } catch (e) {
-      log('кошелёк отказал: ' + e.message, 'bad');
-    } finally { state.busy = false; }
+      log(`${m.verb} не вышло: ` + e.message, 'bad');
+    } finally {
+      state.busy = false;
+      if (!handedOff) closingIds.delete(idKey);
+    }
   }
 
   // ЧАСТИЧНЫЙ ВЫВОД. Считать его как закрытие нельзя: вход остаётся прежним,

@@ -2064,6 +2064,32 @@ async function planSwap(rpc, { pools, coin, stable, amountIn, slippageBps,
   };
 }
 
+// МИНИМУМЫ ПРИ ВЫХОДЕ ИЗ ПОЗИЦИИ.
+//
+// Минимум на каждую сторону по отдельности — ловушка для позиции в работе:
+// сдвинься цена на процент, и доля меньшей стороны меняется на десятки
+// процентов. Поэтому так, как это делает сам Uniswap: считаем состав на краях
+// окна цены ±tol и берём худшее для каждой стороны. currency0 убывает с ростом
+// цены — её минимум на верхнем краю; currency1 растёт — на нижнем. Движение
+// внутри окна проходит, за окном — откат вместо потери.
+//
+// Проверяется только ТЕЛО позиции: PositionManager сравнивает минимум с
+// liquidityDelta − feesAccrued, комиссии туда не входят.
+function closeMinAmounts(sqrtPriceX96, tickLower, tickUpper, liquidity, tol) {
+  if (!sqrtPriceX96 || liquidity <= 0n) return { amount0Min: 0n, amount1Min: 0n };
+  const sqrtA = getSqrtRatioAtTick(tickLower);
+  const sqrtB = getSqrtRatioAtTick(tickUpper);
+  // Цена в окне ±tol — это корень цены, умноженный на sqrt(1 ± tol).
+  const k = (x) => BigInt(Math.round(Math.sqrt(x) * 1e9));
+  const sqrtLo = BigInt(sqrtPriceX96) * k(1 - tol) / 1000000000n;
+  const sqrtHi = BigInt(sqrtPriceX96) * k(1 + tol) / 1000000000n;
+  const atHi = amountsForLiquidity(sqrtHi, sqrtA, sqrtB, liquidity);
+  const atLo = amountsForLiquidity(sqrtLo, sqrtA, sqrtB, liquidity);
+  // Десятая процента — на округление в собственной математике пула.
+  const shave = (x) => x * 999n / 1000n;
+  return { amount0Min: shave(atHi.amount0), amount1Min: shave(atLo.amount1) };
+}
+
 // ── разрешения ───────────────────────────────────────────────────────────
 //
 // Путь оплаты в V4: токен → Permit2 → PositionManager. Нужны ДВА разрешения.
@@ -2252,7 +2278,7 @@ const API = {
   pickBestSwap, planSwap, liveCandidates, DYNAMIC_FEE, quoteSwapPath, buildSwapPathCalldata,
   encodePathKey, encodePath, encodeExactInPath, findPoolsByKey, computePoolId, FEE_TIERS, readPermit2Allowance, buildPermit2ApproveTo, planSwapApprovals,
   encBytes, encBytesArray, encodeV4Swap, encodeCurrencyAmount,
-  buildCloseCalldata, encodeDecreaseParams, encodeTakePair, encodeSweep, isNativeCurrency,
+  buildCloseCalldata, closeMinAmounts, encodeDecreaseParams, encodeTakePair, encodeSweep, isNativeCurrency,
   readPositionLiquidity, readPositionPool, MSG_SENDER, unpackTicks, readFees, poolDepth,
   CHAINS, useChain,
 };
