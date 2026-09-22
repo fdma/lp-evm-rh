@@ -1187,15 +1187,18 @@ function makeRpc(url, fetchImpl) {
           body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }),
           signal: timeoutSignal(),
         });
-        const d = await res.json();
-        if (d.error) throw new Error(`${method}: ${d.error.message || 'ошибка узла'}`);
+        let d = null;
+        try { d = await res.json(); } catch (e) { /* html вместо json */ }
+        if (!d) throw new Error(`${method}: узел ответил ${res.status || 'не json'}`);
+        if (d.error) throw new Error(`${method}: ${d.error.message || 'ошибка узла'}` +
+                                     (res.status === 429 ? ' (429)' : ''));
         return d.result;
       } catch (e) {
         last = e;
         // «Слишком часто» лечится только паузой подлиннее: узел общий, и
         // долбить его чаще — делать себе же хуже. Внутренняя ошибка узла
         // тоже часто проходит сама, но ей нужна секунда, а не сто миллисекунд.
-        const busy = /too many requests|429|rate/i.test(e.message || '');
+        const busy = /too many requests|429|rate|capacity|exceeded/i.test(e.message || '');
         const sick = /internal server err+or/i.test(e.message || '');
         if (i < tries - 1) {
           await new Promise(r => setTimeout(r, (busy ? 700 : sick ? 900 : 150) * (i + 1)));
@@ -1222,6 +1225,7 @@ function makeRpc(url, fetchImpl) {
   // одиночные и больше пачками к нему не ходим: бывают узлы без этой
   // возможности, и упираться в неё каждый раз значит удваивать каждый запрос.
   let batchBroken = false;
+  const BATCH_MAX = 40;
   let queue = [];
   let scheduled = false;
 
@@ -1237,7 +1241,14 @@ function makeRpc(url, fetchImpl) {
       sendOne(c.method, c.params).then(c.resolve, c.reject);
       return;
     }
-    sendBatch(batch);
+    // Большую волну (список позиций — это сотни вызовов) режем на куски:
+    // узлы ограничивают размер пачки, а весь список одним запросом на лимите
+    // вычислительных единиц получает 429 целиком, а не частично.
+    for (let i = 0; i < batch.length; i += BATCH_MAX) {
+      const part = batch.slice(i, i + BATCH_MAX);
+      if (part.length === 1) sendOne(part[0].method, part[0].params).then(part[0].resolve, part[0].reject);
+      else sendBatch(part);
+    }
   }
 
   // Разослать по одному. Сюда уходит всё, чему пачка не подошла.
@@ -1245,7 +1256,7 @@ function makeRpc(url, fetchImpl) {
     for (const c of batch) sendOne(c.method, c.params).then(c.resolve, c.reject);
   };
 
-  async function sendBatch(batch) {
+  async function sendBatch(batch, attempt = 0) {
     // НОМЕРА УНИКАЛЬНЫ И СВЕРЯЮТСЯ, А НЕ БЕРУТСЯ НА ВЕРУ.
     //
     // Раньше номерами служили 0..n-1, а ответ раскладывался по ним без единой
@@ -1272,11 +1283,28 @@ function makeRpc(url, fetchImpl) {
         body: JSON.stringify(body),
         signal: timeoutSignal(),
       });
-      const d = await res.json();
+      let d = null;
+      try { d = await res.json(); } catch (e) { /* html от балансировщика */ }
       if (!Array.isArray(d)) {
-        // Узел пачек не понимает. Это свойство узла, а не случайность —
-        // больше не пробуем.
-        batchBroken = true;
+        // ЛИМИТ — НЕ ОТСУТСТВИЕ ПАЧЕК.
+        //
+        // Раньше любой ответ-не-массив навсегда выключал пачки. Но на лимите
+        // Alchemy отвечает не массивом, а ОДНИМ объектом с ошибкой 429 — и
+        // один всплеск нагрузки удваивал стоимость каждого прохода до конца
+        // сессии. Хуже того, пачку тут же рассыпали на десятки одиночных
+        // запросов — ровно в тот момент, когда узел просит сбавить.
+        //
+        // Поэтому лимит и 5xx — пауза и та же пачка ещё раз. Выключаем пачки
+        // только тогда, когда узел внятно ответил, что массив не понимает.
+        const msg = (d && d.error && (d.error.message || '')) || '';
+        const code = d && d.error && d.error.code;
+        const transient = res.status === 429 || res.status >= 500 || code === 429 ||
+                          /too many requests|rate|limit|exceeded|capacity/i.test(msg);
+        if (transient && attempt < 2) {
+          await new Promise(r => setTimeout(r, 700 * (attempt + 1)));
+          return sendBatch(batch, attempt + 1);
+        }
+        if (!transient) batchBroken = true;
         oneByOne(batch);
         return;
       }

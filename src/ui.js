@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '6.9.0';
+  const VERSION = '6.10.0';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -1638,8 +1638,7 @@
     if (!p) { log('диапазон не посчитан', 'bad'); return; }
     if (!state.account) { log('кошелёк не подключён', 'bad'); return; }
     if (!p.oneSided) { log('позиция не односторонняя — не отправляю', 'bad'); return; }
-    const age = Date.now() - state.slot0At;
-    if (age > 3000) { log(`цене ${age} мс — жду свежую`, 'warn'); return; }
+    if (!state.slot0) { log('цены пула ещё нет — жду', 'warn'); return; }
 
     // ПРОВЕРКА БАЛАНСА ДО КОШЕЛЬКА.
     //
@@ -1678,6 +1677,31 @@
     }
 
     const snapPool = state.pool, snapAmount = state.amount;
+
+    // СВЕЖАЯ ЦЕНА — ВМЕСТЕ С ПРОВЕРКАМИ, А НЕ ОТКАЗ «ЖДУ СВЕЖУЮ».
+    //
+    // При живой подписке страховочный опрос идёт раз в пять секунд, а в тихом
+    // пуле событий нет — цене в момент нажатия от нуля до пяти секунд. Прежняя
+    // проверка «старше трёх секунд — жду» отбивала так около 40% нажатий, хотя
+    // цена была верной. А пока идут проверки, опрос молчит вовсе, и вторая
+    // проверка перед кошельком добивала остальное.
+    //
+    // Теперь цена читается заново тем же батчем, что и баланс с разрешениями:
+    // лишнего круга до узла нет. Ответ кладём, только если за это время не
+    // пришло ничего новее из подписки — иначе откатили бы цену назад.
+    const freshAsked = Date.now();
+    const freshP = C.readSlot0(state.rpc, snapPool.poolId).then(s0 => {
+      if (state.pool === snapPool && state.slot0At <= freshAsked) {
+        state.slot0 = s0; state.slot0At = Date.now();
+      }
+      return true;
+    }, () => false);
+    // Разрешения тоже спрашиваем сразу, а ждём ниже: это ещё минус один круг.
+    // Нативной монете разрешения не нужны и не бывают: она не токен.
+    const apprP = depNative ? Promise.resolve({ steps: [] })
+      : C.planApprovals(state.rpc, dep.token, state.account, amountRaw(), 1800,
+                        Math.floor(Date.now() / 1000));
+    apprP.catch(() => {});      // если выйдем раньше, отказ не должен всплыть
     try {
       // У нативной монеты нет контракта и нет balanceOf — баланс спрашивается
       // у самой сети. И запас на газ нужен именно здесь: если внести весь
@@ -1724,11 +1748,7 @@
     // Симуляция терминала идёт параллельно и её ответ приходит уже при
     // открытом окне — поздно. Один запрос до отправки решает вопрос.
     try {
-      const now = Math.floor(Date.now() / 1000);
-      // Нативной монете разрешения не нужны и не бывают: она не токен.
-      const plan = depNative ? { steps: [] }
-        : await C.planApprovals(state.rpc, dep.token, state.account,
-                                amountRaw(), 1800, now);
+      const plan = await apprP;
       if (plan.steps.length) {
         log('не хватает разрешений: ' + plan.steps.map(x => x.what).join(', ') +
             '. Нажми «ARM — выдать разрешения», потом входи. ' +
@@ -1737,6 +1757,12 @@
       }
     } catch (e) {
       log('разрешения не проверились: ' + e.message + ' — вход не отправляю', 'bad');
+      return;
+    }
+
+    if (!(await freshP) && Date.now() - state.slot0At > 3000) {
+      log('цена не перечиталась, а последней больше трёх секунд — вход не ' +
+          'отправляю, нажми ещё раз', 'warn');
       return;
     }
 
@@ -4043,14 +4069,28 @@
   // и без нажатий. Иначе после каждого обновления страницы панель позиций
   // пишет «подключи кошелёк», и выглядит это так, будто терминал потерял
   // открытую позицию.
+  //
+  // УЗЕЛ И КОШЕЛЁК — ПАРАЛЛЕЛЬНО, ПОЗИЦИИ — КОГДА ГОТОВЫ ОБА.
+  //
+  // Раньше кошелёк подхватывался раньше, чем узел проходил проверку, и список
+  // позиций запускался при state.rpc === null: журнал читался, а детали
+  // позиций — нет. Список появлялся только со следующим фоновым проходом,
+  // через двадцать секунд после перезагрузки.
+  const rpcReady = checkRpc().catch(() => false);
+  rpcReady.then(ok => { if (ok && $('pool').value) loadPool(); });
   (async () => {
     const w = await W.reconnect();
     if (!w) return;
     adoptAccount(w.address, 'кошелёк уже разрешён здесь: ');
-    if (w.chainId !== C.RH.chainId)
+    if (w.chainId !== C.RH.chainId) {
       log(`но кошелёк в сети ${w.chainId}, а нужна ${C.RH.chainId} (${C.RH.label}) — ` +
           'переключи в Rabby или нажми «Подключить»', 'warn');
-    else loadPositions();
+      return;
+    }
+    if (!(await rpcReady)) return;
+    loadPositions();
+    loadWalletBalances().catch(() => {});
+    loadBalance().catch(() => {});
   })();
 
   const rpcEl = $('rpc'); if (rpcEl) rpcEl.placeholder = C.RH.rpcHint || '';
@@ -4060,5 +4100,4 @@
   // чтобы можно было открыть карточку по прошлой сделке из консоли.
   window.RHTerminal = { showCard, drawCard, version: VERSION };
   log(`терминал ${VERSION}, сеть ${C.RH.label} (${C.RH.chainId}). Enter — вход, R — обновить позиции.`);
-  if (state.rpcUrl) checkRpc().then(ok => { if (ok && $('pool').value) loadPool(); });
 })();

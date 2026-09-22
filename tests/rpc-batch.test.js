@@ -187,3 +187,61 @@ test('сетевой сбой пачку не отключает', async () => {
   assert.deepStrictEqual(r, ['0x3', '0x4']);
   assert.strictEqual(calls.length - было, 1, 'вторая волна снова пачкой');
 });
+
+test('429 объектом пачку не отключает и не рассыпает на одиночные', async () => {
+  // Так отвечает Alchemy на лимите: HTTP 429 и ОДИН объект с ошибкой вместо
+  // массива. Раньше это читалось как «узел пачек не умеет» — навсегда.
+  let limited = 1;
+  const calls = [];
+  const f = async (url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push(Array.isArray(body) ? body.length : 1);
+    if (Array.isArray(body) && limited > 0) {
+      limited--;
+      return { status: 429, json: async () => ({ jsonrpc: '2.0', id: null,
+        error: { code: 429, message: 'Your app has exceeded its compute units per second capacity' } }) };
+    }
+    const answer = (r) => ({ jsonrpc: '2.0', id: r.id, result: '0x' + String(r.params[0]) });
+    if (Array.isArray(body)) return { status: 200, json: async () => body.map(answer) };
+    return { status: 200, json: async () => answer(body) };
+  };
+  const rpc = C.makeRpc('http://x', f);
+  const r = await Promise.all([1, 2, 3].map(i => rpc('eth_call', [i])));
+  assert.deepStrictEqual(r, ['0x1', '0x2', '0x3']);
+  assert.deepStrictEqual(calls, [3, 3], 'после паузы — та же пачка, а не три одиночных');
+  const r2 = await Promise.all([4, 5].map(i => rpc('eth_call', [i])));
+  assert.deepStrictEqual(r2, ['0x4', '0x5']);
+  assert.deepStrictEqual(calls.slice(2), [2], 'пачки остались включены');
+});
+
+test('узел без пачек — выключаем их, и больше не пробуем', async () => {
+  const calls = [];
+  const f = async (url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push(Array.isArray(body) ? body.length : 1);
+    if (Array.isArray(body)) {
+      return { status: 200, json: async () => ({ jsonrpc: '2.0', id: null,
+        error: { code: -32600, message: 'invalid request' } }) };
+    }
+    return { status: 200, json: async () => ({ jsonrpc: '2.0', id: body.id, result: '0x' + String(body.params[0]) }) };
+  };
+  const rpc = C.makeRpc('http://x', f);
+  await Promise.all([1, 2].map(i => rpc('eth_call', [i])));
+  const было = calls.length;
+  await Promise.all([3, 4].map(i => rpc('eth_call', [i])));
+  assert.deepStrictEqual(calls.slice(было), [1, 1]);
+});
+
+test('большая волна режется на пачки по 40', async () => {
+  const calls = [];
+  const f = async (url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push(Array.isArray(body) ? body.length : 1);
+    const answer = (r) => ({ jsonrpc: '2.0', id: r.id, result: '0x' + String(r.params[0]) });
+    return { status: 200, json: async () => Array.isArray(body) ? body.map(answer) : answer(body) };
+  };
+  const rpc = C.makeRpc('http://x', f);
+  const r = await Promise.all(Array.from({ length: 85 }, (_, i) => rpc('eth_call', [i])));
+  assert.strictEqual(r[84], '0x84');
+  assert.deepStrictEqual(calls, [40, 40, 5]);
+});
