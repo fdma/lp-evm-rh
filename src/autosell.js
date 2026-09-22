@@ -173,8 +173,19 @@ const RHAutoSell = (() => {
   // Ниже единицы — ноль защиты, «исполни по любой цене». Выше половины —
   // почти наверняка опечатка в поле «своё», и такую заявку лучше не
   // отправлять вовсе, чем отдать монету за бесценок.
+  // ПОТОЛОК ДОПУСКА — 20%, и выше него не подрезаем, а ОТКАЗЫВАЕМ.
+  //
+  // Раньше число сверх половины зажималось до 50% — хотя комментарий выше
+  // обещал «такую заявку лучше не отправлять вовсе». Набрал 80 вместо 8.0 —
+  // и все три попытки уходили с допуском 50%, то есть с согласием отдать
+  // монету за полцены. Проверено: агрегатор такую сделку собирает, своего
+  // потолка у него нет. Поэтому потолок наш, и опечатку мы отвергаем.
+  const MAX_SLIPPAGE_BPS = 2000;
+
   function slippageBps() {
-    return Math.min(5000, Math.max(1, Math.round(Number(S.slippage) * 100)));
+    const bps = Math.round(Number(S.slippage) * 100);
+    if (!Number.isFinite(bps) || bps > MAX_SLIPPAGE_BPS) return null;
+    return Math.max(1, bps);
   }
 
   // ── АГРЕГАТОР ─────────────────────────────────────────────────────────────
@@ -194,8 +205,21 @@ const RHAutoSell = (() => {
   const NATIVE_PSEUDO = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
   const forApi = (a) => (/^0x0{40}$/i.test(a || '') ? NATIVE_PSEUDO : a);
 
-  async function ask(url, init) {
-    const r = await fetch(url, init);
+  // Сколько ждём агрегатор. Без предела зависший ответ держал автопродажу
+  // вечно: ни продажи, ни ошибки, ни следующей попытки.
+  const ASK_TIMEOUT_MS = 10000;
+
+  async function ask(url, init = {}) {
+    const signal = (typeof AbortSignal !== 'undefined' && AbortSignal.timeout)
+      ? AbortSignal.timeout(ASK_TIMEOUT_MS) : undefined;
+    let r;
+    try { r = await fetch(url, { ...init, signal }); }
+    catch (e) {
+      if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) {
+        throw new Error(`агрегатор молчит дольше ${ASK_TIMEOUT_MS / 1000} с`);
+      }
+      throw e;
+    }
     const text = await r.text();
     let j = null;
     try { j = JSON.parse(text); } catch (e) { /* Cloudflare отвечает html */ }
@@ -255,7 +279,7 @@ const RHAutoSell = (() => {
     };
   }
 
-  return { load, save, settings: S, decide, slippageBps,
+  return { load, save, settings: S, decide, slippageBps, MAX_SLIPPAGE_BPS,
            route, build, plan, forApi, NATIVE_PSEUDO, API,
            coinSide, isUsdStable, STABLE, USD_STABLE };
 })();

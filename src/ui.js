@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '6.8.0';
+  const VERSION = '6.9.0';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -72,11 +72,11 @@
   let liveRows = [];
   let livePools = new Set();
 
-  // Отложенная карточка итога: её ставит закрытие, а показывает конец
+  // Отложенные карточки итога: их ставит закрытие, а показывает конец
   // автопродажи — чтобы окно вышло один раз и с окончательными числами.
-  // Объявлена здесь, рядом с прочим состоянием, а не у места показа: ею
-  // пользуются две функции из разных концов файла.
-  let pendingCard = null;
+  // По одной на позицию: раньше место было одно, и второе закрытие, досчитанное
+  // во время продажи первого, затирало его — одна из карточек пропадала.
+  const pendingCards = new Set();
 
   // Позиции, выход из которых отправлен и ещё не досчитан. Второй выход по
   // такой позиции не принимается — см. closePosition.
@@ -108,7 +108,7 @@
   const save = () => localStorage.setItem(KEY, JSON.stringify({
     rpcUrl: state.rpcUrl, amount: state.amount, side: state.side,
     width: state.width, gap: state.gap, intent: state.intent, pool: $('pool').value,
-    amtUnit: state.amtUnit,
+    amtUnit: state.amtUnit, amountQuote: state.amountQuote,
     pools: state.pools,
   }));
 
@@ -120,6 +120,7 @@
       if (s.amount) state.amount = s.amount;
       if (s.intent) state.intent = s.intent;
       if (s.amtUnit === 'coin' || s.amtUnit === 'quote') state.amtUnit = s.amtUnit;
+      if (Number.isFinite(s.amountQuote) && s.amountQuote > 0) state.amountQuote = s.amountQuote;
       if (s.width) state.width = s.width;
       if (s.gap) state.gap = s.gap;
       if (Array.isArray(s.pools)) state.pools = s.pools;
@@ -164,8 +165,10 @@
       if (state.intent === k) b.classList.add('on');
       b.onclick = () => {
         state.intent = k;
-        // Точная доля относилась к балансу другой стороны.
+        // Точная доля относилась к балансу другой стороны, а сумма в деньгах —
+        // к монете, которую в другом режиме не вносят.
         state.amountRaw = null; state.amountRawToken = null;
+        state.amountQuote = null;
         sideRow(); amtRow(); recalc(); save();
         loadBalance().catch(() => {});
       };
@@ -1292,8 +1295,31 @@
     return v.toFixed(Math.min(18, Math.max(6, -mag + 4)));
   }
 
+  // СУММА В ДЕНЬГАХ ЖИВЁТ В ДЕНЬГАХ.
+  //
+  // Раньше «30 USDG» переводились в монеты один раз — по цене, запомненной
+  // при отрисовке поля, — и дальше жили как штуки. Цена уходила, и к моменту
+  // входа эти штуки стоили уже не 30, а 45 долларов: на полтора раза больше
+  // задуманного. Поле при этом продолжало показывать то, что набрали.
+  //
+  // Теперь набранное в деньгах хранится в деньгах (amountQuote), а монеты из
+  // него считаются заново на каждом пересчёте — то есть по живой цене и,
+  // главное, в момент входа: open() начинается с recalc().
+  function syncQuoteAmount() {
+    // Только при входе МОНЕТОЙ: переключатель единиц есть лишь там. В покупке
+    // сумма и так в стейбле, и перезаписать её монетами значило бы внести
+    // совсем не ту сумму.
+    if (state.intent !== 'sell') return;
+    if (state.amtUnit !== 'quote' || !(state.amountQuote > 0) || !state.slot0) return;
+    const px = priceOf(state.slot0.tick);
+    if (!(px > 0)) return;
+    state.amount = state.amountQuote / px;
+    state.amountRaw = null; state.amountRawToken = null;
+  }
+
   function recalc() {
     if (!state.pool || !state.slot0) return null;
+    syncQuoteAmount();
     try {
       const r = resolveSide();
       state.side = r.side;
@@ -1950,7 +1976,9 @@
     // единица поля не должна читаться как выбор того, что вносить.
     $('l-amt').textContent = sell
       ? `сколько монеты вносим (${state.amtUnit === 'quote'
-          ? 'набираем в ' + quoteSym() : 'набираем в штуках'})`
+          ? (state.slot0 ? 'набираем в ' + quoteSym()
+                         : 'в ' + quoteSym() + ' — жду цену пула')
+          : 'набираем в штуках'})`
       : `сумма, ${sym}`;
     if (!sell) {
       // Суммы под реальную работу: прежние 1/2/5/10 остались от проверок на
@@ -1989,6 +2017,7 @@
         state.amount = Number(state.amountRaw) / Math.pow(10, depBal.dec);
         // Для какой суммы эта точная доля посчитана — см. amountRaw().
         state.amountRawFor = state.amount;
+        state.amountQuote = null;           // доля — это штуки, а не деньги
         amtRow(); recalc(); save();
         log(`взял ${pct}% баланса: ${fmtNum(state.amount)} ${depBal.sym}`);
       };
@@ -2010,16 +2039,26 @@
     const own = document.createElement('input');
     own.type = 'text'; own.className = 'own';
     own.placeholder = inQuote ? 'своё, ' + quoteSym() : 'своё';
-    own.value = state.amount
-      ? String(inQuote ? +(state.amount * price).toFixed(6) : state.amount)
-      : '';
+    own.value = inQuote
+      ? (state.amountQuote > 0 ? String(state.amountQuote)
+         : state.amount ? String(+(state.amount * price).toFixed(6)) : '')
+      : (state.amount ? String(state.amount) : '');
     own.onchange = () => {
       const v = parseFloat(String(own.value).replace(',', '.'));
       if (!isFinite(v) || v <= 0) { own.style.borderColor = 'var(--bad)'; return; }
+      // Выбраны деньги, а цены пула нет — перевести нечем. Раньше число
+      // молча понималось как штуки, хотя подпись говорила «в USDG».
+      if (state.amtUnit === 'quote' && !inQuote) {
+        own.style.borderColor = 'var(--bad)';
+        log('цена пула ещё не пришла — не могу перевести деньги в монеты, ' +
+            'подожди или набери в штуках', 'warn');
+        return;
+      }
       own.style.borderColor = '';
       // Ввели руками — точное значение доли больше не относится к делу.
-      state.amount = inQuote ? v / price : v;
       state.amountRaw = null; state.amountRawToken = null;
+      if (inQuote) { state.amountQuote = v; state.amount = v / price; }
+      else { state.amountQuote = null; state.amount = v; }
       amtRow(); recalc(); save();
     };
     host.appendChild(own);
@@ -2046,7 +2085,13 @@
       b.title = k === 'coin'
         ? 'число в поле — штуки монеты'
         : `число в поле — ${quoteSym()}, пересчитается в монету по цене пула`;
-      b.onclick = () => { state.amtUnit = k; amtRow(); save(); };
+      b.onclick = () => {
+        if (k === state.amtUnit) return;
+        // Сумма та же, меняется только то, в чём она держится.
+        state.amountQuote = (k === 'quote' && price > 0 && state.amount)
+          ? +(state.amount * price).toFixed(6) : null;
+        state.amtUnit = k; amtRow(); save();
+      };
       units.appendChild(b);
     }
     host.appendChild(units);
@@ -2965,7 +3010,7 @@
         // Теперь она одна и выходит в самом конце: после продажи с фактическим
         // итогом, а если продажи не было — с этой оценкой. Показывает её
         // autoSellAfter, который отрабатывает в любом случае.
-        pendingCard = String(tokenId);
+        pendingCards.add(String(tokenId));
       } else {
         line += ' | вход не записан, итог посчитать не с чем';
       }
@@ -3462,7 +3507,7 @@
 
   // Свой ряд кнопок. Общий chips() не подходит: он дёргает recalc() и save()
   // формы входа, к автопродаже отношения не имеющие.
-  function asChips(host, values, suffix, get, set) {
+  function asChips(host, values, suffix, get, set, max = Infinity) {
     if (!host) return;
     host.innerHTML = '';
     for (const v of values) {
@@ -3477,7 +3522,13 @@
     if (!values.includes(get())) own.value = String(get());
     const apply = () => {
       const v = parseFloat(String(own.value).replace(',', '.'));
-      if (!isFinite(v) || v < 0) { own.style.borderColor = 'var(--bad)'; return; }
+      // Выше предела — опечатка (80 вместо 8.0), её не подрезаем, а не
+      // принимаем: подрезанная опечатка молча превращается в настройку.
+      if (!isFinite(v) || v <= 0 || v > max) {
+        own.style.borderColor = 'var(--bad)';
+        if (v > max) log(`больше ${max}${suffix.trim()} не принимаю — похоже на опечатку`, 'warn');
+        return;
+      }
       own.style.borderColor = '';
       set(v); AS.save(); drawAutosell();
     };
@@ -3522,7 +3573,8 @@
 
     if (!S.on) return;
 
-    asChips($('as-slip'), [1, 3, 5, 10], ' %', () => S.slippage, v => S.slippage = v);
+    asChips($('as-slip'), [1, 3, 5, 10], ' %', () => S.slippage, v => S.slippage = v,
+            AS.MAX_SLIPPAGE_BPS / 100);
 
     const modes = $('as-modes');
     modes.innerHTML = '';
@@ -3693,6 +3745,30 @@
   // Разрешение теперь одно: роутер агрегатора берёт монету обычным approve,
   // без Permit2. В устоявшемся состоянии окно кошелька остаётся ровно одно —
   // сама продажа.
+  // ОЧЕРЕДЬ К КОШЕЛЬКУ ДЛЯ АВТОПРОДАЖИ.
+  //
+  // Раньше автопродажа держала «занято» всю свою жизнь — от первого запроса к
+  // агрегатору до подтверждения третьей попытки, минуты. Из-за этого:
+  //   * зависший агрегатор запирал выход из ЛЮБОЙ другой позиции: «Закрыть»
+  //     отвечал «уже жду ответа кошелька», хотя окна кошелька не было;
+  //   * второе закрытие, досчитанное во время продажи первого, видело «занято»
+  //     и автопродажу ПРОПУСКАЛО — одной строкой в журнале, навсегда.
+  //
+  // «Занято» означает одно: открыто окно кошелька. Поэтому автопродажа берёт
+  // его только на время подписи, а если оно занято — ждёт своей очереди, а не
+  // сдаётся. Проверка и захват идут без ожидания между ними, так что двое
+  // ждущих не проскочат одновременно.
+  async function walletTurn(maxWaitMs = 180000) {
+    const t0 = Date.now();
+    while (state.busy) {
+      if (Date.now() - t0 > maxWaitMs) return null;
+      await new Promise(r => setTimeout(r, 250));
+    }
+    state.busy = true;
+    let done = false;
+    return () => { if (!done) { done = true; state.busy = false; } };
+  }
+
   async function autoSell(ctx) {
     const d = AS.decide(ctx);
     if (!d.sell) { log('автопродажа: ' + d.why, 'dim'); return; }
@@ -3719,9 +3795,7 @@
 
     const chain = C.RH.kyberChain;
     if (!chain) { log(`автопродажа: сеть ${C.RH.label} не поддержана`, 'warn'); return; }
-    if (state.busy) { log('автопродажа: кошелёк занят, пропускаю', 'warn'); return; }
 
-    state.busy = true;
     try {
       log('автопродажа: ' + d.why);
 
@@ -3744,7 +3818,15 @@
           log('автопродажа: даю роутеру разрешение на эту монету (один раз)');
           const MAX = (1n << 256n) - 1n;
           const ap = C.buildApproveTo(d.addr, router, MAX);
-          const ah = await W.send({ from: state.account, to: ap.to, data: ap.data });
+          const release = await walletTurn();
+          if (!release) {
+            log('автопродажа: кошелёк занят слишком долго — разрешение не выдано, ' +
+                'монета осталась в кошельке', 'bad');
+            return;
+          }
+          let ah;
+          try { ah = await W.send({ from: state.account, to: ap.to, data: ap.data }); }
+          finally { release(); }
           const st = await waitMined(ah);
           gasWei += gasOf(st.receipt);          // квитанция уже на руках
           if (st.status !== 'ok') {
@@ -3773,16 +3855,48 @@
       // ПОПЫТКИ. Отказ по цене — не повод звать человека руками: позиция уже
       // закрыта, монета уже в кошельке, держать её никто не собирался.
       const base = AS.slippageBps();
+      if (base == null) {
+        log(`автопродажа: допуск ${AS.settings.slippage}% — это больше потолка ` +
+            `${AS.MAX_SLIPPAGE_BPS / 100}%, похоже на опечатку. Поправь в карточке ` +
+            `автопродажи; монета осталась в кошельке`, 'bad');
+        return;
+      }
+      // Лестница удваивает допуск, но не выше потолка. Упёрлась в потолок —
+      // следующие попытки идут с ним же, но по свежей котировке.
+      const stepBps = (n) => Math.min(AS.MAX_SLIPPAGE_BPS, base * Math.pow(2, n - 1));
       for (let attempt = 1; attempt <= 3; attempt++) {
-        const bps = Math.min(5000, base * Math.pow(2, attempt - 1));
+        const bps = stepBps(attempt);
 
-        const plan = await AS.plan({
-          chain, tokenIn: d.addr, tokenOut: d.into, amountIn: d.raw,
-          sender: state.account, slippageBps: bps,
-          // Сверка: транзакция обязана уйти на тот же адрес, которому мы
-          // выдали разрешение, а не на любой, какой назовёт сервис.
-          expectRouter: router,
-        });
+        // СБОЙ АГРЕГАТОРА — НЕ КОНЕЦ, А ПОВОД ПОВТОРИТЬ.
+        //
+        // Раньше запрос маршрута стоял вне лестницы попыток: один ответ 429
+        // или 5xx — и продажа сдавалась с первого раза, монета оставалась.
+        // Отказ сверки роутера — другое дело: это не сбой, а подмена адреса,
+        // и повторять такое нельзя ни при каких условиях.
+        let plan;
+        try {
+          plan = await AS.plan({
+            chain, tokenIn: d.addr, tokenOut: d.into, amountIn: d.raw,
+            sender: state.account, slippageBps: bps,
+            // Сверка: транзакция обязана уйти на тот же адрес, которому мы
+            // выдали разрешение, а не на любой, какой назовёт сервис.
+            expectRouter: router,
+          });
+        } catch (e) {
+          if (/чужой роутер/.test(e.message || '')) {
+            log('автопродажа ОСТАНОВЛЕНА: ' + e.message, 'bad');
+            return;
+          }
+          if (attempt === 3) {
+            log('автопродажа: агрегатор не ответил три раза — ' + e.message +
+                '. Монета в кошельке, продай вручную.', 'bad');
+            return;
+          }
+          log(`автопродажа: агрегатор не ответил (${e.message}) — ` +
+              `пробую снова через секунду`, 'warn');
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        }
 
         const outHuman = (d.intoDec == null)
           ? null : Number(plan.amountOut) / Math.pow(10, d.intoDec);
@@ -3816,17 +3930,25 @@
         }
 
         let hash;
+        const release = await walletTurn();
+        if (!release) {
+          log('автопродажа: кошелёк занят слишком долго — продажу не отправил, ' +
+              'монета в кошельке', 'bad');
+          return;
+        }
         try {
           hash = await W.send({
             from: state.account, to: plan.to, data: plan.data,
             value: isNative(d.addr) ? '0x' + BigInt(d.raw).toString(16) : '0x0',
           });
         } catch (e) {
+          release();
           // Отказ пришёл из кошелька, а не из сети: человек нажал «отклонить».
           // Это его решение, повторять нечего.
           log('автопродажа: кошелёк отказал — ' + e.message, 'bad');
           return;
         }
+        release();
         log('автопродажа: продажа отправлена ' + hash, 'ok');
 
         const r = await waitMined(hash);
@@ -3848,29 +3970,28 @@
           return;
         }
         log(`автопродажа: сеть отклонила. Пересчитываю и пробую снова с допуском ` +
-            `${(Math.min(5000, base * Math.pow(2, attempt)) / 100).toFixed(1)}%`, 'warn');
+            `${(stepBps(attempt + 1) / 100).toFixed(1)}%`, 'warn');
       }
     } catch (e) {
       log('автопродажа не вышла: ' + e.message, 'bad');
     } finally {
-      state.busy = false;
+      // «Занято» автопродажа больше не держит — его берёт и отдаёт walletTurn
+      // вокруг каждой подписи. Снимать его здесь значило бы отпустить чужое
+      // окно кошелька.
       setTimeout(loadPositions, 4000);
     }
   }
 
-  // Собрать то, что нужно решению, из уже прочитанной квитанции.
-  //
-  // Цену пула здесь НЕ считаем: она нужна только предохранителю по убытку, а
-  // он берёт её от ТОГО пула, через который пойдёт сделка. Какой это пул, до
-  // перебора неизвестно.
-  function flushCard() {
-    if (!pendingCard) return;
-    const id = pendingCard; pendingCard = null;
+  function flushCard(tokenId) {
+    const id = String(tokenId);
+    if (tokenId == null || !pendingCards.delete(id)) return;
     try { showCard(id, { ...(ledger.get(id) || {}) }); } catch (e) { }
   }
 
+  // Собрать то, что нужно автопродаже, из уже прочитанной квитанции.
+
   async function autoSellAfter(r, key, mode, extra = {}) {
-    if (!AS.settings.on) { flushCard(); return; }
+    if (!AS.settings.on) { flushCard(extra.tokenId); return; }
     try {
       const sym0 = await tokenSymbol(key.currency0);
       const sym1 = await tokenSymbol(key.currency1);
@@ -3893,7 +4014,7 @@
     } finally {
       // Что бы ни случилось — продали, отказались, упали, — карточка выходит
       // ровно один раз и с тем, что в журнале на этот момент.
-      flushCard();
+      flushCard(extra.tokenId);
     }
   }
 
