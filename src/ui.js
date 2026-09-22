@@ -313,10 +313,27 @@
           `который платит.</div>`;
         return;
       }
-      state.pool = key;
-      state.decimals[key.currency0] = await tokenDecimals(key.currency0);
-      state.decimals[key.currency1] = await tokenDecimals(key.currency1);
-      const s0 = await tokenSymbol(key.currency0), s1 = await tokenSymbol(key.currency1);
+      // ПУЛ СТАНОВИТСЯ ТЕКУЩИМ ТОЛЬКО ЦЕЛИКОМ.
+      //
+      // Раньше state.pool присваивался ДО чтения названий и разрядности. Если
+      // одно из них спотыкалось (частое дело на перегруженном узле), журнал
+      // писал «пул не гружу» — а в состоянии уже стоял новый ключ без названий.
+      // Сторона входа тогда бралась от прошлого пула, а подписка на цену
+      // продолжала слать цену ПРОШЛОГО пула. Enter входил в пул, который ты
+      // считал отвергнутым, по чужой цене.
+      //
+      // Теперь всё читается в локальные переменные (разом — это одна пачка),
+      // проверяется, и только потом пул подменяется одним присваиванием.
+      let d0, d1, s0, s1;
+      try {
+        [d0, d1, s0, s1] = await Promise.all([
+          tokenDecimals(key.currency0), tokenDecimals(key.currency1),
+          tokenSymbol(key.currency0), tokenSymbol(key.currency1),
+        ]);
+      } catch (e) {
+        log('не прочиталась разрядность токенов — пул не гружу: ' + e.message, 'bad');
+        return;
+      }
       // Название не прочиталось — не грузим пул. По названиям определяется,
       // какая сторона стейбл, а от этого зависит СТОРОНА диапазона и то,
       // какой токен уйдёт с кошелька. Молчаливый «?» выключал это определение.
@@ -326,6 +343,12 @@
         return;
       }
       key.sym0 = s0; key.sym1 = s1;
+      state.decimals[key.currency0] = d0;
+      state.decimals[key.currency1] = d1;
+      state.pool = key;
+      // Цена прошлого пула к этому отношения не имеет. Пока не придёт своя,
+      // вход откажет по возрасту цены — и это правильно.
+      state.slot0 = null; state.slot0At = 0;
       const step = (Math.pow(1.0001, key.tickSpacing) - 1) * 100;
       $('poolinfo').innerHTML =
         `<div class="kv"><span>пара</span><b>${s0} / ${s1}</b></div>` +
@@ -1598,6 +1621,17 @@
     // приходит уже при открытом окне подписи. Дешевле проверить заранее:
     // один запрос, зато не откроется окно с заведомо провальной сделкой.
     const dep = resolveSide();
+    // В ПАРЕ БЕЗ СТЕЙБЛА НЕ ВХОДИМ.
+    //
+    // Вся модель терминала — «купить или продать монету за стейбл», и выбора
+    // стороны для другой пары в интерфейсе нет вовсе. resolveSide в такой паре
+    // возвращал сторону, оставшуюся от ПРОШЛОГО пула, а выбор покупка/продажа
+    // молча игнорировался: с кошелька уходил токен, который ты не выбирал.
+    if (!dep.known) {
+      log('в паре нет стейбла — терминал входит только в пары со стейблом, ' +
+          'иначе не понять, какую сторону вносить', 'bad');
+      return;
+    }
     // Снимок того, на чём строился план: всё, что после await, обязано
     // относиться к тому же пулу и той же сумме. Иначе в calldata попадут
     // тики одного пула и ключ другого.
@@ -2693,7 +2727,8 @@
         catch (e) { nativeBefore = null; }
       }
 
-      const h = await W.send({ from: state.account, to: C.RH.positionManager, data });
+      const acct = state.account;         // с него уходит — его и досчитываем
+      const h = await W.send({ from: acct, to: C.RH.positionManager, data });
       log(`${m.verb} отправлено: ` + h, 'ok');
 
       if (AS.settings.on && mode !== 'fees' && C.RH.kyberChain) {
@@ -2715,8 +2750,8 @@
       // ЧЕСТНЫЙ ИТОГ. Считаем по тому, что реально вернулось, а не по
       // ожиданиям: читаем квитанцию самой транзакции.
       const settle = mode === 'all'
-        ? settleClose(h, tokenId, rec, symQuote, key, nativeBefore)
-        : settleTake(h, tokenId, symQuote, key, m.verb, nativeBefore, mode);
+        ? settleClose(h, tokenId, rec, symQuote, key, nativeBefore, acct)
+        : settleTake(h, tokenId, symQuote, key, m.verb, nativeBefore, mode, acct);
       // Запрет снимается, когда выход досчитан — включая автопродажу после
       // него: до этого момента позиция ещё «в пути».
       handedOff = true;
@@ -2750,7 +2785,7 @@
   // потраченный газ. Если баланс «до» снять не успели — так и говорим, а не
   // подставляем ноль: ноль здесь выглядит как настоящая цифра.
 
-  async function receiptBack(hash, key, nativeBefore) {
+  async function receiptBack(hash, key, nativeBefore, acct) {
     for (let i = 0; i < 20; i++) {
       // СПРАШИВАЕМ СРАЗУ, А ПАУЗУ ЖДЁМ ПОДПИСКОЙ.
       //
@@ -2766,7 +2801,11 @@
       if (!rc) continue;
       if (rc.status != null && BigInt(rc.status) === 0n) return { failed: true };
 
-      const me = state.account.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+      // АДРЕС — ТОТ, С КОТОРОГО УШЛА ТРАНЗАКЦИЯ, а не тот, что выбран сейчас.
+      // Переключил аккаунт в Rabby, пока выход майнится, — и переводы искались
+      // бы на новый адрес: «ничего не вернулось», итог минус сто процентов.
+      const who = acct || state.account;
+      const me = who.toLowerCase().replace(/^0x/, '').padStart(64, '0');
       const back = { 0: 0, 1: 0 };
       // ТЕ ЖЕ СУММЫ, НО В БАЗОВЫХ ЕДИНИЦАХ.
       //
@@ -2777,19 +2816,45 @@
       // целое, каким его вернула сеть.
       const raw = { 0: 0n, 1: 0n };
       const decs = { 0: 18, 1: 18 };
-      let nativeUnknown = false;
+      let nativeUnknown = false, nativeLoose = false;
       for (const idx of [0, 1]) {
         const cur = idx === 0 ? key.currency0 : key.currency1;
         if (isNative(cur)) {
-          if (nativeBefore == null) { nativeUnknown = true; continue; }
+          // НАТИВНУЮ СЧИТАЕМ ПО БАЛАНСУ НА БЛОКЕ ТРАНЗАКЦИИ.
+          //
+          // Событий Transfer у нативной нет, остаётся разница баланса. Раньше
+          // брали «до окна кошелька» и «сейчас» — и всё, что пришло на адрес за
+          // эти полминуты (вывод с биржи, другое закрытие), считалось выручкой
+          // позиции. На Robinhood нативный ETH не стейбл, и автопродажа
+          // продавала его — то есть твои собственные деньги, а не выручку.
+          //
+          // Баланс на блоке транзакции и на блоке перед ним отсекает всё, что
+          // случилось вне этого блока. Внутри одного блока чужой приход на тот
+          // же адрес возможен, но это уже редкость, а не полминуты окна.
+          const gas = BigInt(rc.gasUsed || 0) *
+                      BigInt(rc.effectiveGasPrice || rc.gasPrice || 0);
+          let delta = null;
           try {
-            const after = BigInt(await state.rpc('eth_getBalance',
-                                                 [state.account, 'latest']));
-            const gas = BigInt(rc.gasUsed || 0) *
-                        BigInt(rc.effectiveGasPrice || rc.gasPrice || 0);
-            const delta = after - BigInt(nativeBefore) + gas;
+            const bn = BigInt(rc.blockNumber);
+            const [b0, b1] = await Promise.all([
+              state.rpc('eth_getBalance', [who, '0x' + (bn - 1n).toString(16)]),
+              state.rpc('eth_getBalance', [who, '0x' + bn.toString(16)]),
+            ]);
+            delta = BigInt(b1) - BigInt(b0) + gas;
+          } catch (e) { delta = null; }
+          if (delta != null) {
             back[idx] = delta > 0n ? Number(delta) / 1e18 : 0;
             raw[idx] = delta > 0n ? delta : 0n;
+            continue;
+          }
+          // Узел не отдал баланс на блоке. Для ПОКАЗА считаем по-старому, но
+          // продавать такое число нельзя: в нём может сидеть чужой приход.
+          if (nativeBefore == null) { nativeUnknown = true; continue; }
+          try {
+            const after = BigInt(await state.rpc('eth_getBalance', [who, 'latest']));
+            const d = after - BigInt(nativeBefore) + gas;
+            back[idx] = d > 0n ? Number(d) / 1e18 : 0;
+            nativeLoose = true;                 // raw остаётся нулём
           } catch (e) { nativeUnknown = true; }
           continue;
         }
@@ -2812,15 +2877,15 @@
       // мелких позициях комиссия сети сопоставима с прибылью.
       const gasWei = BigInt(rc.gasUsed || 0) *
                      BigInt(rc.effectiveGasPrice || rc.gasPrice || 0);
-      return { back0: back[0], back1: back[1], nativeUnknown, gasWei,
+      return { back0: back[0], back1: back[1], nativeUnknown, nativeLoose, gasWei,
                raw0: raw[0], raw1: raw[1], dec0: decs[0], dec1: decs[1] };
     }
     return { timeout: true };
   }
 
-  async function settleTake(hash, tokenId, symQuote, key, verb, nativeBefore, mode) {
+  async function settleTake(hash, tokenId, symQuote, key, verb, nativeBefore, mode, acct) {
     {
-      const r = await receiptBack(hash, key, nativeBefore);
+      const r = await receiptBack(hash, key, nativeBefore, acct);
       if (r.failed) { log(`${verb} НЕ прошло: сеть отклонила транзакцию`, 'bad'); return; }
       if (r.timeout) { log(`${verb}: подтверждения не дождался, проверь кошелёк`, 'warn'); return; }
       const back0 = r.back0, back1 = r.back1;
@@ -2843,14 +2908,14 @@
           `${back1.toFixed(4)} = ${got.toFixed(4)} ${symQuote}. ` +
           `Всего вынуто из позиции: ${takenOut.toFixed(4)} ${symQuote} — ` +
           `итог считаю с учётом этого.`, 'ok');
-      await autoSellAfter(r, key, mode, { tokenId, rec: ledger.get(String(tokenId)) });
+      await autoSellAfter(r, key, mode, { tokenId, rec: ledger.get(String(tokenId)), acct });
       return;
     }
   }
 
-  async function settleClose(hash, tokenId, rec, symQuote, key, nativeBefore) {
+  async function settleClose(hash, tokenId, rec, symQuote, key, nativeBefore, acct) {
     {
-      const r = await receiptBack(hash, key, nativeBefore);
+      const r = await receiptBack(hash, key, nativeBefore, acct);
       if (r.failed) { log('закрытие НЕ прошло: сеть отклонила транзакцию', 'bad'); return; }
       if (r.timeout) { log('закрытие: подтверждения не дождался, проверь кошелёк', 'warn'); return; }
       const back0 = r.back0, back1 = r.back1;
@@ -2905,7 +2970,7 @@
         line += ' | вход не записан, итог посчитать не с чем';
       }
       log(line, rec && rec.amountIn != null && got >= rec.amountIn ? 'ok' : 'warn');
-      await autoSellAfter(r, key, 'all', { tokenId, rec, homeTick });
+      await autoSellAfter(r, key, 'all', { tokenId, rec, homeTick, acct });
       return;
     }
   }
@@ -3258,26 +3323,58 @@
   // Кнопка была нарисована, но ни к чему не привязана — история
   // обновлялась только при подключении кошелька.
   $('b-hist').onclick = () => loadHistory();
+  // ── АДРЕС КОШЕЛЬКА ──────────────────────────────────────────────────────
+  //
+  // Один путь принятия адреса на все три случая: кнопка «Подключить»,
+  // восстановление при загрузке и СМЕНА АККАУНТА В САМОМ КОШЕЛЬКЕ.
+  //
+  // Последнего раньше не было вовсе: слушатели в wallet.js были написаны, но
+  // нигде не подключены. Переключил аккаунт в Rabby — терминал продолжал
+  // читать балансы, разрешения и позиции СТАРОГО адреса, а подписывал уже
+  // новый. Транзакции либо отваливались с непонятной ошибкой кошелька, либо
+  // уходили с нового адреса, пока терминал ждал монету на старом.
+  function adoptAccount(addr, why) {
+    const prev = state.account;
+    if (!addr) {
+      state.account = null;
+      $('d-wallet').className = 'dot';
+      $('s-wallet').textContent = 'кошелёк не подключён';
+      if (prev) log('кошелёк отключён от страницы', 'warn');
+      return;
+    }
+    const changed = prev && prev.toLowerCase() !== addr.toLowerCase();
+    state.account = addr;
+    $('d-wallet').className = 'dot on';
+    $('s-wallet').textContent = addr.slice(0, 6) + '…' + addr.slice(-4);
+    if (changed) {
+      log(`в кошельке выбран другой адрес: ${addr} — перечитываю позиции и балансы`, 'warn');
+      if (closingIds.size) {
+        // Уже отправленный выход досчитается на тот адрес, с которого ушёл,
+        // но продавать с нового его монету терминал не станет.
+        log('выход, отправленный с прежнего адреса, досчитается на него; ' +
+            'автопродажи по нему не будет', 'warn');
+      }
+    } else if (why) {
+      log(why + addr, 'ok');
+    }
+    startPositionsPump();
+    watchMyTransfers();
+  }
+
   $('b-wallet').onclick = async () => {
     try {
       const w = await W.connect();
-      state.account = w.address;
-      $('d-wallet').className = 'dot on';
-      $('s-wallet').textContent = w.address.slice(0, 6) + '…' + w.address.slice(-4);
-      log('кошелёк подключён: ' + w.address, 'ok');
-      startPositionsPump();
-      watchMyTransfers();
+      adoptAccount(w.address, 'кошелёк подключён: ');
       loadWalletBalances().catch(() => {});
-    loadWalletBalances().catch(() => {});
       // Сеть переключаем сразу, а не в момент подписи. Иначе автор сначала
       // соберёт вход, а потом упрётся в отказ на самом последнем шаге.
       if (w.chainId !== C.RH.chainId) {
-        log(`кошелёк в сети ${w.chainId}, а нужна ${C.RH.chainId} (BNB Chain) — прошу переключить`, 'warn');
+        log(`кошелёк в сети ${w.chainId}, а нужна ${C.RH.chainId} (${C.RH.label}) — прошу переключить`, 'warn');
         try {
           await W.ensureChain(w.provider);
-          log('сеть переключена на BNB Chain', 'ok');
+          log(`сеть переключена на ${C.RH.label}`, 'ok');
         } catch (e) {
-          log(e.message + '. В Rabby выбери BNB Chain и нажми «Подключить» ещё раз', 'bad');
+          log(e.message + `. В Rabby выбери ${C.RH.label} и нажми «Подключить» ещё раз`, 'bad');
         }
       }
       // Позиции — сразу: ради них и подключаемся, и там кнопка «Закрыть».
@@ -3288,6 +3385,26 @@
       loadBalance().catch(() => {});
     } catch (e) { log('кошелёк: ' + e.message, 'bad'); }
   };
+
+  // Кошелёк сам сообщает о смене аккаунта и сети — слушаем.
+  W.onAccountsChanged((accs) => {
+    adoptAccount(accs && accs[0]);
+    if (state.account) {
+      loadWalletBalances().catch(() => {});
+      loadPositions();
+      loadBalance().catch(() => {});
+    }
+  });
+  W.onChainChanged((hex) => {
+    let id = null;
+    try { id = Number(BigInt(hex)); } catch (e) { }
+    // Перезагружать страницу тут нельзя: сам терминал просит кошелёк сменить
+    // сеть перед подписью, и это событие приходит и тогда. Достаточно сказать.
+    if (id != null && id !== C.RH.chainId) {
+      log(`кошелёк переключили на сеть ${id}, а терминал работает в ${C.RH.label} ` +
+          `(${C.RH.chainId}) — перед подписью попрошу вернуть`, 'warn');
+    }
+  });
 
   // ── горячая клавиша ─────────────────────────────────────────────────────
   //
@@ -3580,6 +3697,26 @@
     const d = AS.decide(ctx);
     if (!d.sell) { log('автопродажа: ' + d.why, 'dim'); return; }
 
+    // КОШЕЛЁК СМЕНИЛИ ПОСРЕДИ ВЫХОДА — НЕ ПРОДАЁМ.
+    //
+    // Монета пришла на адрес, с которого ушло закрытие. Если в Rabby сейчас
+    // выбран другой, продажа ушла бы с него — где этой монеты нет, — либо
+    // кошелёк отверг бы её с непонятной ошибкой. Скажем прямо и оставим.
+    if (ctx.acct && (state.account || '').toLowerCase() !== ctx.acct.toLowerCase()) {
+      log(`автопродажа: кошелёк сменили во время выхода — ${d.sym} остался на ` +
+          `${ctx.acct.slice(0, 6)}…${ctx.acct.slice(-4)}, продай его оттуда вручную`, 'warn');
+      return;
+    }
+
+    // Нативную, посчитанную «на глаз», не продаём: узел не отдал баланс на
+    // блоке транзакции, и в разнице могли оказаться чужие деньги.
+    if (isNative(d.addr) && ctx.nativeLoose) {
+      log(`автопродажа: возврат ${d.sym} посчитан неточно (узел не отдал баланс ` +
+          `на блоке закрытия), в нём мог оказаться посторонний приход — ` +
+          `продавать не берусь, продай вручную`, 'warn');
+      return;
+    }
+
     const chain = C.RH.kyberChain;
     if (!chain) { log(`автопродажа: сеть ${C.RH.label} не поддержана`, 'warn'); return; }
     if (state.busy) { log('автопродажа: кошелёк занят, пропускаю', 'warn'); return; }
@@ -3748,6 +3885,8 @@
         // Пул, из которого вышли. Он и есть точка отсчёта для предохранителя:
         // по его цене терминал показывал стоимость позиции.
         homePool: poolIdOf(key),
+        // С какого адреса ушло закрытие и точен ли возврат нативной.
+        acct: extra.acct, nativeLoose: r.nativeLoose,
       });
     } catch (e) {
       log('автопродажа: не смог собрать данные — ' + e.message, 'bad');
@@ -3786,12 +3925,7 @@
   (async () => {
     const w = await W.reconnect();
     if (!w) return;
-    state.account = w.address;
-    $('d-wallet').className = 'dot on';
-    $('s-wallet').textContent = w.address.slice(0, 6) + '…' + w.address.slice(-4);
-    log('кошелёк уже разрешён здесь: ' + w.address, 'ok');
-    startPositionsPump();
-    watchMyTransfers();
+    adoptAccount(w.address, 'кошелёк уже разрешён здесь: ');
     if (w.chainId !== C.RH.chainId)
       log(`но кошелёк в сети ${w.chainId}, а нужна ${C.RH.chainId} (${C.RH.label}) — ` +
           'переключи в Rabby или нажми «Подключить»', 'warn');
