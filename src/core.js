@@ -507,8 +507,19 @@ const ARCHIVE_RE = /archive|state (is )?not available|missing trie|pruned/i;
 // версия его не имела: запрос без фильтра развалился на сотни кусков, и узел
 // ответил «Too Many Requests» — деление, задуманное как лекарство, само
 // превратилось в обстрел общего узла. Потолок общий на весь верхний вызов.
+//
+// НЕПОЛНОТУ НЕ ПРЯЧЕМ. Если старую половину пришлось бросить, у результата
+// появляется поле partialFrom — первый блок, с которого журнал прочитан. Без
+// этого список позиций выглядел полным, а позиции старше отрезанного куска
+// просто не показывались, вместе с кнопкой «Закрыть».
 async function getLogsSplit(rpc, filter, from, to, state = null) {
   const st = state || { left: 48 };
+  const logs = await getLogsSplitInner(rpc, filter, from, to, st);
+  if (st.partialFrom != null) logs.partialFrom = st.partialFrom;
+  return logs;
+}
+
+async function getLogsSplitInner(rpc, filter, from, to, st) {
   if (st.left <= 0) {
     throw new Error('журнал не читается: отрезок пришлось бы делить слишком мелко');
   }
@@ -527,12 +538,15 @@ async function getLogsSplit(rpc, filter, from, to, state = null) {
     if (to - from < 4 || RATE_LIMIT_RE.test(msg)) throw e;
     const mid = Math.floor((from + to) / 2);
     // Узел не хранит такую глубину: старую половину даже не пробуем.
-    if (ARCHIVE_RE.test(msg)) return getLogsSplit(rpc, filter, mid + 1, to, st);
+    if (ARCHIVE_RE.test(msg)) {
+      st.partialFrom = Math.max(st.partialFrom || 0, mid + 1);
+      return getLogsSplitInner(rpc, filter, mid + 1, to, st);
+    }
     if (!LOGS_CAP_RE.test(msg)) throw e;
     // Половинки идут ПО ОЧЕРЕДИ, а не параллельно: узел общий, и одновременный
     // залп — прямой путь к «Too Many Requests».
-    const a = await getLogsSplit(rpc, filter, from, mid, st);
-    const b = await getLogsSplit(rpc, filter, mid + 1, to, st);
+    const a = await getLogsSplitInner(rpc, filter, from, mid, st);
+    const b = await getLogsSplitInner(rpc, filter, mid + 1, to, st);
     return a.concat(b);
   }
 }
@@ -650,7 +664,11 @@ async function findMint(rpc, tokenId, fromBlock) {
 
 // Что реально сдвинулось в этой транзакции между кошельком и пулом.
 // Читаем расписку: там лежат все переводы токенов, и подделать их нельзя.
-async function txFlows(rpc, hash, owner) {
+// НАТИВНАЯ МОНЕТА СОБЫТИЙ НЕ ОСТАВЛЯЕТ. Для пары с ней (opts.native) её
+// движение считается разницей баланса на границах блока плюс газ, если
+// транзакцию подписал сам владелец. Узлу для этого нужно состояние на старом
+// блоке; не отдал — нативной стороны просто нет, как было раньше.
+async function txFlows(rpc, hash, owner, opts = {}) {
   const rc = await rpc('eth_getTransactionReceipt', [hash]);
   if (!rc || !rc.logs) return null;
   const me = addrWord(owner).toLowerCase();
@@ -671,6 +689,23 @@ async function txFlows(rpc, hash, owner) {
       amount: BigInt(l.data === '0x' ? '0x0' : l.data),
       dir,
     });
+  }
+  if (opts.native) {
+    try {
+      const bn = BigInt(rc.blockNumber);
+      const [b0, b1] = await Promise.all([
+        rpc('eth_getBalance', [owner, '0x' + (bn - 1n).toString(16)]),
+        rpc('eth_getBalance', [owner, '0x' + bn.toString(16)]),
+      ]);
+      const mine = (rc.from || '').toLowerCase() === owner.toLowerCase();
+      const gas = mine ? BigInt(rc.gasUsed || 0) *
+                         BigInt(rc.effectiveGasPrice || rc.gasPrice || 0) : 0n;
+      const delta = BigInt(b1) - BigInt(b0) + gas;
+      if (delta !== 0n) {
+        flows.push({ token: '0x' + '0'.repeat(40),
+                     amount: delta < 0n ? -delta : delta, dir: delta < 0n ? -1 : 1 });
+      }
+    } catch (e) { /* старого состояния нет — нативную сторону не знаем */ }
   }
   return { block: Number(BigInt(rc.blockNumber)), flows };
 }
@@ -797,7 +832,21 @@ async function poolFeeReality(rpc, poolId, latest, window = 40000) {
              why: 'узел сейчас не отдаёт события обмена — повтори через минуту',
              blocks: latest - from };
   }
-  const fees = logs.map(l => Number(BigInt('0x' + words(l.data)[5]))).sort((a, b) => a - b);
+  // КОМИССИЯ В СОБЫТИИ — ОБЩАЯ, А НЕ ТА, ЧТО ДОСТАЁТСЯ LP.
+  //
+  // PoolManager пишет в Swap комиссию вместе с протокольной долей:
+  // swapFee = pf + lp − pf·lp/1e6. Пул с включённой долей протокола и нулевой
+  // комиссией LP выглядел бы «платящим», а провайдеры с него не получали бы
+  // ничего. Долю протокола берём из slot0 и вычитаем; берём большую из двух
+  // сторон — оценка должна быть осторожной, а не щедрой.
+  let pf = 0;
+  try {
+    const s0 = await readSlot0(rpc, poolId);
+    pf = Math.max(s0.protocolFee & 0xfff, (s0.protocolFee >> 12) & 0xfff);
+  } catch (e) { pf = 0; }
+  const lpPart = (f) => (pf ? Math.max(0, Math.round((f - pf) / (1 - pf / 1e6))) : f);
+  const fees = logs.map(l => lpPart(Number(BigInt('0x' + words(l.data)[5]))))
+                   .sort((a, b) => a - b);
   if (!fees.length) {
     return { swaps: 0, pays: null, why: 'обменов не было — платит или нет, неизвестно',
              blocks: latest - from };
@@ -809,7 +858,10 @@ async function poolFeeReality(rpc, poolId, latest, window = 40000) {
     // Платит, если хоть один обмен из недавних взял ненулевую комиссию.
     // Строже нельзя: у плавающей комиссии часть обменов законно идёт по нулю.
     pays: maxFee > 0,
-    why: maxFee > 0 ? null : 'все недавние обмены прошли с нулевой комиссией',
+    protocolFee: pf,
+    why: maxFee > 0 ? null
+       : pf ? 'вся комиссия недавних обменов ушла протоколу, LP не получили ничего'
+            : 'все недавние обмены прошли с нулевой комиссией',
   };
 }
 
@@ -854,9 +906,11 @@ async function readAllPositions(rpc, owner, fromBlock = 0) {
     const b = Number(BigInt(l.blockNumber));
     if (!seen.has(id) || b < seen.get(id)) seen.set(id, b);
   }
-  return [...seen.entries()]
+  const out = [...seen.entries()]
     .sort((a, b) => b[1] - a[1])                  // свежие первыми
     .map(([id, block]) => ({ id, block }));
+  if (logs.partialFrom != null) out.partialFrom = logs.partialFrom;
+  return out;
 }
 
 // Открытие и закрытие позиции из событий пула.
@@ -1413,6 +1467,9 @@ async function readSlot0(rpc, poolId) {
   return {
     sqrtPriceX96,
     tick: Number(toSigned(BigInt('0x' + w[1]), 256)),
+    // Протокольная доля: младшие 12 бит — для обмена 0→1, старшие — 1→0,
+    // в миллионных. Нужна, чтобы отличить комиссию LP от общей комиссии.
+    protocolFee: w.length > 2 ? Number(BigInt('0x' + w[2])) : 0,
   };
 }
 
@@ -2258,6 +2315,9 @@ function buildPermit2Approve(token, amount, expirationUnix) {
 // Что нужно сделать перед входом на заданную сумму. Возвращает список
 // действий, а не выполняет их: подписывает всегда автор.
 async function planApprovals(rpc, token, owner, amountNeeded, ttlSeconds, nowUnix) {
+  // Нативная монета уходит значением транзакции: approve у неё нет, а
+  // allowance по нулевому адресу возвращал пустоту, и BigInt('0x') ронял ARM.
+  if (isNativeCurrency(token)) return { current: null, steps: [] };
   const a = await readAllowances(rpc, token, owner);
   const need = BigInt(amountNeeded);
   const steps = [];

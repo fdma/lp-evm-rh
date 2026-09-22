@@ -47,7 +47,7 @@
   const KEY = C.RH.storeKey;
   // Номер версии на виду. Без него не отличить обновлённую сборку от старой:
   // автор дважды присылал скрин со старой, думая, что она новая.
-  const VERSION = '6.10.0';
+  const VERSION = '6.11.0';
 
   // Нативная монета сети записывается нулевым адресом. Нужна и на входе
   // (туда пока не пускаем), и при разборе квитанции: событий Transfer у неё
@@ -365,7 +365,9 @@
           real.pays ? (real.median / 10000).toFixed(3) + '%'
                     : 'неизвестно'}</b></div>` +
         `<div class="hint">${real.pays
-          ? `замерено по ${real.swaps} обменам за последние ${real.blocks} блоков`
+          ? `замерено по ${real.swaps} обменам за последние ${real.blocks} блоков` +
+            (real.protocolFee ? `; это доля LP — протокол берёт ещё ` +
+              `${(real.protocolFee / 10000).toFixed(2)}% с обмена себе` : '')
           : (real.why || 'проверить нечем') + ' — входить вслепую не стоит'}</div>` +
         `<div class="kv"><span>шаг цены</span><b class="num">${step.toFixed(2)}%</b></div>` +
         `<div class="kv"><span>минимальный отступ</span><b class="num warn">${
@@ -1543,8 +1545,23 @@
            (10n ** BigInt(Math.max(0, d - 15)));
   }
 
+  // ARM держит тот же флаг «окно кошелька открыто», что вход и выход: иначе
+  // его можно нажать посреди входа и получить два окна подряд, где второе
+  // выдаёт разрешение уже после того, как вход ушёл без него.
   async function arm() {
+    if (state.busy) { log('уже жду ответа кошелька', 'warn'); return; }
+    state.busy = true;
+    try { await armInner(); }
+    catch (e) { log('ARM не прошёл: ' + e.message, 'bad'); }
+    finally { state.busy = false; }
+  }
+
+  async function armInner() {
     if (!state.pool || !state.account) { log('нужны пул и кошелёк', 'bad'); return; }
+    if (!resolveSide().known) {
+      log('в паре нет стейбла — входить в неё терминал не станет, разрешения не нужны', 'warn');
+      return;
+    }
     const token = quoteToken();
     const need = amountRaw();
     const now = Math.floor(Date.now() / 1000);
@@ -1864,7 +1881,7 @@
                                          : snapAmount * (priceCoin || 0);
       const depSymbol = dep.token.toLowerCase() === (key.currency0 || '').toLowerCase()
         ? key.sym0 : key.sym1;
-      pendingEntry = { amountIn: amountInStable, tEntry: Date.now(),
+      const entry = { amountIn: amountInStable, tEntry: Date.now(),
                        // То, чем реально зашли — для честной подписи в карточке.
                        amountInToken: snapAmount, symIn: depSymbol,
                        depIsStable,
@@ -1875,7 +1892,7 @@
       if (!depIsStable && !priceCoin) {
         log('цена входа не прочиталась — итог по этой позиции будет неточным', 'warn');
       }
-      setTimeout(() => bindEntry(), 6000);
+      setTimeout(() => bindEntry(entry), 6000);
       setTimeout(loadPositions, 6000);
     } catch (e) {
       log('кошелёк отказал: ' + e.message, 'bad');
@@ -1888,9 +1905,26 @@
 
   // Привязка записи о входе к номеру NFT: номер известен только после того,
   // как транзакция попала в блок.
-  let pendingEntry = null;
-  async function bindEntry() {
+  //
+  // У КАЖДОГО ВХОДА СВОЯ ЗАПИСЬ И СВОЙ ПРЕДЕЛ ОЖИДАНИЯ.
+  //
+  // Раньше ожидающий вход лежал в одной переменной: второй вход, отправленный
+  // до подтверждения первого, затирал его, и первая позиция оставалась без
+  // записи. Опрос шёл без предела — пропавшая или заменённая транзакция
+  // крутила его каждые четыре секунды до закрытия вкладки. А получатель
+  // сверялся с адресом, выбранным в кошельке СЕЙЧАС: сменил адрес — и
+  // совпадения не будет никогда, тот же вечный цикл.
+  const BIND_TRIES = 45;                        // ≈ три минуты по 4 с
+  async function bindEntry(pendingEntry, tries = 0) {
     if (!pendingEntry) return;
+    const again = () => {
+      if (tries + 1 >= BIND_TRIES) {
+        log(`вход ${pendingEntry.hash.slice(0, 10)}… не подтвердился за три минуты — ` +
+            'запись не привязана; позицию терминал найдёт в цепочке сам', 'warn');
+        return;
+      }
+      setTimeout(() => bindEntry(pendingEntry, tries + 1), 4000);
+    };
     // НОМЕР ПОЗИЦИИ БЕРЁМ ИЗ КВИТАНЦИИ, А НЕ У ОБОЗРЕВАТЕЛЯ.
     //
     // В версии для Robinhood здесь стоял запрос в Blockscout. На BSC такого
@@ -1903,25 +1937,31 @@
       const TRANSFER =
         '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
       const rc = await state.rpc('eth_getTransactionReceipt', [pendingEntry.hash]);
-      if (!rc) { setTimeout(bindEntry, 4000); return; }
+      if (!rc) { again(); return; }
       if (rc.status && BigInt(rc.status) === 0n) {
         log('вход не прошёл: сеть отклонила транзакцию', 'bad');
-        pendingEntry = null; return;
+        return;
       }
-      const me = (state.account || '').toLowerCase().replace(/^0x/, '').padStart(64, '0');
+      const me = (rc.from || state.account || '').toLowerCase()
+        .replace(/^0x/, '').padStart(64, '0');
       const mint = (rc.logs || []).find(l =>
         (l.address || '').toLowerCase() === C.RH.positionManager &&
         (l.topics || [])[0] === TRANSFER &&
         ((l.topics || [])[2] || '').toLowerCase().endsWith(me) &&
         (l.topics || []).length === 4);
       const id = mint ? String(BigInt(mint.topics[3])) : null;
-      if (!id) { setTimeout(bindEntry, 4000); return; }
+      if (!id) {
+        // Квитанция есть, а NFT в ней нет — ждать больше нечего: она не
+        // появится от повторного чтения той же квитанции.
+        log('вход подтверждён, но номер позиции в квитанции не нашёлся — ' +
+            'запись не привязана', 'warn');
+        return;
+      }
       ledger.put(String(id), pendingEntry);
       log(`вход записан: позиция ${id}, ${pendingEntry.amountIn} по цене ` +
-          `${pendingEntry.priceIn.toPrecision(6)}`, 'ok');
-      pendingEntry = null;
+          `${(pendingEntry.priceIn || 0).toPrecision(6)}`, 'ok');
       loadPositions();
-    } catch (e) { setTimeout(bindEntry, 4000); }
+    } catch (e) { again(); }
   }
 
   // Номера позиций, у которых ликвидность оказалась нулевой. Живёт в памяти
@@ -2169,11 +2209,25 @@
     }, 20000);
   }
 
+  // Снять живой пересчёт целиком. Без этого выходы «кошелёк отключён» и
+  // «позиций нет» оставляли на узле подписки на пулы, которых в таблице уже
+  // нет, — и они копились с каждой сменой аккаунта.
+  function dropLiveRows() {
+    liveRows = [];
+    for (const pid of livePools) wsUnsubscribe('pos:' + pid);
+    livePools.clear();
+  }
+
+  let partialWarned = false;
   async function loadPositions() {
     const run = ++posRun;
     const stale = () => run !== posRun;
     const tb = $('pos').querySelector('tbody');
-    if (!state.account) { tb.innerHTML = '<tr><td colspan="7" class="hint">подключи кошелёк</td></tr>'; return; }
+    if (!state.account) {
+      dropLiveRows();
+      tb.innerHTML = '<tr><td colspan="7" class="hint">подключи кошелёк</td></tr>';
+      return;
+    }
     tb.innerHTML = '<tr><td colspan="7" class="hint">читаю…</td></tr>';
     let ids = [];
     try {
@@ -2189,7 +2243,15 @@
       // «internal server error». Один запрос по всей истории и дешевле,
       // и полнее: фильтр по адресу делает глубину бесплатной.
       const from = C.RH.deepLogs ? 0 : -(C.RH.logsWindow || 5000);
-      ids = (await C.readAllPositions(logsRpc(), state.account, from)).map(x => x.id);
+      const all = await C.readAllPositions(logsRpc(), state.account, from);
+      ids = all.map(x => x.id);
+      // Узел отдал не всю историю — говорим об этом, а не показываем
+      // неполный список как полный. Раз за сеанс: фон ходит каждые 20 с.
+      if (all.partialFrom != null && !partialWarned) {
+        partialWarned = true;
+        log(`узел отдал журнал только с блока ${all.partialFrom} — позиции, ` +
+            'открытые раньше, могли не показаться', 'warn');
+      }
     } catch (e) { log('позиции не прочитались: ' + e.message, 'warn'); }
     // Свои позиции знаем сами: обозреватель индексирует новую NFT с
     // задержкой до полуминуты, и всё это время позиция «пропадала».
@@ -2199,7 +2261,11 @@
       if (!ids.includes(k)) ids.unshift(k);
     }
     if (stale()) return;
-    if (!ids.length) { tb.innerHTML = '<tr><td colspan="7" class="hint">позиций нет</td></tr>'; return; }
+    if (!ids.length) {
+      dropLiveRows();
+      tb.innerHTML = '<tr><td colspan="7" class="hint">позиций нет</td></tr>';
+      return;
+    }
     // Таблицу НЕ очищаем здесь: впереди отсев пустых оболочек, и на это время
     // должно оставаться «читаю…». Пустая таблица читается как «позиций нет».
     tb.innerHTML = `<tr><td colspan="7" class="hint">читаю ${ids.length} позиций…</td></tr>`;
@@ -2390,6 +2456,17 @@
         if (feeShare == null) { /* считать нечем — строки не будет */ }
         const raw2 = Math.pow(1.0001, s0.tick) * Math.pow(10, d0 - d1);
         const stIdx2 = STABLE.test(sym1 || '') ? 1 : 0;
+        // ПРОДАВЕЦ ПЛАТИТ И ПРОТОКОЛУ. Комиссия в ключе и замер — это доля
+        // LP, а с обмена сверху берётся ещё протокольная: на Robinhood она
+        // включена примерно у половины живых пулов. Сторона обмена — монета
+        // в стейбл: монета первой — младшие 12 бит, второй — старшие.
+        // Цена из подписки протокольную долю не несёт, поэтому берём её из
+        // slot0, прочитанного при загрузке списка.
+        if (feeShare != null && P.s0 && P.s0.protocolFee) {
+          const pf = (stIdx2 === 1 ? P.s0.protocolFee : P.s0.protocolFee >> 12) & 0xfff;
+          const pfs = pf / 1e6;
+          feeShare = pfs + feeShare - pfs * feeShare;
+        }
         const a2 = C.amountsForLiquidity(
           s0.sqrtPriceX96, C.getSqrtRatioAtTick(t.tickLower),
           C.getSqrtRatioAtTick(t.tickUpper), liq);
@@ -2483,24 +2560,29 @@
       // При перевороте нижняя граница становится верхней.
       const bLo = Math.min(pAt(t.tickLower), pAt(t.tickUpper));
       const bHi = Math.max(pAt(t.tickLower), pAt(t.tickUpper));
-      let bounds = '—';
-      if (s0) {
+      // Границы позиции — в тех же единицах, что и весь экран. Выпуск берём
+      // у МОНЕТЫ ЭТОЙ позиции, а не у загруженного пула. Читаем его один раз
+      // здесь: живой пересчёт ниже синхронный и в сеть не ходит.
+      const coinAddr = stIdx === 0 ? info.key.currency1 : info.key.currency0;
+      const sup = unit === 'cap' ? await supplyOf(coinAddr) : null;
+      // Ячейка границ — тоже функция цены: «внутри / до входа N%» меняется
+      // с каждым обменом, и живой пересчёт обязан её обновлять, а не только
+      // стоимость рядом.
+      const boundsOf = (s0) => {
+        if (!s0) return '—';
         const nowP = stIdx === 0
           ? 1 / (Math.pow(1.0001, s0.tick) * Math.pow(10, d0 - d1))
           : Math.pow(1.0001, s0.tick) * Math.pow(10, d0 - d1);
         const inside = nowP >= bLo && nowP <= bHi;
         const near = nowP < bLo ? bLo : bHi;
         const away = Math.abs(near / nowP - 1) * 100;
-        // Границы позиции — в тех же единицах, что и весь экран. Выпуск берём
-        // у МОНЕТЫ ЭТОЙ позиции, а не у загруженного пула.
-        const coinAddr = stIdx === 0 ? info.key.currency1 : info.key.currency0;
-        const sup = unit === 'cap' ? await supplyOf(coinAddr) : null;
         const showB = (v) => sup ? fmtCap(v * sup) : fmtPrice(v);
-        bounds = `<span class="dim">${sup ? 'Min капа' : 'Min'}</span> ${showB(bLo)}<br>` +
-                 `<span class="dim">${sup ? 'Max капа' : 'Max'}</span> ${showB(bHi)}<br>` +
-                 (inside ? '<span class="ok">внутри</span>'
-                         : `<span class="warn">до входа ${away.toFixed(1)}%</span>`);
-      }
+        return `<span class="dim">${sup ? 'Min капа' : 'Min'}</span> ${showB(bLo)}<br>` +
+               `<span class="dim">${sup ? 'Max капа' : 'Max'}</span> ${showB(bHi)}<br>` +
+               (inside ? '<span class="ok">внутри</span>'
+                       : `<span class="warn">до входа ${away.toFixed(1)}%</span>`);
+      };
+      const bounds = boundsOf(s0);
       // Запоминаем позицию для переключателя шкалы: пара, пул и границы.
       found.push({ id: String(id), pair: `${sym0}/${sym1}`, poolId,
                    tickLower: t.tickLower, tickUpper: t.tickUpper });
@@ -2573,7 +2655,12 @@
       // Строка встаёт на живой пересчёт: цена этого пула приходит подпиской,
       // и по ней обновляются «в работе / ждёт», состав, стоимость и итог.
       // Всё это чистая арифметика от цены — в сеть не ходим.
-      liveRows.push({
+      //
+      // БЕЗ РАЗРЯДНОСТИ — НЕ ВСТАЁТ. Первичный проход в таком случае гасит
+      // цену и показывает прочерки. Живой пересчёт подставлял настоящую цену
+      // в формулы с d0 = d1 = null, 10^(null − null) давало единицу, и строка
+      // показывала правдоподобную стоимость, ошибочную в 10^12 раз.
+      if (d0 != null && d1 != null) liveRows.push({
         tr, poolId,
         redraw: (s0) => {
           if (!tr.parentNode) return false;        // строку уже сменили
@@ -2581,6 +2668,7 @@
           tr.cells[0].innerHTML =
             `${id}<br><span class="${inRange ? 'ok' : 'dim'}">${
               inRange ? 'в работе' : 'ждёт'}</span>`;
+          tr.cells[2].innerHTML = boundsOf(s0);
           tr.cells[3].innerHTML = comp;
           tr.cells[4].innerHTML = valueStr;
           // Итог пересчитываем, только когда вход уже найден: до этого в
@@ -2664,7 +2752,8 @@
       const m = await C.findMint(logsRpc(), id,
                                  C.RH.deepLogs ? 0 : -(C.RH.mintWindow || 60000));
       if (!m) return null;
-      const f = await C.txFlows(state.rpc, m.hash, state.account);
+      const f = await C.txFlows(state.rpc, m.hash, state.account,
+        { native: isNative(key.currency0) || isNative(key.currency1) });
       const inflow = f ? f.flows.filter(x => x.dir < 0) : [];
       if (!inflow.length) return null;
       const pe = await C.priceAtBlock(logsRpc(), poolId, m.block);
@@ -3170,7 +3259,8 @@
 
       // Стоимость движений транзакции по цене её собственного блока.
       const valueAt = async (ev, dir) => {
-        const f = await C.txFlows(state.rpc, ev.hash, state.account);
+        const f = await C.txFlows(state.rpc, ev.hash, state.account,
+          { native: isNative(g.key.currency0) || isNative(g.key.currency1) });
         const pr = await C.priceAtBlock(logsRpc(), pid, ev.block);
         const raw = pr ? C.priceFromSqrt(pr.sqrtPriceX96, d0, d1) : null;
         const mine = ev.delta > 0n ? ev.delta : -ev.delta;
@@ -3647,7 +3737,10 @@
   // Считается на месте, без похода в сеть: квитанцию уже принёс waitMined.
   function receivedFrom(rc, token) {
     if (!rc) return 0n;
-    const me = state.account.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+    // Получатель — тот, кто подписал продажу, а не адрес, выбранный в
+    // кошельке сейчас: его могли переключить, пока шло подтверждение.
+    const who = rc.from || state.account;
+    const me = who.toLowerCase().replace(/^0x/, '').padStart(64, '0');
     let sum = 0n;
     for (const l of (rc.logs || [])) {
       if ((l.address || '').toLowerCase() !== token.toLowerCase()) continue;
@@ -3668,6 +3761,10 @@
   const nativePriceCache = new Map();
   const NATIVE_PRICE_TTL = 5 * 60 * 1000;
   async function nativePriceIn(stable, decStable) {
+    // Выход в саму нативную: газ уже в тех же деньгах, курс — единица.
+    // Раньше здесь искался пул «нативная/нативная», не находился, и газ из
+    // итога пропадал целиком.
+    if (isNative(stable)) return 1;
     const k = (stable || '').toLowerCase();
     const hit = nativePriceCache.get(k);
     if (hit && Date.now() - hit.at < NATIVE_PRICE_TTL) return hit.price;
@@ -3714,18 +3811,34 @@
     // Выручка продажи. У нативной монеты событий Transfer не бывает — её
     // считаем по изменению баланса за вычетом газа, как это делает разбор
     // закрытия. Без этого выход в BNB давал ноль и ложный минус на всю сумму.
+    //
+    // Баланс берём НА ГРАНИЦАХ БЛОКА ПРОДАЖИ, а не «сейчас минус до». Между
+    // «до» и «сейчас» проходят секунды, и любой чужой перевод на кошелёк за
+    // это время записывался в выручку. Блок продажи тоже может нести чужое
+    // поступление, но это окно в один блок, а не в десятки.
     let saleRaw;
     if (isNative(d.into)) {
-      if (nativeBefore == null) {
-        log('автопродажа: баланс до продажи снять не успел, итог не считаю', 'dim');
-        return;
-      }
+      const who = saleReceipt && saleReceipt.from;
+      const bn = saleReceipt && saleReceipt.blockNumber && BigInt(saleReceipt.blockNumber);
       try {
-        const after = BigInt(await state.rpc('eth_getBalance', [state.account, 'latest']));
-        const delta = after - BigInt(nativeBefore) + gasOf(saleReceipt);
+        let delta;
+        if (who && bn) {
+          const [b0, b1] = await Promise.all([
+            state.rpc('eth_getBalance', [who, '0x' + (bn - 1n).toString(16)]),
+            state.rpc('eth_getBalance', [who, '0x' + bn.toString(16)]),
+          ]);
+          delta = BigInt(b1) - BigInt(b0) + gasOf(saleReceipt);
+        } else {
+          if (nativeBefore == null) {
+            log('автопродажа: баланс до продажи снять не успел, итог не считаю', 'dim');
+            return;
+          }
+          const after = BigInt(await state.rpc('eth_getBalance', [who || state.account, 'latest']));
+          delta = after - BigInt(nativeBefore) + gasOf(saleReceipt);
+        }
         saleRaw = delta > 0n ? delta : 0n;
       } catch (e) {
-        log('автопродажа: баланс после продажи прочитать не смог, итог не считаю', 'dim');
+        log('автопродажа: баланс вокруг продажи прочитать не смог, итог не считаю', 'dim');
         return;
       }
     } else {
@@ -3741,13 +3854,26 @@
 
     const got = fromClose + fromSale;
     const net = gasCost == null ? got : got - gasCost;
-    const pnl = net - rec.amountIn;
+    // Старая запись входа (в монете, а не в стейбле) с этим не сравнима —
+    // строка при закрытии уже сказала «итог не считаю», и здесь то же самое.
+    if (!entryUsable(rec, got)) {
+      log(`ПРОДАНО ${ctx.tokenId}: из позиции ${fromClose.toFixed(6)} + за монету ` +
+          `${fromSale.toFixed(6)} = ${got.toFixed(6)} ${d.intoSym} | вход записан ` +
+          'в монете, а не в стейбле — итог не считаю', 'warn');
+      return;
+    }
+    // Вынутое раньше («Комиссии», «Половина») — часть того же результата.
+    // Без него закрытие остатка показывало минус ровно на снятую сумму —
+    // строка при закрытии это учитывала, а итог по факту нет.
+    const out = (ledger.get(String(ctx.tokenId)) || {}).takenOut || 0;
+    const pnl = net + out - rec.amountIn;
     const pct = rec.amountIn > 0 ? pnl / rec.amountIn * 100 : 0;
 
     log(`ИТОГ ПО ФАКТУ ${ctx.tokenId}: из позиции ${fromClose.toFixed(6)} + ` +
         `за монету ${fromSale.toFixed(6)} = ${got.toFixed(6)} ${d.intoSym}` +
         (gasCost == null ? ' (газ посчитать не смог)'
                          : ` − газ ${gasCost.toFixed(6)} = ${net.toFixed(6)}`) +
+        (out > 0 ? ` + вынуто раньше ${out.toFixed(6)}` : '') +
         ` | вносил ${rec.amountIn.toFixed(6)} → ${pnl >= 0 ? '+' : ''}${pnl.toFixed(6)} ` +
         `(${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)`,
         pnl >= 0 ? 'ok' : 'bad');
@@ -3875,7 +4001,12 @@
           try { tick = (await C.readSlot0(state.rpc, ctx.homePool)).tick; }
           catch (e) { tick = null; }
         }
-        if (tick != null) homePrice = Math.pow(1.0001, tick) * Math.pow(10, d.dec - d.intoDec);
+        // homePrice — цена currency0 в currency1, поправка разрядов d0 − d1.
+        // Раньше она всегда была «монета − стейбл», и при монете в currency1
+        // (6 знаков у USDG против 18 у монеты) оценка выхода врала на 10^24.
+        const d0 = d.side === 0 ? d.dec : d.intoDec;
+        const d1 = d.side === 0 ? d.intoDec : d.dec;
+        if (tick != null) homePrice = Math.pow(1.0001, tick) * Math.pow(10, d0 - d1);
       }
 
       // ПОПЫТКИ. Отказ по цене — не повод звать человека руками: позиция уже
@@ -3978,6 +4109,8 @@
         log('автопродажа: продажа отправлена ' + hash, 'ok');
 
         const r = await waitMined(hash);
+        // Отклонённая сетью попытка тоже платит газ, и в итог он входит.
+        if (r.status === 'failed') gasWei += gasOf(r.receipt);
         if (r.status === 'ok') {
           log(`АВТОПРОДАЖА ПРОШЛА: ${d.sym} → ${d.intoSym}`, 'ok');
           // Итог считаем ПО ФАКТУ: строка при закрытии оценивала монету по
