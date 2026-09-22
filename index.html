@@ -2,6 +2,11 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
+<!-- Без этого тега телефон рисует страницу как десктоп в 980 px и сжимает:
+     кнопки и цифры становятся мелкими, а одноколоночная раскладка не
+     включается вовсе. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#09090b">
 <!-- САМА СТРАНИЦА НЕ ДОЛЖНА ЛЕЖАТЬ В КЭШЕ.
      Адреса скриптов с номером сборки лежат ВНУТРИ этого файла, а GitHub Pages
      просит браузер хранить его десять минут. Из-за этого после выкладки автор
@@ -16,104 +21,247 @@
 <link rel="preconnect" href="https://aggregator-api.kyberswap.com" crossorigin>
 <title>LP — Uniswap V4</title>
 <style>
-  /* ЦВЕТА ВЗЯТЫ ИЗ СПРАВОЧНИКА, КОТОРЫЙ ПРИСЛАЛ АВТОР.
-     Три уровня поверхности (фон -> панель -> приподнятая) плюс инсет для
-     полей ввода, три яркости текста и один акцент — мята. Волосяные линии
-     не тёмно-синие, а белые с малой прозрачностью: на тёмном они читаются
-     мягче и не рисуют сетку поверх содержимого.
-     Прежние имена переменных сохранены до одного: ничего в разметке и
-     скриптах менять не пришлось. */
+  /* ДИЗАЙН 7.0 — по референсам автора: shadcn, coss, beUI, transitions.dev.
+     Общий язык у них один: почти чёрный нейтральный фон (zinc), тонкие
+     светлые рамки, крупные скругления, белая главная кнопка, сегментные
+     переключатели с подложкой, которая переезжает к выбранному, и короткие
+     анимации, которые подсказывают, что изменилось, а не развлекают.
+     Имена переменных прежние: ui.js ссылается на var(--bad) и соседей. */
   :root{
-    --bg:#101216; --panel:#181b20; --raised:#20242b; --inset:#12151a;
-    --line:rgba(255,255,255,.08); --line2:rgba(255,255,255,.14);
-    --fg:#edf0f4; --dim:#969eab; --dim2:#788291;
-    --ok:#81d8ad; --accent:#a7e1c0; --accent-dim:#213a30;
-    --warn:#e2b87b; --bad:#ed9393; --act:#a7e1c0;
+    --bg:#09090b; --panel:#0e0e11; --raised:#18181b; --raised2:#222226;
+    --inset:#0b0b0d;
+    --line:rgba(255,255,255,.07); --line2:rgba(255,255,255,.11);
+    --line3:rgba(255,255,255,.2);
+    --fg:#fafafa; --dim:#a1a1aa; --dim2:#71717a;
+    --ok:#7ee2b0; --accent:#7ee2b0; --accent-dim:#16352a;
+    --warn:#f0b86e; --bad:#f58b8b; --act:#fafafa;
+    --r:14px; --r-sm:9px;
+    --ease:cubic-bezier(.2,.8,.2,1);
+    --spring:cubic-bezier(.3,1.35,.5,1);
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);
-       font:13px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  html{color-scheme:dark}
+  ::selection{background:rgba(126,226,176,.25)}
+  body{margin:0;min-height:100vh;color:var(--fg);
+       background:
+         radial-gradient(900px 420px at 18% -120px,rgba(126,226,176,.07),transparent 70%),
+         radial-gradient(800px 380px at 88% -160px,rgba(120,150,255,.06),transparent 70%),
+         var(--bg);
+       background-attachment:fixed;
+       font:13px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+       -webkit-font-smoothing:antialiased;
        /* Табличные цифры на всей странице. Цена обновляется четыре раза в
           секунду, и без них строка дёргается на каждом знаке. */
        font-variant-numeric:tabular-nums}
   .num{font-variant-numeric:tabular-nums;
-       font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
-  header{display:flex;align-items:center;gap:14px;padding:9px 16px;
-         border-bottom:1px solid var(--line);background:var(--panel)}
-  header h1{margin:0;font-size:14px;letter-spacing:.14em;font-weight:600}
+       font-family:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+       letter-spacing:-.01em}
+
+  /* ── шапка: стекло поверх страницы ──────────────────────────────────── */
+  header{position:sticky;top:0;z-index:50;display:flex;align-items:center;
+         flex-wrap:wrap;gap:10px;padding:10px 18px;
+         background:rgba(9,9,11,.72);
+         -webkit-backdrop-filter:blur(14px) saturate(1.5);
+         backdrop-filter:blur(14px) saturate(1.5);
+         border-bottom:1px solid var(--line)}
+  header h1{margin:0 6px 0 0;font-size:15px;font-weight:650;letter-spacing:-.01em;
+            display:flex;align-items:center;gap:9px}
+  header h1::before{content:"";width:22px;height:22px;border-radius:7px;
+    background:
+      radial-gradient(circle at 30% 25%,rgba(255,255,255,.9),transparent 45%),
+      linear-gradient(135deg,#7ee2b0,#5b8cff);
+    box-shadow:0 0 0 1px rgba(255,255,255,.15) inset,0 4px 14px rgba(126,226,176,.25)}
   header .sp{flex:1}
-  .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;
-        border:1px solid var(--line2);border-radius:999px;font-size:11.5px;color:var(--dim)}
-  .dot{width:7px;height:7px;border-radius:50%;background:var(--dim2)}
-  .dot.on{background:var(--ok);box-shadow:0 0 7px var(--ok)}
-  .dot.bad{background:var(--bad)}
-  main{display:grid;grid-template-columns:minmax(300px,340px) 1fr;gap:14px;
-       padding:14px;align-items:start}
-  @media(max-width:840px){main{grid-template-columns:1fr}}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:9px;
-        padding:12px 13px}
-  .card h2{margin:0 0 10px;font-size:11px;letter-spacing:.12em;color:var(--dim);
-           text-transform:uppercase;font-weight:600}
-  label{display:block;font-size:11px;color:var(--dim);margin:9px 0 4px;
-        letter-spacing:.04em;text-transform:uppercase}
-  input[type=text]{width:100%;background:var(--inset);color:var(--fg);
-        border:1px solid var(--line2);border-radius:6px;padding:7px 9px;
-        font:inherit}
-  input[type=text]:focus{outline:none;border-color:var(--act)}
+  .pill{display:inline-flex;align-items:center;gap:7px;padding:4px 10px;
+        background:rgba(255,255,255,.03);border:1px solid var(--line);
+        border-radius:999px;font-size:12px;color:var(--dim);
+        transition:color .2s,border-color .2s}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--dim2);
+       transition:background .3s,box-shadow .3s;flex:none}
+  /* Живой индикатор дышит: видно, что данные идут, а не застыли. */
+  .dot.on{background:var(--ok);animation:pulse 2.4s var(--ease) infinite}
+  .dot.bad{background:var(--bad);box-shadow:0 0 0 3px rgba(245,139,139,.15)}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(126,226,176,.55)}
+                   70%{box-shadow:0 0 0 6px rgba(126,226,176,0)}
+                   100%{box-shadow:0 0 0 0 rgba(126,226,176,0)}}
+
+  /* ── раскладка и карточки ───────────────────────────────────────────── */
+  main{display:grid;grid-template-columns:minmax(310px,360px) minmax(0,1fr);gap:16px;
+       padding:16px 18px 40px;align-items:start;max-width:1600px;margin:0 auto}
+  @media(max-width:880px){main{grid-template-columns:minmax(0,1fr);padding:12px}}
+  .card{position:relative;border-radius:var(--r);padding:16px;
+        background:linear-gradient(180deg,rgba(255,255,255,.028),rgba(255,255,255,.008)),var(--panel);
+        border:1px solid var(--line);
+        box-shadow:0 1px 0 rgba(255,255,255,.04) inset,0 10px 30px -18px rgba(0,0,0,.8);
+        animation:rise .5s var(--ease) both}
+  main>div>.card:nth-child(2),.grid2>.card:nth-child(2){animation-delay:.04s}
+  main>div>.card:nth-child(3){animation-delay:.08s}
+  main>div>.card:nth-child(4){animation-delay:.12s}
+  main>div>.card:nth-child(5){animation-delay:.16s}
+  @keyframes rise{from{opacity:0;transform:translateY(6px);filter:blur(3px)}
+                  to{opacity:1;transform:none;filter:none}}
+  .card h2{margin:0 0 12px;font-size:13.5px;font-weight:600;color:var(--fg);
+           letter-spacing:-.005em}
+  .card h2::first-letter,label::first-letter{text-transform:uppercase}
+  label{display:block;font-size:12px;color:var(--dim);margin:14px 0 6px;font-weight:500}
+
+  /* ── поля ввода ─────────────────────────────────────────────────────── */
+  input[type=text]{width:100%;height:36px;background:var(--inset);color:var(--fg);
+        border:1px solid var(--line2);border-radius:var(--r-sm);padding:0 11px;
+        font:inherit;transition:border-color .15s,box-shadow .15s,background .15s}
+  input[type=text]::placeholder{color:var(--dim2)}
+  input[type=text]:hover{border-color:var(--line3)}
+  input[type=text]:focus{outline:none;border-color:rgba(255,255,255,.35);
+        box-shadow:0 0 0 3px rgba(255,255,255,.07)}
+
+  /* ── кнопки ─────────────────────────────────────────────────────────── */
   .row{display:flex;gap:6px;flex-wrap:wrap}
   button{background:var(--raised);color:var(--fg);
-         border:1px solid var(--line2);border-radius:7px;padding:7px 12px;
-         cursor:pointer;font:inherit;transition:.12s ease;
-         box-shadow:0 1px 0 rgba(255,255,255,.04) inset}
-  button:hover{background:#262b33;border-color:rgba(255,255,255,.22);
-               transform:translateY(-1px)}
-  button:active{transform:translateY(0)}
-  button.on{background:var(--accent);border-color:var(--accent);
-            color:#0d1712;font-weight:600;
-            box-shadow:0 0 0 1px rgba(167,225,192,.22),0 4px 14px rgba(167,225,192,.14)}
-  button:disabled{opacity:.4;cursor:not-allowed}
-  .wide{width:100%;padding:11px;font-weight:600;font-size:14px}
-  /* Акцент ровно там, где нужно действие — так и написано в справочнике. */
-  .go{background:var(--accent);border-color:var(--accent);color:#0d1712;
-      font-weight:600;box-shadow:0 4px 16px rgba(167,225,192,.16)}
-  .go:hover{background:#b6e9cc;border-color:#b6e9cc}
-  .danger{background:#2a1a1c;border-color:rgba(237,147,147,.35);color:var(--bad)}
-  .danger:hover{background:#33201f;border-color:rgba(237,147,147,.5)}
-  .own{width:74px}
+         border:1px solid var(--line2);border-radius:var(--r-sm);padding:7px 13px;
+         cursor:pointer;font:inherit;font-weight:500;
+         transition:background .15s,border-color .15s,color .15s,box-shadow .15s,
+                    transform .12s var(--ease);
+         box-shadow:0 1px 0 rgba(255,255,255,.05) inset,0 1px 2px rgba(0,0,0,.3)}
+  button:hover{background:var(--raised2);border-color:var(--line3)}
+  button:active{transform:scale(.97)}
+  button:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(255,255,255,.12)}
+  button.on{background:rgba(126,226,176,.12);border-color:rgba(126,226,176,.4);
+            color:var(--ok)}
+  button:disabled{opacity:.4;cursor:not-allowed;transform:none}
+  .wide{width:100%;height:42px;padding:0 14px;font-weight:600;font-size:14px;
+        border-radius:11px;letter-spacing:.01em}
+  /* Главное действие — белое, как «Get started» у референсов: на тёмном
+     его видно первым, и оно одно на экране. */
+  .go{background:#fafafa;border-color:#fafafa;color:#09090b;font-weight:600;
+      box-shadow:0 1px 0 rgba(255,255,255,.6) inset,0 6px 20px -6px rgba(255,255,255,.35)}
+  .go:hover{background:#e4e4e7;border-color:#e4e4e7}
+  .danger{background:rgba(245,139,139,.06);border-color:rgba(245,139,139,.3);color:var(--bad)}
+  .danger:hover{background:rgba(245,139,139,.13);border-color:rgba(245,139,139,.5)}
+  .own{width:76px}
+
+  /* ── сегментные переключатели ───────────────────────────────────────── */
+  /* Кнопки-варианты стоят в одной «дорожке», выбранный отмечен подложкой.
+     Подложку двигает fx.js — она переезжает, а не мигает. Без скрипта
+     выбранный подсвечен сам, так что ничего не ломается. */
+  .seg{position:relative;display:inline-flex;flex-wrap:wrap;align-items:center;
+       gap:2px;padding:3px;max-width:100%;
+       background:var(--inset);border:1px solid var(--line);border-radius:11px}
+  .seg>button{position:relative;z-index:1;background:transparent;border:0;
+       box-shadow:none;color:var(--dim);border-radius:8px;
+       padding:6px 11px!important;font-size:12.5px!important;margin:0!important;
+       transition:color .2s,background .2s,transform .12s var(--ease)}
+  .seg>button:hover{color:var(--fg);background:rgba(255,255,255,.035)}
+  .seg>button.on,.seg>button.go{color:var(--fg);background:transparent;
+       font-weight:550;box-shadow:none}
+  .seg:not(.has-ind)>button.on,.seg:not(.has-ind)>button.go{background:#27272a}
+  .seg>.seg-ind{position:absolute;left:0;top:0;z-index:0;border-radius:8px;
+       background:#27272a;pointer-events:none;
+       box-shadow:0 1px 0 rgba(255,255,255,.07) inset,0 2px 6px rgba(0,0,0,.45);
+       transition:transform .32s var(--spring),width .32s var(--spring),
+                  height .32s var(--spring),opacity .2s}
+  .seg.no-anim>.seg-ind{transition:none}
+  .seg>input.own{height:30px;width:70px;margin-left:2px;border-radius:8px;
+       background:transparent;border-color:var(--line)}
+  #r-side.seg{display:flex}
+  #r-side.seg>button{flex:1}
+  #chains.seg{padding:2px}
+  #chains.seg>button{padding:4px 10px!important;font-size:12px!important}
+  /* Недавние пулы — ярлыки, а не выбор: мелкие пилюли. */
+  #recent>button{padding:4px 10px;font-size:12px;border-radius:999px;
+       background:rgba(255,255,255,.03)}
+
+  /* Выключатель автопродажи — настоящий тумблер: бегунок едет с отскоком. */
+  #as-on{display:inline-flex;align-items:center;gap:9px;padding:5px 12px 5px 6px;
+         border-radius:999px}
+  #as-on::before{content:"";width:30px;height:18px;border-radius:999px;flex:none;
+         background:
+           radial-gradient(circle 7px at 9px 50%,#d4d4d8 98%,transparent 100%),
+           #3f3f46;
+         transition:background .35s var(--spring)}
+  #as-on.on{background:rgba(126,226,176,.1);border-color:rgba(126,226,176,.35);color:var(--ok)}
+  #as-on.on::before{background:
+           radial-gradient(circle 7px at 21px 50%,#09090b 98%,transparent 100%),
+           var(--ok)}
+
+  /* ── таблицы, пары «ключ — значение», цена ──────────────────────────── */
   table{width:100%;border-collapse:collapse}
-  td,th{padding:6px 6px;text-align:left;border-bottom:1px solid var(--line);
-        font-size:12.5px}
+  td,th{padding:10px 8px;text-align:left;border-bottom:1px solid var(--line);
+        font-size:12.5px;vertical-align:top}
+  tbody tr{transition:background .15s}
+  tbody tr:hover{background:rgba(255,255,255,.018)}
+  tbody tr:last-child td{border-bottom:0}
   /* «Первые две колонки держат смысл строки, остальные — числа по правому
      краю». Правило из справочника; у нас числовые ячейки помечены .num. */
   td.num,th.num{text-align:right}
-  th{color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase;
-     letter-spacing:.06em}
-  .big{font-size:26px;font-weight:600;letter-spacing:-.01em}
-  .kv{display:flex;justify-content:space-between;gap:10px;padding:3px 0;
-      border-bottom:1px dashed var(--line);font-size:12.5px}
+  th{color:var(--dim2);font-weight:500;font-size:11.5px;padding-top:4px}
+  th::first-letter{text-transform:uppercase}
+  td button{border-radius:8px}
+  .big{font-size:34px;font-weight:650;letter-spacing:-.03em;line-height:1.15;
+       margin-top:4px;transition:color .6s var(--ease)}
+  /* Вспышка при изменении цены: зелёная вверх, красная вниз. */
+  .big.tick-up{animation:tickUp .7s var(--ease)}
+  .big.tick-down{animation:tickDown .7s var(--ease)}
+  @keyframes tickUp{0%{color:var(--ok);text-shadow:0 0 18px rgba(126,226,176,.45)}100%{color:var(--fg)}}
+  @keyframes tickDown{0%{color:var(--bad);text-shadow:0 0 18px rgba(245,139,139,.45)}100%{color:var(--fg)}}
+  .kv{display:flex;justify-content:space-between;gap:10px;padding:8px 0;
+      border-bottom:1px solid var(--line);font-size:12.5px}
+  .kv:last-child{border-bottom:0}
   .kv span:first-child{color:var(--dim)}
   .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
   .dim{color:var(--dim)}
-  .log{background:var(--inset);border:1px solid var(--line);border-radius:7px;
-       padding:9px;max-height:190px;overflow:auto;font-size:12px;
-       font-family:ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap}
-  .log div{padding:1px 0;border-bottom:1px solid #0e141b}
-  .hint{color:var(--dim);font-size:11.5px;margin-top:6px}
-  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  @media(max-width:640px){.grid2{grid-template-columns:1fr}}
-</style>
-<style>
-/* Переключатель сети: две кнопки, активная подсвечена. Специально крупные —
-   на телефоне промахнуться по ним нельзя, это выбор сети, а не мелочь. */
-.chains { display:inline-flex; gap:4px; margin-left:6px }
-.chains button {
-  padding:4px 10px; font-size:12px; line-height:1.2; border-radius:6px;
-  border:1px solid var(--line, #2a2f3a); background:transparent;
-  color:var(--dim, #8a90a0); cursor:pointer;
-}
-.chains button.on {
-  background:var(--accent, #2b6cff); border-color:var(--accent, #2b6cff); color:#fff;
-}
+  .hint{color:var(--dim2);font-size:12px;margin-top:8px}
+  .grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}
+  @media(max-width:640px){.grid2{grid-template-columns:minmax(0,1fr)}}
+  #chart{border:1px solid var(--line);border-radius:10px!important}
+  /* На узком экране таблицы позиций и истории листаются вбок, а не
+     раздвигают страницу. */
+  @media(max-width:880px){
+    #pos,#hist{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}
+    #pos td,#hist td{white-space:nowrap}
+    header{padding:8px 12px;gap:6px}
+    header .sp{display:none}
+    .pill{font-size:11px;padding:3px 8px}
+    .big{font-size:28px}
+  }
+
+  /* ── журнал ─────────────────────────────────────────────────────────── */
+  .log{background:var(--inset);border:1px solid var(--line);border-radius:11px;
+       padding:6px 10px;max-height:220px;overflow:auto;font-size:12px;
+       font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;white-space:pre-wrap;
+       scrollbar-width:thin;scrollbar-color:#27272a transparent}
+  .log div{padding:4px 0 4px 12px;position:relative;
+           border-bottom:1px solid rgba(255,255,255,.035);
+           animation:logIn .35s var(--ease)}
+  .log div::before{content:"";position:absolute;left:0;top:10px;width:5px;height:5px;
+           border-radius:50%;background:var(--dim2)}
+  .log div.ok::before{background:var(--ok)} .log div.warn::before{background:var(--warn)}
+  .log div.bad::before{background:var(--bad)}
+  .log div:not(.ok):not(.warn):not(.bad){color:#d4d4d8}
+  @keyframes logIn{from{opacity:0;transform:translateY(-4px);filter:blur(2px)}
+                   to{opacity:1;transform:none;filter:none}}
+
+  /* Панель автопродажи раскрывается, а не выпрыгивает. */
+  #as-body{animation:reveal .3s var(--ease)}
+  @keyframes reveal{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+
+  /* «Читаю…», «ищу вход…» — мерцающий текст вместо застывшей надписи:
+     видно, что работа идёт. Класс ставит fx.js. */
+  .shimmer{background:linear-gradient(90deg,var(--dim2) 0%,var(--dim2) 40%,
+             #e4e4e7 50%,var(--dim2) 60%,var(--dim2) 100%);
+           background-size:250% 100%;-webkit-background-clip:text;background-clip:text;
+           color:transparent!important;animation:shimmer 1.8s linear infinite}
+  @keyframes shimmer{from{background-position:100% 0}to{background-position:-150% 0}}
+
+  /* Карточка итога: фон затемняется с размытием, картинка всплывает. */
+  .cardbox{-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);
+           animation:fade .22s var(--ease)}
+  .cardbox canvas{animation:pop .42s var(--spring)}
+  @keyframes fade{from{opacity:0}to{opacity:1}}
+  @keyframes pop{from{opacity:0;transform:scale(.94) translateY(8px)}to{opacity:1;transform:none}}
+
+  @media (prefers-reduced-motion:reduce){
+    *,*::before,*::after{animation:none!important;transition:none!important}
+  }
 </style>
 </head>
 <body>
@@ -122,7 +270,7 @@
   <h1>LP <span id="ver" style="color:var(--dim);font-weight:400;font-size:11px;letter-spacing:0"></span></h1>
   <!-- Переключатель сети. Стоит первым, потому что от него зависит всё
        остальное: адреса контрактов, узел, память браузера. -->
-  <span class="chains" id="chains"></span>
+  <span class="chains seg" id="chains"></span>
   <span class="pill"><span class="dot" id="d-rpc"></span><span id="s-rpc">узел не проверен</span></span>
   <span class="pill"><span class="dot" id="d-wallet"></span><span id="s-wallet">кошелёк не подключён</span></span>
   <span class="pill"><span class="dot" id="d-price"></span><span id="s-price">цена стоит</span></span>
@@ -163,14 +311,14 @@
     <div class="card" style="margin-top:12px">
       <h2>вход</h2>
       <label id="l-amt">сумма</label>
-      <div class="row" id="r-amt"></div>
+      <div class="row seg" id="r-amt"></div>
       <div class="hint" id="bal" style="margin-top:4px"></div>
       <label>что делаем</label>
-      <div class="row" id="r-side"></div>
+      <div class="row seg" id="r-side"></div>
       <label>ширина %</label>
-      <div class="row" id="r-width"></div>
+      <div class="row seg" id="r-width"></div>
       <label>отступ от цены %</label>
-      <div class="row" id="r-gap"></div>
+      <div class="row seg" id="r-gap"></div>
       <div id="rangeinfo" style="margin-top:10px"></div>
       <button class="wide" id="b-arm" style="margin-top:10px">ARM — выдать разрешения</button>
       <button class="wide go" id="b-open" style="margin-top:7px">ВОЙТИ</button>
@@ -188,7 +336,7 @@
       </div>
       <div id="as-body" style="display:none">
         <label>проскальзывание %</label>
-        <div class="row" id="as-slip"></div>
+        <div class="row seg" id="as-slip"></div>
         <label>после чего продавать</label>
         <div class="row" id="as-modes"></div>
         <div class="hint" id="as-note" style="margin-top:8px"></div>
@@ -210,7 +358,7 @@
         <!-- Переключатель единиц. Мемкоин в цене выглядит как 0.000359391 —
              такое число нечем измерить на глаз. Капитализация читается сразу.
              Математика одна и та же: капа это цена, умноженная на выпуск. -->
-        <div class="row" id="unitbar" style="gap:6px;margin-bottom:6px"></div>
+        <div class="row seg" id="unitbar" style="margin-bottom:8px"></div>
         <div class="big num" id="price">—</div>
         <div class="hint" id="pricesub">пул не загружен</div>
         <!-- Переключатель того, ЧТО показано на шкале: планируемый вход или
@@ -276,10 +424,11 @@
      страницу со старым кодом и справедливо писал, что ничего не изменилось.
      Меняется номер — меняется адрес, и браузер обязан скачать заново.
      ПРИ КАЖДОЙ ПРАВКЕ js ЭТОТ НОМЕР И VERSION В ui.js МЕНЯЮТСЯ ВМЕСТЕ. -->
-<script src="src/keccak.js?v=6.12.0"></script>
-<script src="src/core.js?v=6.12.0"></script>
-<script src="src/wallet.js?v=6.12.0"></script>
-<script src="src/autosell.js?v=6.12.0"></script>
-<script src="src/ui.js?v=6.12.0"></script>
+<script src="src/keccak.js?v=7.0.0"></script>
+<script src="src/core.js?v=7.0.0"></script>
+<script src="src/wallet.js?v=7.0.0"></script>
+<script src="src/autosell.js?v=7.0.0"></script>
+<script src="src/ui.js?v=7.0.0"></script>
+<script src="src/fx.js?v=7.0.0"></script>
 </body>
 </html>
